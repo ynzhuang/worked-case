@@ -180,6 +180,22 @@ def retrieve(
             )
             mode = "lexical"
 
+    match_terms = list(terms)
+    if text:
+        match_terms.append(text)
+
+    # The lexical index scores documents; when a concept filter is present it
+    # does not gate them. An event raised from symptoms and a glucose value
+    # carries no surface form of the concept anywhere in its narrative, and
+    # those are precisely the records the evidence ladder exists to catch.
+    # Requiring a text match would drop them before any rule ran.
+    structured_concept_filter = bool(concept_ids)
+    lexical_scores = _lexical_scores(index, match_terms)
+    if structured_concept_filter and match_terms:
+        unmatched = "concept filter is structural; lexical score orders results"
+        if unmatched not in notes:
+            notes.append(unmatched)
+
     where: list[str] = []
     params: list[Any] = []
 
@@ -208,73 +224,66 @@ def retrieve(
     if seriousness:
         clauses = []
         for category in seriousness:
-            clauses.append("(e.seriousness = ? OR e.seriousness LIKE ? "
-                           "OR e.seriousness LIKE ? OR e.seriousness LIKE ?)")
-            params.extend([category, f"{category}|%", f"%|{category}", f"%|{category}|%"])
+            clauses.append(
+                "(e.seriousness = ? OR e.seriousness LIKE ? "
+                "OR e.seriousness LIKE ? OR e.seriousness LIKE ?)"
+            )
+            params.extend(
+                [category, f"{category}|%", f"%|{category}", f"%|{category}|%"]
+            )
         where.append("(" + " OR ".join(clauses) + ")")
 
-    state_join = ""
+    # Free-text search with no concept filter: the lexical match *is* the query,
+    # so it filters rather than merely scores.
+    if match_terms and not structured_concept_filter:
+        if not lexical_scores:
+            where.append("1 = 0")
+        else:
+            doc_ids = sorted(lexical_scores)
+            where.append(f"e.doc_id IN ({','.join('?' * len(doc_ids))})")
+            params.extend(doc_ids)
+
+    join = " FROM events e JOIN documents d ON d.doc_id = e.doc_id"
     if evidence_state or verdict or definition_id:
-        state_join = (
+        join += (
             " LEFT JOIN event_states s ON s.event_id = e.event_id"
             " AND s.definition_id = ?"
         )
-        params.insert(0, definition_id or "")
+        state_params: list[Any] = [definition_id or ""]
         if definition_version is not None:
-            state_join += " AND s.definition_version = ?"
-            params.insert(1, definition_version)
+            join += " AND s.definition_version = ?"
+            state_params.append(definition_version)
+        params = state_params + params
         if evidence_state:
-            where.append(f"s.evidence_state IN ({','.join('?' * len(evidence_state))})")
+            where.append(
+                f"s.evidence_state IN ({','.join('?' * len(evidence_state))})"
+            )
             params.extend(list(evidence_state))
         if verdict:
             where.append(f"s.verdict IN ({','.join('?' * len(verdict))})")
             params.extend(list(verdict))
     else:
-        state_join = (
-            " LEFT JOIN event_states s ON s.event_id = e.event_id"
-        )
-
-    match_terms = list(terms)
-    if text:
-        match_terms.append(text)
-
-    sql = (
-        "SELECT e.*, d.text AS doc_text, s.evidence_state AS evidence_state, "
-        "s.verdict AS verdict"
-    )
-    join = " FROM events e JOIN documents d ON d.doc_id = e.doc_id" + state_join
-    order = " ORDER BY e.event_id"
-    score_expr = "0.0"
-
-    if match_terms:
-        # bm25() is negative-better in SQLite; negate so higher is better.
-        sql += ", -bm25(documents_fts) AS score"
-        join += (
-            " JOIN documents_fts f ON f.rowid = d.rowid"
-        )
-        where.insert(0, "documents_fts MATCH ?")
-        # The MATCH parameter must precede the others bound in `where`, but sit
-        # after any state-join parameters.
-        offset = 0
-        if state_join.startswith(" LEFT JOIN event_states s ON s.event_id = e.event_id AND"):
-            offset = 2 if definition_version is not None else 1
-        params.insert(offset, _fts_query(match_terms))
-        order = " ORDER BY score DESC, e.event_id"
-    else:
-        sql += ", 0.0 AS score"
+        join += " LEFT JOIN event_states s ON s.event_id = e.event_id"
 
     clause = (" WHERE " + " AND ".join(where)) if where else ""
-    query = sql + join + clause + order
-
+    query = (
+        "SELECT e.*, d.text AS doc_text, s.evidence_state AS evidence_state, "
+        "s.verdict AS verdict" + join + clause + " ORDER BY e.event_id"
+    )
     rows = index.query(query, params)
 
-    # The unfiltered comparison count: the same lexical query with every
-    # structured predicate removed. It is what makes the negation false
-    # positive rate meaningful.
+    # Rank in Python: a document the lexical index scored comes first, then the
+    # rest in a stable order. Sorting in SQL would mean threading the FTS table
+    # back into a query whose filters are deliberately structural.
+    scored_rows = sorted(
+        rows,
+        key=lambda row: (-lexical_scores.get(row["doc_id"], 0.0), row["event_id"]),
+    )
+
     total_before = _unfiltered_count(index, match_terms)
 
     records: list[RetrievedRecord] = []
-    for row in rows[: max(top_k, 0) or None]:
+    for row in scored_rows[: max(top_k, 0) or None]:
         records.append(
             RetrievedRecord(
                 event_id=row["event_id"],
@@ -290,9 +299,11 @@ def retrieve(
                 seriousness=[s for s in (row["seriousness"] or "").split("|") if s],
                 action_taken=row["action_taken"],
                 coded_term=row["coded_term"],
-                score=float(row["score"] or 0.0),
+                score=lexical_scores.get(row["doc_id"], 0.0),
                 snippet=_snippet(row["doc_text"], terms),
-                matched_terms=[t for t in terms if t.lower() in (row["doc_text"] or "").lower()],
+                matched_terms=[
+                    t for t in terms if t.lower() in (row["doc_text"] or "").lower()
+                ],
             )
         )
 
@@ -329,6 +340,19 @@ def retrieve(
         dense_available=dense_available,
         notes=notes,
     )
+
+
+def _lexical_scores(index: EventIndex, match_terms: list[str]) -> dict[str, float]:
+    """Document ids scored by the FTS5 index. bm25 is negative-better; negated."""
+    if not match_terms:
+        return {}
+    rows = index.query(
+        "SELECT d.doc_id AS doc_id, -bm25(documents_fts) AS score "
+        "FROM documents d JOIN documents_fts f ON f.rowid = d.rowid "
+        "WHERE documents_fts MATCH ?",
+        (_fts_query(match_terms),),
+    )
+    return {row["doc_id"]: float(row["score"]) for row in rows}
 
 
 def _unfiltered_count(index: EventIndex, match_terms: list[str]) -> int:

@@ -52,7 +52,9 @@ from ..runs import execute, results_payload
 from .metrics import (
     ConfusionMatrix,
     PRF,
+    precision_at_k,
     recall_at_k,
+    recall_ceiling_at_k,
     reciprocal_rank,
     scalar_prf,
     set_prf,
@@ -261,8 +263,18 @@ class EvaluationHarness:
 
     # -- phenotype ----------------------------------------------------------
 
+    @property
+    def gold_definition_key(self) -> str:
+        """The definition version the gold answer key was built under."""
+        return str(
+            self.pipeline.store.manifest.get("gold_case_definition")
+            or f"{self.definition.id}.v{self.definition.version}"
+        )
+
     def phenotype_metrics(self) -> dict[str, Any]:
         assignments = self.pipeline.evaluate(self.definition)
+        evaluated_key = f"{self.definition.id}.v{self.definition.version}"
+        matches_gold = evaluated_key == self.gold_definition_key
         matrix = ConfusionMatrix(labels=["case", "review", "excluded"])
         per_study: dict[str, ConfusionMatrix] = {}
 
@@ -303,6 +315,22 @@ class EvaluationHarness:
             }
 
         return {
+            "evaluated_definition": evaluated_key,
+            "gold_definition": self.gold_definition_key,
+            "matches_gold_definition": matches_gold,
+            "comparability_note": (
+                ""
+                if matches_gold
+                else (
+                    f"PPV and sensitivity below compare {evaluated_key} against a "
+                    f"gold key built under {self.gold_definition_key}. The two "
+                    f"definitions disagree by design, so these are a measure of "
+                    f"how far the versions diverge, not of extraction quality. "
+                    f"Pass --version "
+                    f"{self.gold_definition_key.rsplit('.v', 1)[-1]} to score "
+                    f"against the definition the key was written for."
+                )
+            ),
             "pooled": case_ppv_sensitivity(matrix),
             "per_study": {
                 study: case_ppv_sensitivity(cm) for study, cm in sorted(per_study.items())
@@ -348,6 +376,14 @@ class EvaluationHarness:
                         f"recall@{k}": round(recall_at_k(ranked, relevant, k), 4)
                         for k in _RECALL_KS
                     },
+                    **{
+                        f"ceiling@{k}": round(recall_ceiling_at_k(relevant, k), 4)
+                        for k in _RECALL_KS
+                    },
+                    **{
+                        f"precision@{k}": round(precision_at_k(ranked, relevant, k), 4)
+                        for k in _RECALL_KS
+                    },
                 }
             )
 
@@ -376,6 +412,14 @@ class EvaluationHarness:
                 "mrr": round(reciprocal_rank(docs, pooled_relevant), 4),
                 **{
                     f"recall@{k}": round(recall_at_k(docs, pooled_relevant, k), 4)
+                    for k in _RECALL_KS
+                },
+                **{
+                    f"ceiling@{k}": round(recall_ceiling_at_k(pooled_relevant, k), 4)
+                    for k in _RECALL_KS
+                },
+                **{
+                    f"precision@{k}": round(precision_at_k(docs, pooled_relevant, k), 4)
                     for k in _RECALL_KS
                 },
             }
@@ -585,6 +629,16 @@ def run_evaluation(
 ) -> tuple[dict[str, Any], Path | None]:
     """Run every metric and, where asked, write the markdown report."""
     pipeline = pipeline or Pipeline.load(store_path=paths.STORE_DB)
+    if version is None:
+        # Default to the version the gold answer key was written for, so the
+        # headline PPV and sensitivity are comparable numbers rather than a
+        # measure of how far two definition versions have diverged.
+        recorded = str(pipeline.store.manifest.get("gold_case_definition") or "")
+        if recorded.startswith(f"{definition_id}.v"):
+            try:
+                version = int(recorded.rsplit(".v", 1)[-1])
+            except ValueError:
+                version = None
     definition = pipeline.definition(definition_id, version)
     harness = EvaluationHarness.build(pipeline, definition)
     results = harness.run_all()

@@ -176,6 +176,9 @@ def render_markdown(results: dict[str, Any]) -> str:
     phenotype = results["phenotype"]
     add("## 2. Phenotype")
     add("")
+    if not phenotype.get("matches_gold_definition", True):
+        add(f"> **{phenotype['comparability_note']}**")
+        add("")
     pooled = phenotype["pooled"]
     add(
         f"Pooled over {phenotype['subjects']} subjects: PPV **{pooled['ppv']:.3f}**, "
@@ -240,8 +243,11 @@ def render_markdown(results: dict[str, Any]) -> str:
             ["gold-negated documents returned",
              on["gold_negated_documents_returned"], off["gold_negated_documents_returned"]],
             ["MRR", on["mrr"], off["mrr"]],
-            ["recall@10", on["recall@10"], off["recall@10"]],
-            ["recall@50", on["recall@50"], off["recall@50"]],
+            ["precision@10", on["precision@10"], off["precision@10"]],
+            ["precision@50", on["precision@50"], off["precision@50"]],
+            ["recall@50 (ceiling)",
+             f"{on['recall@50']:.3f} ({on['ceiling@50']:.3f})",
+             f"{off['recall@50']:.3f} ({off['ceiling@50']:.3f})"],
         ],
     ))
     add("")
@@ -253,11 +259,20 @@ def render_markdown(results: dict[str, Any]) -> str:
     add("")
     add("### Per-study queries")
     add("")
+    add(
+        "Recall@k is bounded above by k divided by the number of relevant "
+        "documents: with 63 relevant records, recall@5 cannot exceed 0.079 "
+        "however perfect the ranking. The ceiling is shown alongside, and "
+        "precision@k is the figure that is not capped."
+    )
+    add("")
     add(_table(
-        ["study", "relevant", "returned", "MRR", "recall@5", "recall@10", "recall@20", "recall@50"],
+        ["study", "relevant", "returned", "MRR", "P@10", "P@50",
+         "recall@50", "ceiling@50"],
         [
             [q["study"], q["relevant"], q["returned"], q["mrr"],
-             q["recall@5"], q["recall@10"], q["recall@20"], q["recall@50"]]
+             q["precision@10"], q["precision@50"],
+             q["recall@50"], q["ceiling@50"]]
             for q in retrieval["per_study"]
         ],
     ))

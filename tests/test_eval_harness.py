@@ -181,3 +181,49 @@ def test_ranking_metrics():
     assert reciprocal_rank(ranked, {"z"}) == 0.0
     assert recall_at_k(ranked, {"a", "d"}, 2) == 0.5
     assert recall_at_k(ranked, set(), 2) == 0.0
+
+
+def test_scoring_against_a_different_version_is_flagged_not_silent(
+    pipeline, definition_v2
+):
+    """A gold key written for v1 does not score v2. Say so rather than
+    reporting a sensitivity drop as if it were an extraction failure."""
+    harness = EvaluationHarness.build(pipeline, definition_v2)
+    metrics = harness.phenotype_metrics()
+    assert metrics["evaluated_definition"] == "te_symptomatic_hypoglycemia.v2"
+    assert metrics["gold_definition"] == "te_symptomatic_hypoglycemia.v1"
+    assert not metrics["matches_gold_definition"]
+    assert "not of extraction quality" in metrics["comparability_note"]
+
+
+def test_scoring_against_the_matching_version_carries_no_caveat(harness):
+    metrics = harness.phenotype_metrics()
+    assert metrics["matches_gold_definition"]
+    assert metrics["comparability_note"] == ""
+
+
+def test_run_evaluation_defaults_to_the_gold_keys_version(pipeline, tmp_path):
+    from aelayer.eval.harness import run_evaluation
+
+    results, _path = run_evaluation(pipeline, "te_symptomatic_hypoglycemia", None)
+    assert results["definition"]["version"] == 1
+    assert results["phenotype"]["matches_gold_definition"]
+
+
+def test_recall_at_k_is_reported_with_its_ceiling(harness):
+    """A ranking that is exactly right must not read as one that is mostly wrong."""
+    metrics = harness.retrieval_metrics()
+    for query in metrics["per_study"]:
+        assert query["recall@50"] <= query["ceiling@50"] + 1e-9
+        assert 0.0 <= query["precision@10"] <= 1.0
+
+
+def test_precision_at_k_is_not_capped_by_the_relevant_count():
+    from aelayer.eval.metrics import precision_at_k, recall_ceiling_at_k
+
+    ranked = ["a", "b", "c"]
+    assert precision_at_k(ranked, {"a", "b", "c"}, 2) == 1.0
+    assert precision_at_k(ranked, {"z"}, 2) == 0.0
+    assert precision_at_k([], {"a"}, 2) == 0.0
+    assert recall_ceiling_at_k({"a", "b", "c", "d"}, 2) == 0.5
+    assert recall_ceiling_at_k(set(), 2) == 0.0

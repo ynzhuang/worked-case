@@ -156,3 +156,23 @@ def recall_at_k(ranked_ids: Sequence[str], relevant: set[str], k: int) -> float:
     if not relevant:
         return 0.0
     return len(set(ranked_ids[:k]) & relevant) / len(relevant)
+
+
+def recall_ceiling_at_k(relevant: set[str], k: int) -> float:
+    """The best recall@k achievable when there are more relevant items than k.
+
+    With 63 relevant documents, recall@5 cannot exceed 0.079 however perfect the
+    ranking is. Reporting the raw figure without its ceiling invites reading a
+    ranking that is exactly right as one that is mostly wrong.
+    """
+    if not relevant:
+        return 0.0
+    return min(k, len(relevant)) / len(relevant)
+
+
+def precision_at_k(ranked_ids: Sequence[str], relevant: set[str], k: int) -> float:
+    """Proportion of the top k that is relevant. Not capped by the relevant count."""
+    top = ranked_ids[:k]
+    if not top:
+        return 0.0
+    return len([i for i in top if i in relevant]) / len(top)

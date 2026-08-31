@@ -411,7 +411,10 @@ def eval_command(
           f"concept F1 {extraction['concept_detection']['f1']:.3f}")
     _echo(f"  phenotype    PPV {phenotype['pooled']['ppv']:.3f}, "
           f"sensitivity {phenotype['pooled']['sensitivity']:.3f} "
-          f"over {phenotype['subjects']} subjects")
+          f"over {phenotype['subjects']} subjects "
+          f"({phenotype['evaluated_definition']})")
+    if not phenotype.get("matches_gold_definition", True):
+        _echo(f"               note: {phenotype['comparability_note']}")
     _echo(
         f"  retrieval    negation FP rate "
         f"{retrieval['assertion_filter_on']['negation_false_positive_rate']:.4f} "
