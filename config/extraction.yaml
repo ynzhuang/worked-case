@@ -203,7 +203,8 @@ values:
     not_resolved: ["not resolved", "ongoing", "unresolved", "persisted",
                    "continues"]
     fatal: ["fatal", "died", "death"]
-    unknown: ["outcome unknown", "outcome not recorded", "lost to follow-up"]
+    unknown: ["outcome unknown", "outcome not recorded",
+              "outcome was not recorded", "lost to follow-up"]
   rechallenge:
     not_done: ["rechallenge was not performed", "no rechallenge",
                "rechallenge not done", "not rechallenged"]

@@ -172,10 +172,26 @@ class ExtractionEngine:
             found = {s[0] for s in symptoms if s[0] in qualifying}
             if len(found) >= int(spec.get("min_symptoms", 1)):
                 return True
-        for test_id in spec.get("lab_tests") or []:
-            if any(lab.test == test_id for lab in labs):
-                return True
+        for entry in spec.get("lab_tests") or []:
+            test_id = entry["test"] if isinstance(entry, dict) else entry
+            bound = self._candidate_lab_bound(entry)
+            for lab in labs:
+                if lab.test != test_id:
+                    continue
+                if bound is None:
+                    return True
+                if lab.canonical_value is not None and lab.canonical_value < bound:
+                    return True
         return False
+
+    def _candidate_lab_bound(self, entry: Any) -> float | None:
+        """The canonical-unit bound below which a value raises the concept."""
+        if not isinstance(entry, dict) or "below" not in entry:
+            return None
+        lab = self.catalog.lab_tests.get(entry["test"])
+        if lab is None:
+            return None
+        return lab.to_canonical(float(entry["below"]), entry.get("unit", lab.canonical_unit))
 
     @staticmethod
     def _contextual_anchor(
@@ -482,7 +498,9 @@ class ExtractionEngine:
         folded_cues = [c.lower() for c in cues]
         for row in sorted(context.cm_rows, key=lambda r: str(r.get("CMSEQ"))):
             started = parse_date(row.get("CMSTDTC"))
-            if started is None or abs((started - onset_date).days) > 1:
+            # Same day only. A wider window picks up rescue given for a
+            # neighbouring event on the same subject and attributes it here.
+            if started is None or started != onset_date:
                 continue
             blob = f"{row.get('CMTRT') or ''} {row.get('CMINDC') or ''}".lower()
             if any(cue in blob for cue in folded_cues):

@@ -38,7 +38,16 @@ concepts:
     candidate_evidence:
       symptom_sets: [neuroglycopenic, autonomic]
       min_symptoms: 1
-      lab_tests: [GLUCOSE]
+      lab_tests:
+        # A glucose value raises this concept only if it is low at all. The
+        # bound is deliberately wider than any case threshold a definition
+        # uses (ADA Level 1 is 70 mg/dL, Level 2 is 54), so the extractor
+        # narrows the field without pre-empting the definition's decision.
+        # Without it, a hyperglycemia narrative reporting 112 mg/dL would
+        # raise a hypoglycemia candidate.
+        - test: GLUCOSE
+          below: 80
+          unit: mg/dL
 
   HYPERGLYCEMIA:
     label: Hyperglycemia

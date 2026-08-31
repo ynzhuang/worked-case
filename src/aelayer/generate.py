@@ -236,7 +236,7 @@ SYMPTOM_ADJ_PHRASES = [
 ]
 
 RESCUE_PHRASES = [
-    "Oral glucose gel was administered and symptoms settled.",
+    "Oral glucose gel was administered.",
     "The subject was given orange juice as rescue carbohydrate.",
     "Glucose tablets were given by the study nurse.",
     "IV dextrose was administered in the clinic.",
@@ -308,10 +308,14 @@ UNCERTAIN_PHRASES = [
 ]
 
 DISTRACTOR_CONCEPTS = {
-    "NAUSEA": ("Nausea", ["nausea", "nauseated", "feeling sick"]),
+    "NAUSEA": ("Nausea", ["nausea", "feeling sick"]),
     "HEADACHE": ("Headache", ["headache", "cephalgia"]),
     "HYPERGLYCEMIA": ("Hyperglycaemia", ["hyperglycemia", "high blood sugar"]),
 }
+
+#: Distractor concepts whose surface form is itself a catalogued symptom. The
+#: narrative genuinely mentions the symptom, so gold has to record it.
+DISTRACTOR_SYMPTOMS = {"NAUSEA": ["nausea"]}
 
 # Pattern mix.  Weights are chosen so every pattern appears often enough for a
 # per-pattern metric to mean something, while explicit cases stay the majority
@@ -437,10 +441,18 @@ class CorpusGenerator:
         pool = sorted(set(self.neuro) | set(self.autonomic))
         return sorted(self.rng.sample(pool, min(count, len(pool))))
 
-    def _glucose_value(self, unit: str, *, low: bool) -> tuple[float, float]:
-        """Return ``(reported_value, canonical_mgdl)``."""
-        if low:
+    def _glucose_value(self, unit: str, *, level: str = "normal") -> tuple[float, float]:
+        """Return ``(reported_value, canonical_mgdl)`` for a glucose draw.
+
+        ``level`` is ``low`` (a hypoglycaemic value), ``normal`` (a routine
+        surveillance draw) or ``high`` (genuinely hyperglycaemic). A
+        hyperglycemia narrative reporting 76 mg/dL would be neither realistic
+        nor separable from a normal result.
+        """
+        if level == "low":
             mgdl = self.rng.choice([38, 44, 48, 52, 54, 58, 61, 64, 66, 68])
+        elif level == "high":
+            mgdl = self.rng.choice([196, 214, 238, 265, 291, 320])
         else:
             mgdl = self.rng.choice([76, 84, 91, 98, 105, 112])
         if unit == "mmol/L":
@@ -739,7 +751,7 @@ class CorpusGenerator:
         if self.rng.random() < 0.6:
             self._add_symptoms(builder, intent)
         if self.rng.random() < 0.5:
-            self._add_lab(builder, intent, unit, low=True)
+            self._add_lab(builder, intent, unit, level="low")
 
     def _pattern_explicit_verbatim_only(self, builder, intent, convention, subject_id,
                                         anchor_date, anchor_surface, ref_start, unit, extra_rows):
@@ -771,7 +783,7 @@ class CorpusGenerator:
         onset = self._onset(builder, intent, anchor_date, anchor_surface, ref_start)
         symptoms = self._choose_symptoms(2)
         intent["symptoms"] = symptoms
-        value, canonical = self._glucose_value(unit, low=True)
+        value, canonical = self._glucose_value(unit, level="low")
         intent["labs"].append(
             {"test": "GLUCOSE", "value": value, "unit": unit, "canonical_mgdl": canonical}
         )
@@ -808,7 +820,7 @@ class CorpusGenerator:
             f"{self._ucfirst(onset)} the subject "
             f"reported {self._symptom_phrase(symptoms)}."
         )
-        self._add_lab(builder, intent, unit, low=True)
+        self._add_lab(builder, intent, unit, level="low")
         if not convention.codes_hypoglycemia or self.rng.random() < 0.5:
             self._set_coded_term(intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False)
 
@@ -821,7 +833,7 @@ class CorpusGenerator:
             f"The subject became unwell {onset}."
         )
         builder.sentence(f"They described {self._symptom_phrase(symptoms)}.")
-        self._add_lab(builder, intent, unit, low=True)
+        self._add_lab(builder, intent, unit, level="low")
         self._set_coded_term(intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False)
 
     def _pattern_context_rescue(self, builder, intent, convention, subject_id,
@@ -863,6 +875,7 @@ class CorpusGenerator:
             f"mentioned {self._symptom_phrase(symptoms)}."
         )
         builder.sentence("No glucose measurement was available.")
+        builder.sentence(ACTION_PHRASES["none"])
         self._set_coded_term(intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False)
         intent["action_taken"] = "none"
         intent["suppress_extra_rescue"] = True
@@ -951,13 +964,16 @@ class CorpusGenerator:
         self._set_coded_term(intent, coded, matches=True)
         builder.marked_sentence("The subject reported ", surface, f" {onset}.", "concept")
         intent["explicit_mention"] = True
+        intent["symptoms"] = sorted(
+            set(intent["symptoms"]) | set(DISTRACTOR_SYMPTOMS.get(concept_id, []))
+        )
         intent["severity"] = self._severity_for(convention)
         if intent["severity"]:
             builder.sentence(
                 f"The event was graded as {SEVERITY_WORDS[intent['severity']]} in intensity."
             )
         if concept_id == "HYPERGLYCEMIA":
-            self._add_lab(builder, intent, unit, low=False)
+            self._add_lab(builder, intent, unit, level="high")
 
     # -- shared narrative fragments ----------------------------------------
 
@@ -1011,8 +1027,8 @@ class CorpusGenerator:
             )
         )
 
-    def _add_lab(self, builder, intent, unit: str, *, low: bool) -> None:
-        value, canonical = self._glucose_value(unit, low=low)
+    def _add_lab(self, builder, intent, unit: str, *, level: str = "normal") -> None:
+        value, canonical = self._glucose_value(unit, level=level)
         intent["labs"].append(
             {"test": "GLUCOSE", "value": value, "unit": unit, "canonical_mgdl": canonical}
         )
@@ -1231,7 +1247,9 @@ class CorpusGenerator:
                 # Routine, non-event glucose measurements, so the LB table is not
                 # composed exclusively of qualifying values.
                 for offset in (7, 28, 56):
-                    value, canonical = self._glucose_value(convention.glucose_unit, low=False)
+                    value, canonical = self._glucose_value(
+                        convention.glucose_unit, level="normal"
+                    )
                     seq = lb_seq_by_subject.get(subject_id, 0) + 1
                     lb_seq_by_subject[subject_id] = seq
                     corpus.tables["lb"].append(
