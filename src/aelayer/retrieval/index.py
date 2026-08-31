@@ -11,11 +11,13 @@ different one to the same event.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from ..hashing import canonical_json
 from ..ingest import TrialStore
@@ -127,7 +129,28 @@ class EventIndex:
     def __init__(self, connection: sqlite3.Connection, path: Path | None = None):
         self.connection = connection
         self.connection.row_factory = sqlite3.Row
+        # The API serves sync endpoints from a threadpool, so connections are
+        # opened with check_same_thread=False and every statement runs under
+        # this lock. SQLite serialises internally; the lock is what keeps our
+        # own multi-statement writes atomic with respect to each other.
+        self._lock = threading.RLock()
         self.path = path
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """Hold the connection lock for a group of statements."""
+        with self._lock:
+            cursor = self.connection.cursor()
+            try:
+                yield cursor
+                self.connection.commit()
+            finally:
+                cursor.close()
+
+    def query(self, sql: str, parameters: Sequence[Any] = ()) -> list[sqlite3.Row]:
+        """Run one read statement under the lock and materialise its rows."""
+        with self._lock:
+            return list(self.connection.execute(sql, parameters))
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -138,7 +161,9 @@ class EventIndex:
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
                 target.unlink()
-        connection = sqlite3.connect(str(target) if target else ":memory:")
+        connection = sqlite3.connect(
+            str(target) if target else ":memory:", check_same_thread=False
+        )
         connection.executescript(_SCHEMA)
         return cls(connection, target)
 
@@ -149,10 +174,11 @@ class EventIndex:
             raise FileNotFoundError(
                 f"no store at {target}. Run `aelayer extract` to build one."
             )
-        return cls(sqlite3.connect(str(target)), target)
+        return cls(sqlite3.connect(str(target), check_same_thread=False), target)
 
     def close(self) -> None:
-        self.connection.close()
+        with self._lock:
+            self.connection.close()
 
     def __enter__(self) -> "EventIndex":
         return self
@@ -165,56 +191,55 @@ class EventIndex:
     def populate(
         self, store: TrialStore, events: Iterable[EventObject], extractor_version: str
     ) -> None:
-        cursor = self.connection.cursor()
-        for narrative in sorted(store.narratives.values(), key=lambda n: n.doc_id):
+        with self.transaction() as cursor:
+            for narrative in sorted(store.narratives.values(), key=lambda n: n.doc_id):
+                cursor.execute(
+                    "INSERT INTO documents(doc_id, study_id, subject_id, header, text) "
+                    "VALUES (?,?,?,?,?)",
+                    (
+                        narrative.doc_id, narrative.study_id, narrative.subject_id,
+                        narrative.header, narrative.full_text,
+                    ),
+                )
             cursor.execute(
-                "INSERT INTO documents(doc_id, study_id, subject_id, header, text) "
-                "VALUES (?,?,?,?,?)",
-                (
-                    narrative.doc_id, narrative.study_id, narrative.subject_id,
-                    narrative.header, narrative.full_text,
-                ),
+                "INSERT INTO documents_fts(rowid, text) SELECT rowid, text FROM documents"
             )
-        cursor.execute(
-            "INSERT INTO documents_fts(rowid, text) SELECT rowid, text FROM documents"
-        )
 
-        event_list = list(events)
-        for event in event_list:
-            cursor.execute(
-                """INSERT INTO events(
-                    event_id, subject_id, study_id, doc_id, concept_id, coded_term,
-                    coded_term_version, assertion, onset_date, onset_offset_days,
-                    anchor_event, severity, seriousness, relatedness, action_taken,
-                    rechallenge, rescue_treatment, outcome, symptoms,
-                    min_glucose_mgdl, extractor_version, payload
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    event.event_id, event.subject_id, event.study_id, event.doc_id,
-                    event.concept_id, event.coded_term, event.coded_term_version,
-                    event.assertion,
-                    event.onset_date.isoformat() if event.onset_date else None,
-                    event.onset_offset_days, event.anchor_event, event.severity,
-                    "|".join(event.seriousness), event.relatedness,
-                    event.action_taken, event.rechallenge,
-                    1 if event.rescue_treatment else 0, event.outcome,
-                    "|".join(sorted({s.symptom for s in event.symptoms})),
-                    _min_glucose(event),
-                    event.extractor_version,
-                    event.model_dump_json(),
-                ),
+            event_list = list(events)
+            for event in event_list:
+                cursor.execute(
+                    """INSERT INTO events(
+                        event_id, subject_id, study_id, doc_id, concept_id, coded_term,
+                        coded_term_version, assertion, onset_date, onset_offset_days,
+                        anchor_event, severity, seriousness, relatedness, action_taken,
+                        rechallenge, rescue_treatment, outcome, symptoms,
+                        min_glucose_mgdl, extractor_version, payload
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        event.event_id, event.subject_id, event.study_id, event.doc_id,
+                        event.concept_id, event.coded_term, event.coded_term_version,
+                        event.assertion,
+                        event.onset_date.isoformat() if event.onset_date else None,
+                        event.onset_offset_days, event.anchor_event, event.severity,
+                        "|".join(event.seriousness), event.relatedness,
+                        event.action_taken, event.rechallenge,
+                        1 if event.rescue_treatment else 0, event.outcome,
+                        "|".join(sorted({s.symptom for s in event.symptoms})),
+                        _min_glucose(event),
+                        event.extractor_version,
+                        event.model_dump_json(),
+                    ),
+                )
+            cursor.executemany(
+                "INSERT INTO meta(key, value) VALUES (?,?)",
+                [
+                    ("schema_version", str(SCHEMA_VERSION)),
+                    ("snapshot_id", store.snapshot_id),
+                    ("extractor_version", extractor_version),
+                    ("document_count", str(len(store.narratives))),
+                    ("event_count", str(len(event_list))),
+                ],
             )
-        cursor.executemany(
-            "INSERT INTO meta(key, value) VALUES (?,?)",
-            [
-                ("schema_version", str(SCHEMA_VERSION)),
-                ("snapshot_id", store.snapshot_id),
-                ("extractor_version", extractor_version),
-                ("document_count", str(len(store.narratives))),
-                ("event_count", str(len(event_list))),
-            ],
-        )
-        self.connection.commit()
 
     def record_assignments(
         self,
@@ -222,54 +247,53 @@ class EventIndex:
         event_states: Iterable[tuple[str, str, str]] | None = None,
     ) -> None:
         """Store one definition's verdicts, replacing any previous run of it."""
-        cursor = self.connection.cursor()
-        rows = list(assignments)
-        if rows:
-            first = rows[0]
-            cursor.execute(
-                "DELETE FROM assignments WHERE definition_id=? AND definition_version=?",
-                (first.definition_id, first.definition_version),
-            )
-            cursor.execute(
-                "DELETE FROM event_states WHERE definition_id=? AND definition_version=?",
-                (first.definition_id, first.definition_version),
-            )
-        for assignment in rows:
-            cursor.execute(
-                """INSERT INTO assignments(
-                    subject_id, study_id, definition_id, definition_version,
-                    definition_hash, verdict, evidence_state, matched_rule_id,
-                    reason, payload
-                ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    assignment.subject_id, assignment.study_id,
-                    assignment.definition_id, assignment.definition_version,
-                    assignment.definition_hash, assignment.verdict,
-                    assignment.evidence_state, assignment.matched_rule_id,
-                    assignment.reason, assignment.model_dump_json(),
-                ),
-            )
-            for event_id in assignment.contributing_event_ids:
+        with self.transaction() as cursor:
+            rows = list(assignments)
+            if rows:
+                first = rows[0]
                 cursor.execute(
-                    """INSERT OR REPLACE INTO event_states(
-                        event_id, definition_id, definition_version, definition_hash,
-                        evidence_state, verdict, matched_rule_id
-                    ) VALUES (?,?,?,?,?,?,?)""",
+                    "DELETE FROM assignments WHERE definition_id=? AND definition_version=?",
+                    (first.definition_id, first.definition_version),
+                )
+                cursor.execute(
+                    "DELETE FROM event_states WHERE definition_id=? AND definition_version=?",
+                    (first.definition_id, first.definition_version),
+                )
+            for assignment in rows:
+                cursor.execute(
+                    """INSERT INTO assignments(
+                        subject_id, study_id, definition_id, definition_version,
+                        definition_hash, verdict, evidence_state, matched_rule_id,
+                        reason, payload
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
                     (
-                        event_id, assignment.definition_id,
-                        assignment.definition_version, assignment.definition_hash,
-                        assignment.evidence_state, assignment.verdict,
-                        assignment.matched_rule_id,
+                        assignment.subject_id, assignment.study_id,
+                        assignment.definition_id, assignment.definition_version,
+                        assignment.definition_hash, assignment.verdict,
+                        assignment.evidence_state, assignment.matched_rule_id,
+                        assignment.reason, assignment.model_dump_json(),
                     ),
                 )
-        self.connection.commit()
+                for event_id in assignment.contributing_event_ids:
+                    cursor.execute(
+                        """INSERT OR REPLACE INTO event_states(
+                            event_id, definition_id, definition_version, definition_hash,
+                            evidence_state, verdict, matched_rule_id
+                        ) VALUES (?,?,?,?,?,?,?)""",
+                        (
+                            event_id, assignment.definition_id,
+                            assignment.definition_version, assignment.definition_hash,
+                            assignment.evidence_state, assignment.verdict,
+                            assignment.matched_rule_id,
+                        ),
+                    )
 
     # -- reading ------------------------------------------------------------
 
     def meta(self) -> IndexMeta:
         rows = {
             row["key"]: row["value"]
-            for row in self.connection.execute("SELECT key, value FROM meta")
+            for row in self.query("SELECT key, value FROM meta")
         }
         return IndexMeta(
             schema_version=int(rows.get("schema_version", 0)),
@@ -282,9 +306,7 @@ class EventIndex:
     def events(self) -> list[EventObject]:
         return [
             EventObject.model_validate_json(row["payload"])
-            for row in self.connection.execute(
-                "SELECT payload FROM events ORDER BY event_id"
-            )
+            for row in self.query("SELECT payload FROM events ORDER BY event_id")
         ]
 
     def assignments(
@@ -292,7 +314,7 @@ class EventIndex:
     ) -> list[CaseAssignment]:
         return [
             CaseAssignment.model_validate_json(row["payload"])
-            for row in self.connection.execute(
+            for row in self.query(
                 "SELECT payload FROM assignments WHERE definition_id=? AND "
                 "definition_version=? ORDER BY subject_id",
                 (definition_id, definition_version),
@@ -300,15 +322,13 @@ class EventIndex:
         ]
 
     def document(self, doc_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute(
-            "SELECT * FROM documents WHERE doc_id=?", (doc_id,)
-        ).fetchone()
-        return dict(row) if row else None
+        rows = self.query("SELECT * FROM documents WHERE doc_id=?", (doc_id,))
+        return dict(rows[0]) if rows else None
 
     def studies(self) -> list[str]:
         return [
             row[0]
-            for row in self.connection.execute(
+            for row in self.query(
                 "SELECT DISTINCT study_id FROM documents ORDER BY study_id"
             )
         ]

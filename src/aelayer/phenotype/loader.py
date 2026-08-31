@@ -452,8 +452,33 @@ def diff_definitions(
         if isinstance(x, dict) and isinstance(y, dict):
             for key in sorted(set(x) | set(y)):
                 walk(f"{prefix}.{key}" if prefix else key, x.get(key), y.get(key))
-        elif x != y:
+            return
+        if isinstance(x, list) and isinstance(y, list):
+            # Descend into lists element by element so a single changed
+            # threshold reads as one line rather than two dumped rule lists.
+            # Where elements carry an `id`, they are matched on it, so
+            # reordering rules is not reported as a change to every rule.
+            if _keyed_by_id(x) and _keyed_by_id(y):
+                left = {item["id"]: item for item in x}
+                right = {item["id"]: item for item in y}
+                for key in sorted(set(left) | set(right)):
+                    walk(f"{prefix}[{key}]", left.get(key), right.get(key))
+            else:
+                for index in range(max(len(x), len(y))):
+                    walk(
+                        f"{prefix}[{index}]",
+                        x[index] if index < len(x) else None,
+                        y[index] if index < len(y) else None,
+                    )
+            return
+        if x != y:
             changes.append({"path": prefix, "from": x, "to": y})
 
     walk("", a, b)
     return changes
+
+
+def _keyed_by_id(items: list[Any]) -> bool:
+    return bool(items) and all(
+        isinstance(item, dict) and isinstance(item.get("id"), str) for item in items
+    )

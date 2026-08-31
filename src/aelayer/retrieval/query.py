@@ -266,7 +266,7 @@ def retrieve(
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     query = sql + join + clause + order
 
-    rows = list(index.connection.execute(query, params))
+    rows = index.query(query, params)
 
     # The unfiltered comparison count: the same lexical query with every
     # structured predicate removed. It is what makes the negation false
@@ -333,12 +333,12 @@ def retrieve(
 
 def _unfiltered_count(index: EventIndex, match_terms: list[str]) -> int:
     if not match_terms:
-        return index.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    return index.connection.execute(
+        return index.query("SELECT COUNT(*) FROM events")[0][0]
+    return index.query(
         "SELECT COUNT(*) FROM events e JOIN documents d ON d.doc_id = e.doc_id "
         "JOIN documents_fts f ON f.rowid = d.rowid WHERE documents_fts MATCH ?",
         (_fts_query(match_terms),),
-    ).fetchone()[0]
+    )[0][0]
 
 
 def _snippet(text: str, terms: list[str], width: int = 110) -> str:

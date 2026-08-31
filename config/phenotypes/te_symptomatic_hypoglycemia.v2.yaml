@@ -1,0 +1,86 @@
+# v2 is a new file, not an edit of v1.
+#
+# The only substantive change is the glucose threshold in the `supported` rule:
+# 70 mg/dL (the ADA Level 1 glucose alert value) becomes 54 (Level 2, clinically
+# significant hypoglycemia). Studies differ in which they used, and this is
+# exactly the axis a clinical scientist needs to move without touching Python.
+#
+# v1 remains on disk, frozen, and remains runnable and replayable. A cohort
+# built under v1 is not rewritten by the existence of v2.
+
+id: te_symptomatic_hypoglycemia
+version: 2
+status: frozen
+label: Treatment-emergent symptomatic hypoglycemia (Level 2 threshold)
+description: >
+  Symptomatic hypoglycemia with onset within 14 days of a documented
+  dose escalation, in completed cardiometabolic studies. Corroborating
+  glucose values must meet the ADA Level 2 threshold of 54 mg/dL rather
+  than the Level 1 alert value of 70.
+supersedes: te_symptomatic_hypoglycemia.v1
+authors: ["clinical-evidence-prototype"]
+created: 2026-08-31
+
+concept:
+  primary: HYPOGLYCEMIA
+  include_coded_terms: true
+  include_lexicon: true
+
+assertion:
+  require: [present]
+  route_to_review: [uncertain]
+  exclude: [absent, hypothetical, historical, family_history]
+
+anchor:
+  event: dose_escalation
+  source_domain: EX
+  index_rule: first_occurrence
+
+window:
+  unit: days
+  min: 0
+  max: 14
+  on_unresolved_onset: review
+
+evidence_rules:
+  - id: explicit
+    state: explicit
+    description: A coded term or an asserted verbatim mention of the concept.
+    when:
+      any:
+        - coded_term_matches_concept: true
+        - lexicon_match: {assertion: present}
+
+  - id: supported
+    state: supported
+    description: >
+      No explicit mention, but a glucose value at or below the Level 2
+      threshold together with at least one compatible clinical feature.
+    when:
+      all:
+        - lab: {test: GLUCOSE, op: "<", value: 54, unit: mg/dL}
+        - symptoms: {min_count: 1, from: [neuroglycopenic, autonomic]}
+
+  - id: possible
+    state: possible
+    description: >
+      Clinical features plus contextual evidence of management, without
+      confirmation by value or explicit term. A glucose value between 54 and
+      70 no longer reaches `supported` under this version, so subjects
+      resting on one move here.
+    when:
+      all:
+        - symptoms: {min_count: 1, from: [neuroglycopenic, autonomic]}
+        - any:
+            - rescue_treatment: true
+            - action_taken: [dose_reduced, dose_interrupted, drug_withdrawn]
+
+case_definition:
+  primary_set: [explicit, supported]
+  review_set: [possible]
+  excluded: [absent, none]
+
+reporting:
+  counts_by_state: true
+  require_evidence_span: true
+  report_review_set_separately: true

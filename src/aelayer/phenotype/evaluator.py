@@ -183,6 +183,12 @@ class PhenotypeEvaluator:
             resolved = "excluded"
         elif route == "review":
             resolved = "review"
+        # The reason always names the deciding rule, including the policy
+        # pseudo-rules (`assertion.exclude`, `window`, ...). When a clinician
+        # disputes a verdict, the first question is which rule fired, and the
+        # answer has to be in the row rather than inferred from a nearby field.
+        if rule_id and f"'{rule_id}'" not in reason:
+            reason = f"rule '{rule_id}': {reason}"
         return EventVerdict(
             event=event, state=state, route=route, verdict=resolved,
             rule_id=rule_id, reason=reason, offset_days=offset,

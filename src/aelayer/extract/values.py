@@ -297,12 +297,15 @@ class ValueExtractor:
         rows: list[dict[str, Any]],
         onset_date: _dt.date | None,
         *,
-        window_days: int = 1,
+        window_days: int = 0,
     ) -> list[LabHit]:
-        """Structured lab results collected around the event.
+        """Structured lab results collected on the day of the event.
 
-        Restricted to a tight window around onset so that routine surveillance
-        draws taken weeks apart are not offered as evidence for this event.
+        Same day by default. A wider window picks up routine surveillance draws
+        and results belonging to a neighbouring event on the same subject, and
+        offers them as corroboration for this one. Confirmation of a
+        hypoglycaemic episode is a same-visit measurement; anything looser is
+        borrowing evidence.
         """
         if onset_date is None:
             return []
