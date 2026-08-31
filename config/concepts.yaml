@@ -1,0 +1,167 @@
+# Concept catalogue.
+#
+# MedDRA terms below are ILLUSTRATIVE PLACEHOLDERS chosen to look like real
+# coded terms. This repository holds no MedDRA licence and ships no MedDRA
+# content. Replace this file with a licensed extract before any real use.
+#
+# Grouping above the term level is an explicit, named list (see
+# `concept_groups`). No hierarchy is walked as though it were a subsumption
+# ontology.
+
+concepts:
+  HYPOGLYCEMIA:
+    label: Hypoglycemia
+    coded_terms:
+      meddra_pt: ["Hypoglycaemia", "Blood glucose decreased"]
+      meddra_llt: ["Hypoglycemia", "Low blood sugar", "Hypoglycaemic episode",
+                   "Blood sugar low", "Hypoglycaemic event"]
+    lexicon:
+      - hypoglycemia
+      - hypoglycaemia
+      - hypoglycemic episode
+      - hypoglycaemic episode
+      - hypoglycemic event
+      - low blood sugar
+      - low blood glucose
+      - depressed blood glucose
+    abbreviations: ["hypo", "hypos"]
+    context_required: [abbreviations]
+    context_gate:
+      # An abbreviation fires only near a glucose value or a qualifying symptom.
+      lab_tests: [GLUCOSE]
+      symptom_sets: [neuroglycopenic, autonomic]
+      scope: sentence
+    # Evidence that makes this concept a *candidate* even with no mention of it
+    # anywhere in the text. Pooling only explicit mentions undercounts
+    # systematically; the extractor surfaces the candidate and its evidence, and
+    # the phenotype definition decides whether it qualifies.
+    candidate_evidence:
+      symptom_sets: [neuroglycopenic, autonomic]
+      min_symptoms: 1
+      lab_tests: [GLUCOSE]
+
+  HYPERGLYCEMIA:
+    label: Hyperglycemia
+    coded_terms:
+      meddra_pt: ["Hyperglycaemia", "Blood glucose increased"]
+      meddra_llt: ["Hyperglycemia", "High blood sugar"]
+    lexicon:
+      - hyperglycemia
+      - hyperglycaemia
+      - high blood sugar
+      - elevated blood glucose
+    abbreviations: []
+
+  NAUSEA:
+    label: Nausea
+    coded_terms:
+      meddra_pt: ["Nausea"]
+      meddra_llt: ["Nausea", "Feeling sick", "Queasy"]
+    lexicon:
+      - nausea
+      - nauseated
+      - nauseous
+      - feeling sick
+    abbreviations: []
+
+  SYNCOPE:
+    label: Syncope
+    coded_terms:
+      meddra_pt: ["Syncope", "Loss of consciousness"]
+      meddra_llt: ["Fainting", "Blackout", "Syncopal episode"]
+    lexicon:
+      - syncope
+      - syncopal episode
+      - fainting
+      - fainted
+      - loss of consciousness
+    abbreviations: ["LOC"]
+    context_required: [abbreviations]
+    context_gate:
+      symptom_sets: [neuroglycopenic]
+      scope: sentence
+
+  HEADACHE:
+    label: Headache
+    coded_terms:
+      meddra_pt: ["Headache"]
+      meddra_llt: ["Headache", "Cephalgia"]
+    lexicon:
+      - headache
+      - cephalgia
+    abbreviations: []
+
+# Grouping above term level. Explicit membership only; never inferred.
+concept_groups:
+  GLYCEMIC_EVENTS:
+    label: Glycaemic events (SMQ-style narrow grouping, illustrative)
+    members: [HYPOGLYCEMIA, HYPERGLYCEMIA]
+  NEUROLOGIC_EVENTS:
+    label: Neurologic events (illustrative)
+    members: [SYNCOPE, HEADACHE]
+
+symptom_sets:
+  neuroglycopenic:
+    - confusion
+    - dizziness
+    - lightheadedness
+    - blurred vision
+    - difficulty concentrating
+    - drowsiness
+    - slurred speech
+  autonomic:
+    - shakiness
+    - tremor
+    - diaphoresis
+    - sweating
+    - palpitations
+    - pallor
+    - clamminess
+    - hunger
+    - anxiety
+  gastrointestinal:
+    - nausea
+    - vomiting
+    - abdominal pain
+
+# Surface variants for symptom concepts. Key is the canonical symptom.
+symptom_lexicon:
+  diaphoresis: ["diaphoresis", "diaphoretic", "profuse sweating"]
+  sweating: ["sweating", "sweaty"]
+  shakiness: ["shakiness", "shaky", "the shakes"]
+  tremor: ["tremor", "tremulous", "trembling"]
+  palpitations: ["palpitations", "racing heart", "pounding heart"]
+  pallor: ["pallor", "pale", "pale appearance"]
+  clamminess: ["clamminess", "clammy"]
+  hunger: ["hunger", "hungry", "ravenous"]
+  anxiety: ["anxiety", "anxious"]
+  confusion: ["confusion", "confused", "disoriented", "disorientation"]
+  dizziness: ["dizziness", "dizzy", "giddiness"]
+  lightheadedness: ["lightheadedness", "light-headedness", "light headed",
+                    "lightheaded", "light-headed"]
+  blurred vision: ["blurred vision", "blurry vision", "vision blurring"]
+  difficulty concentrating: ["difficulty concentrating", "poor concentration",
+                             "trouble concentrating"]
+  drowsiness: ["drowsiness", "drowsy", "somnolence"]
+  slurred speech: ["slurred speech", "dysarthria"]
+  nausea: ["nausea", "nauseated", "nauseous"]
+  vomiting: ["vomiting", "vomited", "emesis"]
+  abdominal pain: ["abdominal pain", "stomach pain", "epigastric pain"]
+
+lab_tests:
+  GLUCOSE:
+    label: Blood glucose
+    names: ["glucose", "blood glucose", "capillary glucose", "plasma glucose",
+            "fingerstick glucose", "BG", "CBG", "FSG"]
+    canonical_unit: mg/dL
+    conversions:
+      mmol/L: 18.0182          # multiply to reach mg/dL
+      mg/dL: 1.0
+    plausible_range: [10, 900]  # in canonical units; outside this, do not trust
+  HBA1C:
+    label: Haemoglobin A1c
+    names: ["hba1c", "haemoglobin a1c", "hemoglobin a1c", "a1c"]
+    canonical_unit: "%"
+    conversions:
+      "%": 1.0
+    plausible_range: [3, 20]
