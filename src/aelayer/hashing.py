@@ -23,7 +23,12 @@ from typing import Any
 
 #: Bumped by hand when extractor behaviour changes in a way config cannot
 #: express.  Folded into ``extractor_version``.
-EXTRACTOR_CODE_VERSION = "extract-1.0.0"
+EXTRACTOR_CODE_VERSION = "extract-2.0.0"
+
+#: The deterministic path has its own version, separate from the model path,
+#: because a normalizer change and an extractor change have different blast
+#: radii and a result needs to say which one moved.
+NORMALIZER_CODE_VERSION = "normalize-2.0.0"
 
 _HASH_LEN = 16
 
@@ -62,6 +67,18 @@ def extractor_version(
         "extraction": hash_file(extraction_path, length=0),
     }
     return f"{EXTRACTOR_CODE_VERSION}+{hash_payload(payload, length=12)}"
+
+
+def normalizer_version(
+    concepts_path: str | Path, semantics_path: str | Path
+) -> str:
+    """Hash of (code version, concepts.yaml, collection_semantics.yaml)."""
+    payload = {
+        "code": NORMALIZER_CODE_VERSION,
+        "concepts": hash_file(concepts_path, length=0),
+        "semantics": hash_file(semantics_path, length=0),
+    }
+    return f"{NORMALIZER_CODE_VERSION}+{hash_payload(payload, length=12)}"
 
 
 def snapshot_id(data_dir: str | Path, *, length: int = _HASH_LEN) -> str:

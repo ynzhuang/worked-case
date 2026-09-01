@@ -14,7 +14,7 @@ from typing import Any
 import yaml
 
 from . import paths
-from .hashing import extractor_version, hash_file
+from .hashing import extractor_version, hash_file, normalizer_version
 
 
 class ConfigError(ValueError):
@@ -33,15 +33,46 @@ class Concept:
     abbreviations: list[str] = field(default_factory=list)
     context_required: list[str] = field(default_factory=list)
     context_gate: dict[str, Any] = field(default_factory=dict)
+    #: Whether two adjacent records of this concept are more likely two
+    #: episodes than one evolving episode. Hypoglycemia recurs; anaemia
+    #: evolves. The reconciliation default is wrong for the former, so the
+    #: catalogue states it rather than letting the linker assume.
+    recurrence_expected: bool = True
     #: Evidence that makes this concept a candidate with no mention present.
     #: Empty means the concept is only ever raised by an explicit mention.
     candidate_evidence: dict[str, Any] = field(default_factory=dict)
 
     def all_coded_terms(self) -> list[str]:
+        """Every coded term for this concept, across every dictionary version."""
         out: list[str] = []
-        for values in self.coded_terms.values():
+        for key, values in self.coded_terms.items():
+            if key == "by_dictionary_version":
+                for body in values.values():
+                    for terms in body.values():
+                        out.extend(terms)
+                continue
             out.extend(values)
         return sorted(set(out))
+
+    def coded_terms_for_version(self, dictionary_version: str | None) -> list[str]:
+        """Coded terms in force under one dictionary version.
+
+        Used when a definition does *not* bridge versions: a study coded under
+        an earlier dictionary is then matched only on the terms that dictionary
+        actually had.
+        """
+        by_version = self.coded_terms.get("by_dictionary_version") or {}
+        if dictionary_version and dictionary_version in by_version:
+            body = by_version[dictionary_version]
+            return sorted({t for terms in body.values() for t in terms})
+        return sorted(
+            {
+                t
+                for key, values in self.coded_terms.items()
+                if key != "by_dictionary_version"
+                for t in values
+            }
+        )
 
     @property
     def abbreviations_gated(self) -> bool:
@@ -99,6 +130,7 @@ class ConceptCatalog:
                 context_required=list(body.get("context_required") or []),
                 context_gate=body.get("context_gate") or {},
                 candidate_evidence=body.get("candidate_evidence") or {},
+                recurrence_expected=bool(body.get("recurrence_expected", True)),
             )
 
         self.symptom_sets: dict[str, list[str]] = {
@@ -249,6 +281,25 @@ class ExtractionConfig:
         return float(self.confidence.get(key, default))
 
 
+@dataclass(frozen=True)
+class Configs:
+    """Everything loaded from `config/`, with the versions they imply."""
+
+    catalog: "ConceptCatalog"
+    extraction: "ExtractionConfig"
+    semantics: Any
+    extractor_version: str
+    normalizer_version: str
+
+    def __iter__(self):
+        return iter(
+            (self.catalog, self.extraction, self.semantics, self.extractor_version)
+        )
+
+    def terminology_versions(self) -> dict[str, str]:
+        return self.semantics.dictionary_versions()
+
+
 def load_yaml(path: str | Path) -> dict[str, Any]:
     text = Path(path).read_text(encoding="utf-8")
     try:
@@ -262,23 +313,42 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 
 @lru_cache(maxsize=16)
 def _load_cached(
-    concepts_path: str, extraction_path: str, _concepts_hash: str, _extraction_hash: str
-) -> tuple[ConceptCatalog, ExtractionConfig, str]:
+    concepts_path: str,
+    extraction_path: str,
+    semantics_path: str,
+    _concepts_hash: str,
+    _extraction_hash: str,
+    _semantics_hash: str,
+) -> Configs:
+    from .semantics import CollectionSemantics
+
     catalog = ConceptCatalog(load_yaml(concepts_path), Path(concepts_path))
     extraction = ExtractionConfig(load_yaml(extraction_path), Path(extraction_path))
-    version = extractor_version(concepts_path, extraction_path)
-    return catalog, extraction, version
+    semantics = CollectionSemantics(
+        load_yaml(semantics_path), Path(semantics_path)
+    )
+    return Configs(
+        catalog=catalog,
+        extraction=extraction,
+        semantics=semantics,
+        extractor_version=extractor_version(concepts_path, extraction_path),
+        normalizer_version=normalizer_version(concepts_path, semantics_path),
+    )
 
 
 def load_configs(
     concepts_path: str | Path | None = None,
     extraction_path: str | Path | None = None,
-) -> tuple[ConceptCatalog, ExtractionConfig, str]:
-    """Load both config files and compute the extractor version they imply.
+    semantics_path: str | Path | None = None,
+) -> Configs:
+    """Load every config file and compute the versions they imply.
 
-    Results are cached on content hash, so editing a config file in place is
-    picked up without restarting the process.
+    Results are cached on content hash, so editing a file in place is picked up
+    without restarting the process.
     """
     cp = str(concepts_path or paths.CONCEPTS_YAML)
     ep = str(extraction_path or paths.EXTRACTION_YAML)
-    return _load_cached(cp, ep, hash_file(cp), hash_file(ep))
+    sp = str(semantics_path or paths.SEMANTICS_YAML)
+    return _load_cached(
+        cp, ep, sp, hash_file(cp), hash_file(ep), hash_file(sp)
+    )

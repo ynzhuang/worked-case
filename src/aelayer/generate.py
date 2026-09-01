@@ -1,16 +1,23 @@
 """Synthetic corpus generator.
 
-Produces SDTM-shaped tables, one case narrative per adverse event record, and a
-gold answer key.  The corpus is what makes evaluation possible: every narrative
-is assembled from a known intent, and that intent is written out alongside it.
+Ground truth is sampled first; representations are rendered from it.  That
+order is what makes representation invariance measurable at all: the same
+clinical episode appears in six studies under six collection conventions, and
+the harness can ask whether the pipeline reaches the same conclusion each time.
 
-Nothing here is derived from real patients.  Every table carries a ``SYNTHETIC``
-column and every narrative carries a synthetic header.
+Nothing here derives from real patients.  Every table row carries a
+``SYNTHETIC`` column and every narrative carries a synthetic header.
 
-The gold labels are the generator's *intent*, not the extractor's output.  A
-metric computed against them therefore measures whether the pipeline recovers a
-signal that was deliberately planted, which is a weaker claim than performance
-on real clinical text.  The README says so plainly.
+The variants, per the build spec:
+
+===== ==========================================================================
+V-A   one record per episode, everything in structured fields
+V-B   split into several records on severity change
+V-C   core record plus a linked event form carrying the objective value
+V-D   minimal coding; clinical detail only in narrative
+V-E   a study whose action codelist lacks the relevant concept
+V-F   an earlier dictionary version with different preferred terms
+===== ==========================================================================
 """
 
 from __future__ import annotations
@@ -19,161 +26,109 @@ import csv
 import datetime as _dt
 import json
 import random
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from . import paths
 from .catalog import ConceptCatalog, load_configs
-from .models import EVIDENCE_STATE_RANK
+from .models import EVIDENCE_STATE_RANK, SERIOUSNESS_CRITERIA
+from .semantics import CollectionSemantics, StudySemantics
 
 SYNTHETIC_FLAG = "Y"
 NARRATIVE_HEADER = (
     "*** SYNTHETIC RECORD - COMPUTER GENERATED - NOT REAL PATIENT DATA ***"
 )
 
-# --------------------------------------------------------------------------
-# Study-level conventions.  Studies differ on purpose: a system that only works
-# when every trial reports the same way has not solved the problem it claims to.
-# --------------------------------------------------------------------------
+TERMINAL_OUTCOMES = {"recovered", "recovered_with_sequelae", "fatal"}
 
-
-@dataclass(frozen=True)
-class StudyConvention:
-    study_id: str
-    label: str
-    glucose_unit: str
-    dictionary_version: str
-    codes_hypoglycemia: bool
-    severe_events_only: bool
-    n_subjects: int
-    start: _dt.date
-    note: str
-    #: How completely the AE table itself is populated. Older studies leave
-    #: causality, action and outcome to the narrative.
-    structured_ae_detail: str = "full"   # full | partial | minimal
-
-
-STUDY_CONVENTIONS: list[StudyConvention] = [
-    StudyConvention(
-        "STUDY-01", "Cardiometabolic phase 3, region A", "mg/dL", "MedDRA 26.0",
-        True, False, 62, _dt.date(2019, 3, 4),
-        "Conventional coding, US units.",
-    ),
-    StudyConvention(
-        "STUDY-02", "Cardiometabolic phase 3, region B", "mmol/L", "MedDRA 24.1",
-        True, False, 58, _dt.date(2017, 9, 11),
-        "SI units throughout; a threshold rule that ignores units misreads this study.",
-    ),
-    StudyConvention(
-        "STUDY-03", "Phase 2b dose ranging", "mg/dL", "MedDRA 25.0",
-        True, True, 44, _dt.date(2020, 6, 15),
-        "Protocol collected severe adverse events only; milder events survive "
-        "solely as narrative context.",
-    ),
-    StudyConvention(
-        "STUDY-04", "Legacy phase 3 extension", "mmol/L", "MedDRA 21.1",
-        False, False, 71, _dt.date(2015, 1, 20),
-        "No coded term for hypoglycemia was ever applied in this study; every "
-        "event is recoverable only from narrative.",
-        structured_ae_detail="minimal",
-    ),
-    StudyConvention(
-        "STUDY-05", "Phase 3 open-label", "mg/dL", "MedDRA 27.0",
-        True, False, 55, _dt.date(2021, 11, 2),
-        "Recent conventions, mixed phrasing.",
-    ),
-    StudyConvention(
-        "STUDY-06", "Phase 2 crossover", "mmol/L", "MedDRA 23.0",
-        True, False, 40, _dt.date(2018, 5, 7),
-        "Crossover design; rechallenge language appears more often.",
-        structured_ae_detail="partial",
-    ),
-]
-
-NON_SPECIFIC_CODED_TERMS = [
-    "Malaise", "Asthenia", "Feeling abnormal", "General physical health deterioration"
-]
 
 # --------------------------------------------------------------------------
-# Narrative assembly with offset tracking
+# Ground truth
 # --------------------------------------------------------------------------
 
 
-class NarrativeBuilder:
-    """Assembles a narrative while recording character offsets of key mentions."""
+@dataclass
+class EpisodeTruth:
+    """What actually happened, before any study wrote it down."""
 
-    def __init__(self, header: str):
-        self.header = header
-        self._parts: list[str] = []
-        self._marks: dict[str, dict[str, Any]] = {}
+    truth_id: str
+    concept: str
+    onset_offset_days: int              # from the first dose escalation
+    duration_days: int
+    severity_steps: list[tuple[int, str]]   # (day offset from onset, severity)
+    seriousness: bool
+    seriousness_criteria: list[str]
+    relatedness: str
+    action_taken: str | None
+    outcome: str
+    glucose_mgdl: float | None
+    symptoms: list[str]
+    rescue_given: bool
+    third_party_assistance: bool
+    coded_by_study: bool = True
+    assertion: str = "present"
+    #: A second, distinct episode for the same subject a few days later. For a
+    #: concept where recurrence is expected these must stay separate.
+    recurrence_gap_days: int | None = None
+    note: str = ""
 
     @property
-    def _cursor(self) -> int:
-        # Offsets are measured against header + "\n" + body, which is the exact
-        # string the extractor sees.
-        return len(self.header) + 1 + sum(len(p) for p in self._parts)
+    def peak_severity(self) -> str:
+        order = ["mild", "moderate", "severe"]
+        return max((s for _d, s in self.severity_steps), key=order.index)
 
-    def sentence(self, text: str) -> None:
-        if self._parts:
-            self._parts.append(" ")
-        self._parts.append(text)
+    @property
+    def onset_is_in_window(self) -> bool:
+        return 0 <= self.onset_offset_days <= 14
 
-    def marked_sentence(self, before: str, mention: str, after: str, label: str) -> None:
-        """Add a sentence and record where ``mention`` lands inside it."""
-        if self._parts:
-            self._parts.append(" ")
-        start = self._cursor + len(before)
-        self._parts.append(before + mention + after)
-        self._marks[label] = {
-            "text": mention,
-            "start": start,
-            "end": start + len(mention),
-        }
+    def true_evidence_state(self) -> str:
+        """The state v1 should assign given the clinical facts.
 
-    def mark(self, label: str) -> dict[str, Any] | None:
-        return self._marks.get(label)
+        Computed from the truth, independent of how any study recorded it.
+        """
+        if self.concept != "HYPOGLYCEMIA" or self.assertion != "present":
+            return "none"
+        has_symptom = bool(self.symptoms)
+        low_glucose = self.glucose_mgdl is not None and self.glucose_mgdl < 70
+        if self.coded_by_study:
+            return "explicit"
+        if low_glucose and has_symptom:
+            return "supported"
+        if has_symptom:
+            return "insufficient"
+        return "none"
 
-    def body(self) -> str:
-        return "".join(self._parts)
+    def true_verdict(self) -> str:
+        """The verdict v1 should reach, independent of representation.
 
-    def full_text(self) -> str:
-        return f"{self.header}\n{self.body()}"
+        This is what invariance is measured against: a study that codes the
+        event and one that leaves it to the narrative should land in the same
+        bucket, even if they arrive by different rules.
+        """
+        if self.concept != "HYPOGLYCEMIA" or self.assertion != "present":
+            return "excluded"
+        if not self.onset_is_in_window:
+            return "excluded"
+        low_glucose = self.glucose_mgdl is not None and self.glucose_mgdl < 70
+        has_symptom = bool(self.symptoms)
+        if low_glucose and has_symptom:
+            return "case"
+        if has_symptom:
+            return "review"
+        return "excluded"
 
 
 # --------------------------------------------------------------------------
-# Surface-form pools
+# Surface forms
 # --------------------------------------------------------------------------
 
-CONCEPT_SURFACES_US = [
-    "hypoglycemia", "hypoglycemic episode", "low blood sugar", "low blood glucose",
-]
-CONCEPT_SURFACES_GB = [
-    "hypoglycaemia", "hypoglycaemic episode", "low blood sugar",
-]
-MISSPELLINGS = [
-    "hypoglycemai", "hypoglyceemia", "hypoglycaema", "hypogycemia", "hypoglcyemia",
+VERBATIM_TERMS = [
+    "low blood sugar episode", "hypoglycaemic event", "symptomatic low glucose",
+    "hypo episode", "low glucose reading",
 ]
 
-ONSET_PHRASINGS: dict[str, list[str]] = {
-    "relative_after": [
-        "{n} {unit} after the {anchor}",
-        "{n} {unit} following the {anchor}",
-        "{n} {unit} post {anchor}",
-    ],
-    "relative_within": ["within {n} {unit} of the {anchor}"],
-    "relative_later": ["{n} {unit} later"],
-    "day_after": ["the day after the {anchor}"],
-    "study_day": ["on study day {study_day}"],
-    "absolute_date": ["on {date_dmy}"],
-    "vague": ["several days after the {anchor}", "a few days after the {anchor}"],
-    "same_day": ["on the day of the {anchor}"],
-}
-
-#: Noun-phrase surfaces, safe after "the subject reported ...". The adjectival
-#: variants in concepts.yaml are exercised by a separate sentence template so
-#: the narratives stay grammatical while still covering both surface forms.
-SYMPTOM_NOUN_FORMS: dict[str, list[str]] = {
+SYMPTOM_NOUNS: dict[str, list[str]] = {
     "confusion": ["confusion", "disorientation"],
     "dizziness": ["dizziness", "giddiness"],
     "lightheadedness": ["lightheadedness", "light-headedness"],
@@ -192,170 +147,101 @@ SYMPTOM_NOUN_FORMS: dict[str, list[str]] = {
     "anxiety": ["anxiety"],
 }
 
-#: Adjectival surfaces, used only after "the subject was ...".
-SYMPTOM_ADJ_FORMS: dict[str, list[str]] = {
-    "confusion": ["confused", "disoriented"],
-    "dizziness": ["dizzy"],
-    "lightheadedness": ["lightheaded", "light-headed"],
-    "drowsiness": ["drowsy"],
-    "diaphoresis": ["diaphoretic"],
-    "sweating": ["sweaty"],
-    "shakiness": ["shaky"],
-    "tremor": ["tremulous"],
-    "pallor": ["pale"],
-    "clamminess": ["clammy"],
-    "hunger": ["hungry"],
-    "anxiety": ["anxious"],
+CONCEPT_SURFACES = {
+    "HYPOGLYCEMIA": ["hypoglycaemia", "hypoglycemia", "low blood sugar",
+                     "hypoglycaemic episode", "low blood glucose"],
+    "HYPERGLYCEMIA": ["hyperglycaemia", "high blood sugar"],
+    "NAUSEA": ["nausea", "feeling sick"],
+    "HEADACHE": ["headache", "cephalgia"],
+    "ANAEMIA": ["anaemia", "low haemoglobin"],
 }
-
-ANCHOR_SURFACES = [
-    "dose escalation", "dose increase", "uptitration", "dose titration",
-]
-
-NUMBER_WORDS = {
-    1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
-    7: "seven", 8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
-}
-
-LAB_PHRASES = [
-    "Capillary glucose was {value} {unit}.",
-    "Fingerstick glucose {value} {unit} was recorded at the time of the event.",
-    "Plasma glucose measured {value} {unit}.",
-    "A blood glucose of {value} {unit} was documented.",
-]
-
-SYMPTOM_PHRASES = [
-    "The subject reported {symptoms}.",
-    "The subject described {symptoms}.",
-    "{symptoms_cap} {was_were} noted by the site nurse.",
-    "On examination the subject had {symptoms}.",
-]
-SYMPTOM_ADJ_PHRASES = [
-    "The subject was {adj} at the time of the assessment.",
-    "The site nurse recorded that the subject appeared {adj}.",
-]
-
-RESCUE_PHRASES = [
-    "Oral glucose gel was administered.",
-    "The subject was given orange juice as rescue carbohydrate.",
-    "Glucose tablets were given by the study nurse.",
-    "IV dextrose was administered in the clinic.",
-]
 
 ACTION_PHRASES = {
-    "dose_reduced": "The dose was reduced at the next scheduled visit.",
-    "dose_interrupted": "Study drug was held for 48 hours.",
-    "drug_withdrawn": "The subject was permanently discontinued from study drug.",
-    "none": "No dose change to study drug was made.",
+    "dose_not_changed": "No change was made to study drug.",
+    "dose_reduced": "The study drug dose was reduced at the next visit.",
+    "drug_interrupted": "Study drug was interrupted for 48 hours.",
+    "drug_withdrawn": "The subject was permanently withdrawn from study drug.",
+    "not_applicable": "No study drug action was applicable.",
+    "unknown": "The action taken with study drug was not recorded.",
 }
 
 OUTCOME_PHRASES = {
-    "resolved": "The event resolved the same day.",
-    "resolving": "The event was resolving at the time of the last assessment.",
-    "not_resolved": "The event was ongoing at the end of the reporting period.",
+    "recovered": "The event resolved the same day.",
+    "recovering": "The event was still resolving at the last assessment.",
+    "not_recovered": "The event was ongoing at the end of the reporting period.",
+    "recovered_with_sequelae": "The event resolved with residual symptoms.",
+    "fatal": "The event had a fatal outcome.",
     "unknown": "The outcome was not recorded.",
 }
 
 RELATEDNESS_PHRASES = {
-    "possible": "The investigator assessed the event as possibly related to study drug.",
-    "probable": "The investigator assessed the event as probably related to study drug.",
     "not_related": "The investigator considered the event unrelated to study drug.",
     "unlikely": "The investigator judged the event unlikely related to study drug.",
+    "possible": "The investigator assessed the event as possibly related to study drug.",
+    "probable": "The investigator assessed the event as probably related to study drug.",
+    "definite": "The investigator considered the event definitely related to study drug.",
+    "unknown": "Causality was not assessed.",
 }
 
-RECHALLENGE_PHRASES = {
-    "done_recurred": "On rechallenge the event recurred.",
-    "done_no_recurrence": "The subject was rechallenged without recurrence.",
-    "not_done": "Rechallenge was not performed.",
-}
-
-SERIOUSNESS_PHRASES = {
-    "hospitalisation": "The subject was admitted to hospital for observation.",
-    "life_threatening": "The episode was considered life threatening by the investigator.",
+CRITERION_PHRASES = {
+    "hospitalisation": "The subject was admitted to hospital.",
+    "life_threatening": "The episode was considered life threatening.",
     "other_medically_important": "The event was regarded as medically important.",
+    "death": "The subject died.",
+    "disability": "The event resulted in persistent disability.",
+    "congenital_anomaly": "A congenital anomaly was reported.",
 }
 
-SEVERITY_WORDS = {"mild": "mild", "moderate": "moderate", "severe": "severe"}
-
-NEGATION_PHRASES = [
-    "There was no evidence of {concept} during the visit.",
-    "The subject denies {concept}.",
+#: Assertion-bearing sentences. Assertion matters in narrative and discovery,
+#: not in a coded AE row: a coded row asserts presence by construction.
+NEGATED_ASIDES = [
+    "There was no evidence of {concept} at the follow-up visit.",
     "Screening was negative for {concept}.",
     "{concept_cap} was ruled out on review of the glucose log.",
 ]
-
-HYPOTHETICAL_PHRASES = [
+HYPOTHETICAL_ASIDES = [
     "The subject was advised to report symptoms of {concept} promptly.",
     "The site was instructed to monitor for {concept} after each dose increase.",
-    "Carbohydrate was supplied in case of {concept}.",
 ]
-
-HISTORICAL_PHRASES = [
-    "The subject has a history of {concept} prior to study entry.",
-    "Past medical history includes {concept}.",
+HISTORICAL_ASIDES = [
+    "Past medical history includes {concept} prior to study entry.",
     "{concept_cap} was documented previously, before screening.",
 ]
 
-FAMILY_PHRASES = [
-    "The subject's mother has {concept}.",
-    "Family history of {concept} was recorded at screening.",
-]
 
-UNCERTAIN_PHRASES = [
-    "The presentation was concerning for {concept}, though this could not be confirmed.",
-    "Possible {concept} was considered by the investigator.",
-    "{concept_cap} cannot be excluded on the available information.",
-]
+class NarrativeBuilder:
+    """Assembles a narrative while recording where key mentions land."""
 
-DISTRACTOR_CONCEPTS = {
-    "NAUSEA": ("Nausea", ["nausea", "feeling sick"]),
-    "HEADACHE": ("Headache", ["headache", "cephalgia"]),
-    "HYPERGLYCEMIA": ("Hyperglycaemia", ["hyperglycemia", "high blood sugar"]),
-}
+    def __init__(self, header: str):
+        self.header = header
+        self._parts: list[str] = []
+        self._marks: dict[str, dict[str, Any]] = {}
 
-#: Distractor concepts whose surface form is itself a catalogued symptom. The
-#: narrative genuinely mentions the symptom, so gold has to record it.
-DISTRACTOR_SYMPTOMS = {"NAUSEA": ["nausea"]}
+    @property
+    def _cursor(self) -> int:
+        return len(self.header) + 1 + sum(len(p) for p in self._parts)
 
-# Pattern mix.  Weights are chosen so every pattern appears often enough for a
-# per-pattern metric to mean something, while explicit cases stay the majority
-# as they are in real coded data.
-PATTERN_WEIGHTS: dict[str, int] = {
-    "explicit_coded": 14,
-    "explicit_verbatim_only": 6,
-    "explicit_british": 5,
-    "explicit_misspelled": 4,
-    "abbrev_gated": 5,
-    "abbrev_ungated": 4,
-    "lab_symptom": 9,
-    "split_sentence": 5,
-    "context_rescue": 6,
-    "context_action": 5,
-    "symptom_only": 5,
-    "negated": 8,
-    "hypothetical": 5,
-    "historical": 5,
-    "family_history": 4,
-    "uncertain": 5,
-    "out_of_window": 5,
-    "unresolved_onset": 4,
-    "distractor": 8,
-}
+    def sentence(self, text: str) -> None:
+        if self._parts:
+            self._parts.append(" ")
+        self._parts.append(text)
 
+    def marked(self, before: str, mention: str, after: str, label: str) -> None:
+        if self._parts:
+            self._parts.append(" ")
+        start = self._cursor + len(before)
+        self._parts.append(before + mention + after)
+        self._marks[label] = {"text": mention, "start": start,
+                              "end": start + len(mention)}
 
-@dataclass
-class Row:
-    table: str
-    values: dict[str, Any]
+    def mark(self, label: str) -> dict[str, Any] | None:
+        return self._marks.get(label)
 
+    def body(self) -> str:
+        return "".join(self._parts)
 
-@dataclass
-class GeneratedCorpus:
-    tables: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    narratives: list[dict[str, Any]] = field(default_factory=list)
-    gold: list[dict[str, Any]] = field(default_factory=list)
-    gold_cases: list[dict[str, Any]] = field(default_factory=list)
-    manifest: dict[str, Any] = field(default_factory=dict)
+    def full_text(self) -> str:
+        return f"{self.header}\n{self.body()}"
 
 
 # --------------------------------------------------------------------------
@@ -363,906 +249,611 @@ class GeneratedCorpus:
 # --------------------------------------------------------------------------
 
 
+@dataclass
+class GeneratedCorpus:
+    tables: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    narratives: list[dict[str, Any]] = field(default_factory=list)
+    truths: list[dict[str, Any]] = field(default_factory=list)
+    gold_records: list[dict[str, Any]] = field(default_factory=list)
+    gold_episodes: list[dict[str, Any]] = field(default_factory=list)
+    manifest: dict[str, Any] = field(default_factory=dict)
+
+
 class CorpusGenerator:
     def __init__(
         self,
         seed: int = 7,
-        n_studies: int = 4,
+        n_studies: int = 6,
+        invariance_truths: int = 24,
+        background_per_study: int = 18,
         catalog: ConceptCatalog | None = None,
-        subjects_per_study: int | None = None,
+        semantics: CollectionSemantics | None = None,
     ):
-        if not 1 <= n_studies <= len(STUDY_CONVENTIONS):
-            raise ValueError(
-                f"n_studies must be between 1 and {len(STUDY_CONVENTIONS)}"
-            )
         self.seed = seed
         self.rng = random.Random(seed)
-        self.conventions = STUDY_CONVENTIONS[:n_studies]
-        self.subjects_per_study = subjects_per_study
-        if catalog is None:
-            catalog, _, _ = load_configs()
+        if catalog is None or semantics is None:
+            catalog, _extraction, semantics, _v = load_configs()
         self.catalog = catalog
-        self.symptom_surfaces = catalog.symptom_lexicon
-        self.neuro = catalog.symptom_sets["neuroglycopenic"]
-        self.autonomic = catalog.symptom_sets["autonomic"]
+        self.semantics = semantics
+        all_studies = semantics.study_ids()
+        if not 1 <= n_studies <= len(all_studies):
+            raise ValueError(f"n_studies must be between 1 and {len(all_studies)}")
+        self.study_ids = all_studies[:n_studies]
+        self.invariance_truths = invariance_truths
+        self.background_per_study = background_per_study
+        self._lb_seq: dict[str, int] = {}
 
     # -- helpers ------------------------------------------------------------
 
     def _pick(self, seq: list[Any]) -> Any:
         return seq[self.rng.randrange(len(seq))]
 
-    def _weighted_pattern(self, convention: StudyConvention) -> str:
-        weights = dict(PATTERN_WEIGHTS)
-        if convention.severe_events_only:
-            # Milder presentations are simply not collected as AE records here,
-            # so contextual-only patterns become rarer, not absent.
-            for key in ("context_rescue", "context_action", "symptom_only"):
-                weights[key] = max(1, weights[key] // 3)
-            weights["explicit_coded"] += 6
-        if not convention.codes_hypoglycemia:
-            weights["explicit_coded"] = 0
-            weights["explicit_british"] = 0
-            weights["explicit_verbatim_only"] += 10
-            weights["lab_symptom"] += 5
-        names = sorted(weights)
-        population = [n for n in names for _ in range(weights[n])]
-        return self._pick(population)
-
-    @staticmethod
-    def _ucfirst(text: str) -> str:
-        """Capitalise the first character only.
-
-        ``str.capitalize`` lowercases the remainder, which would corrupt an
-        embedded date such as ``on 28-Apr-2019``.
-        """
-        return text[:1].upper() + text[1:] if text else text
-
-    def _set_coded_term(self, intent: dict[str, Any], term: str | None, *, matches: bool) -> None:
-        """Record the AE dictionary term and whether it denotes the concept.
-
-        A study may code an event as "Malaise" while the narrative plainly
-        describes hypoglycemia. That is a coded term, but it is not a coded
-        term *for this concept*, and the `explicit` rule must not fire on it.
-        """
-        intent["coded_term"] = term
-        intent["coded_term_matches_concept"] = bool(term) and matches
-
-    def _concept_coded_term(self, concept_id: str = "HYPOGLYCEMIA") -> str:
-        return self._pick(sorted(self.catalog.concept(concept_id).all_coded_terms()))
-
     def _symptom_phrase(self, symptoms: list[str]) -> str:
-        surfaces = [self._pick(SYMPTOM_NOUN_FORMS.get(s, [s])) for s in symptoms]
+        surfaces = [self._pick(SYMPTOM_NOUNS.get(s, [s])) for s in symptoms]
         if len(surfaces) == 1:
             return surfaces[0]
         return ", ".join(surfaces[:-1]) + " and " + surfaces[-1]
 
-    def _choose_symptoms(self, count: int = 0) -> list[str]:
-        count = count or self.rng.choice([1, 1, 2, 2, 3])
-        pool = sorted(set(self.neuro) | set(self.autonomic))
-        return sorted(self.rng.sample(pool, min(count, len(pool))))
-
-    def _glucose_value(self, unit: str, *, level: str = "normal") -> tuple[float, float]:
-        """Return ``(reported_value, canonical_mgdl)`` for a glucose draw.
-
-        ``level`` is ``low`` (a hypoglycaemic value), ``normal`` (a routine
-        surveillance draw) or ``high`` (genuinely hyperglycaemic). A
-        hyperglycemia narrative reporting 76 mg/dL would be neither realistic
-        nor separable from a normal result.
-        """
-        if level == "low":
-            mgdl = self.rng.choice([38, 44, 48, 52, 54, 58, 61, 64, 66, 68])
-        elif level == "high":
-            mgdl = self.rng.choice([196, 214, 238, 265, 291, 320])
-        else:
-            mgdl = self.rng.choice([76, 84, 91, 98, 105, 112])
+    def _glucose_in(self, unit: str, mgdl: float) -> tuple[float, float]:
+        """Return ``(value_as_reported, canonical_mgdl)`` for a study's unit."""
         if unit == "mmol/L":
-            return round(mgdl / 18.0182, 1), round(round(mgdl / 18.0182, 1) * 18.0182, 4)
+            reported = round(mgdl / 18.0182, 1)
+            return reported, round(reported * 18.0182, 4)
         return float(mgdl), float(mgdl)
 
-    def _onset_phrase(
-        self, offset: int, anchor_surface: str, anchor_date: _dt.date, ref_start: _dt.date
-    ) -> tuple[str, str, int]:
-        """Pick a phrasing for an onset offset.
+    def coded_term_for(self, concept: str, dictionary_version: str) -> str | None:
+        """The preferred term this dictionary version uses for the concept."""
+        body = self.catalog.concept(concept)
+        by_version = body.coded_terms.get("by_dictionary_version") or {}
+        if dictionary_version in by_version:
+            terms = by_version[dictionary_version].get("pt") or []
+            if terms:
+                return terms[0]
+        terms = body.coded_terms.get("pt") or []
+        return terms[0] if terms else None
 
-        Returns ``(phrase, phrasing_id, offset_actually_expressed)``.  Vague
-        quantifiers express a range rather than a number: the true offset stays
-        in gold, and the mismatch shows up in the per-pattern onset metric
-        instead of being hidden.
+    # -- truth sampling -----------------------------------------------------
+
+    def sample_truth(self, truth_id: str, *, kind: str = "case") -> EpisodeTruth:
+        """Sample one episode of ground truth.
+
+        ``kind`` steers the clinical picture so the corpus covers cases, review
+        candidates and clear non-cases rather than only positives.
         """
-        onset_date = anchor_date + _dt.timedelta(days=offset)
-        if offset == 0:
-            # "0 days later" is not something anyone writes.
-            options = ["study_day", "absolute_date", "same_day"]
-        else:
-            options = [
-                "relative_after", "relative_within", "relative_later",
-                "study_day", "absolute_date",
-            ]
-        if offset == 1:
-            options.append("day_after")
-        if 3 <= offset <= 5:
-            options.append("vague")
-        if offset >= 14 and offset % 7 == 0:
-            options.append("relative_after")  # expressed in weeks below
-        phrasing = self._pick(options)
-        template = self._pick(ONSET_PHRASINGS[phrasing])
-        # Weeks where the offset divides evenly, days otherwise. Trials write
-        # both, and the extractor has to normalise both to days.
-        if offset and offset % 7 == 0 and offset >= 7 and self.rng.random() < 0.4:
-            magnitude, unit_word = offset // 7, "week"
-        else:
-            magnitude, unit_word = offset, "day"
-        unit_word = unit_word if magnitude == 1 else unit_word + "s"
-        n_text = (
-            NUMBER_WORDS[magnitude]
-            if magnitude in NUMBER_WORDS and self.rng.random() < 0.45
-            else str(magnitude)
+        symptom_pool = sorted(
+            set(self.catalog.symptom_sets["neuroglycopenic"])
+            | set(self.catalog.symptom_sets["autonomic"])
         )
-        phrase = template.format(
-            n=n_text,
-            unit=unit_word,
-            anchor=anchor_surface,
-            study_day=(onset_date - ref_start).days + 1,
-            date_dmy=onset_date.strftime("%d-%b-%Y"),
+        onset = self.rng.randint(0, 14)
+        severity_start = self._pick(["mild", "moderate", "severe"])
+        steps = [(0, severity_start)]
+        if self.rng.random() < 0.35:
+            worse = {"mild": "moderate", "moderate": "severe", "severe": "severe"}
+            steps.append((self.rng.randint(1, 3), worse[severity_start]))
+        serious = severity_start == "severe" and self.rng.random() < 0.5
+        criteria = (
+            sorted(self.rng.sample(
+                ["hospitalisation", "life_threatening", "other_medically_important"], 1
+            ))
+            if serious else []
         )
-        return phrase, phrasing, offset
-
-    # -- gold state computation --------------------------------------------
-
-    @staticmethod
-    def gold_state(intent: dict[str, Any]) -> str:
-        """The evidence state v1 should assign, computed from generation intent.
-
-        This mirrors the semantics of ``te_symptomatic_hypoglycemia.v1``.  It is
-        deliberately written from the intent side rather than by calling the
-        evaluator, so that the harness compares two independent derivations of
-        the same answer.
-        """
-        if intent.get("concept") != "HYPOGLYCEMIA":
-            return "none"
-        assertion = intent.get("assertion")
-        if assertion == "absent":
-            return "absent"
-
-        if assertion in ("hypothetical", "historical", "family_history"):
-            return "none"
-        if assertion == "uncertain":
-            # Routed to review by the assertion policy. The `explicit` rule can
-            # still fire on a matching coded term, because a coded term is an
-            # assertion-independent fact; the lexicon arm requires `present`.
-            return "explicit" if intent.get("coded_term_matches_concept") else "none"
-        # assertion == present
-        if intent.get("coded_term_matches_concept") or intent.get("explicit_mention"):
-            return "explicit"
-        low_glucose = any(
-            lab["canonical_mgdl"] < 70 for lab in intent.get("labs", [])
-            if lab["test"] == "GLUCOSE"
+        outcome = self._pick(
+            ["recovered", "recovered", "recovering", "not_recovered"]
         )
-        has_symptom = bool(intent.get("symptoms"))
-        if low_glucose and has_symptom:
-            return "supported"
-        if has_symptom and (
-            intent.get("rescue_treatment")
-            or intent.get("action_taken")
-            in ("dose_reduced", "dose_interrupted", "drug_withdrawn")
-        ):
-            return "possible"
-        return "none"
+        action = self._pick(
+            ["dose_not_changed", "dose_reduced", "drug_interrupted",
+             "drug_withdrawn", "dose_reduced"]
+        )
 
-    @staticmethod
-    def gold_verdict(intent: dict[str, Any], state: str) -> str:
-        """The v1 verdict for one record, from intent."""
-        if intent.get("concept") != "HYPOGLYCEMIA":
-            return "excluded"
-        assertion = intent.get("assertion")
-        if assertion in ("absent", "hypothetical", "historical", "family_history"):
-            return "excluded"
-        if intent.get("onset_offset_days") is None:
-            return "review"  # window.on_unresolved_onset: review
-        if not (0 <= intent["onset_offset_days"] <= 14):
-            return "excluded"
-        if assertion == "uncertain":
-            return "review"  # assertion.route_to_review
-        if state in ("explicit", "supported"):
-            return "case"
-        if state == "possible":
-            return "review"
-        return "excluded"
+        if kind == "case":
+            glucose = float(self.rng.choice([38, 44, 48, 52, 54, 58, 62, 66, 68]))
+            symptoms = sorted(self.rng.sample(symptom_pool, self.rng.choice([1, 2, 2, 3])))
+        elif kind == "review":
+            # Symptoms with no confirming value: the adjudication set.
+            glucose = None
+            symptoms = sorted(self.rng.sample(symptom_pool, self.rng.choice([1, 2])))
+        elif kind == "out_of_window":
+            glucose = float(self.rng.choice([44, 52, 58, 64]))
+            symptoms = sorted(self.rng.sample(symptom_pool, 2))
+            onset = self.rng.randint(21, 60)
+        elif kind == "no_symptoms":
+            glucose = float(self.rng.choice([48, 58, 66]))
+            symptoms = []
+        else:  # distractor concept
+            return EpisodeTruth(
+                truth_id=truth_id,
+                concept=self._pick(["HYPERGLYCEMIA", "NAUSEA", "HEADACHE"]),
+                onset_offset_days=onset, duration_days=self.rng.randint(1, 6),
+                severity_steps=steps, seriousness=serious,
+                seriousness_criteria=criteria,
+                relatedness=self._pick(["possible", "probable", "unlikely", "not_related"]),
+                action_taken=action, outcome=outcome, glucose_mgdl=None,
+                symptoms=[], rescue_given=False, third_party_assistance=False,
+                note="distractor concept",
+            )
 
-    # -- record builders ----------------------------------------------------
+        return EpisodeTruth(
+            truth_id=truth_id,
+            concept="HYPOGLYCEMIA",
+            onset_offset_days=onset,
+            duration_days=self.rng.randint(1, 5),
+            severity_steps=steps,
+            seriousness=serious,
+            seriousness_criteria=criteria,
+            relatedness=self._pick(["possible", "probable", "unlikely", "not_related"]),
+            action_taken=action,
+            outcome=outcome,
+            glucose_mgdl=glucose,
+            symptoms=symptoms,
+            rescue_given=bool(symptoms) and self.rng.random() < 0.6,
+            third_party_assistance=severity_start == "severe" and self.rng.random() < 0.4,
+            recurrence_gap_days=(
+                self.rng.randint(2, 5) if self.rng.random() < 0.22 else None
+            ),
+            note=kind,
+        )
 
-    def _build_record(
+    # -- rendering ----------------------------------------------------------
+
+    def render(
         self,
-        convention: StudyConvention,
+        truth: EpisodeTruth,
+        study: StudySemantics,
         subject_id: str,
-        ae_seq: int,
         anchor_date: _dt.date,
-        ref_start: _dt.date,
+        corpus: GeneratedCorpus,
+        episode_index: int = 0,
     ) -> dict[str, Any]:
-        """Build one AE record, its narrative, and its gold block."""
-        pattern = self._weighted_pattern(convention)
-        doc_id = f"{subject_id}-NAR-{ae_seq:02d}"
+        """Write one truth into one study's collection conventions."""
+        onset = anchor_date + _dt.timedelta(days=truth.onset_offset_days)
+        end = onset + _dt.timedelta(days=truth.duration_days)
+        variant = study.representation
+
+        # V-B splits a worsening event across records; every other variant is
+        # one record per episode.
+        if variant == "V-B" and len(truth.severity_steps) > 1:
+            steps = truth.severity_steps
+        else:
+            steps = [(0, truth.peak_severity)]
+
+        record_ids: list[str] = []
+        narrative_doc_id = f"{subject_id}-NAR-{episode_index + 1:02d}"
+
+        for step_index, (day_offset, severity) in enumerate(steps):
+            step_start = onset + _dt.timedelta(days=day_offset)
+            is_last = step_index == len(steps) - 1
+            seq = len(record_ids) + 1 + episode_index * 10
+            source_record_id = f"{subject_id}-AE-{seq:03d}"
+            record_ids.append(source_record_id)
+
+            outcome = truth.outcome if is_last else "not_recovered"
+            row = self._ae_row(
+                truth=truth, study=study, subject_id=subject_id,
+                source_record_id=source_record_id, seq=seq,
+                severity=severity, onset=step_start,
+                end=end if (is_last and outcome in TERMINAL_OUTCOMES) else None,
+                outcome=outcome, is_last=is_last,
+                narrative_doc_id=narrative_doc_id if step_index == 0 else None,
+                continuation_of=record_ids[step_index - 1] if step_index else None,
+            )
+            corpus.tables["ae"].append(row)
+            corpus.gold_records.append(
+                self._gold_record(truth, study, row, severity, step_start,
+                                  end if is_last else None, outcome)
+            )
+
+        # V-C puts the objective value on a linked form instead of anywhere else.
+        if variant == "V-C" and truth.glucose_mgdl is not None:
+            reported, canonical = self._glucose_in(study.glucose_unit, truth.glucose_mgdl)
+            corpus.tables["linked_hypo_event"].append({
+                "STUDYID": study.study_id, "USUBJID": subject_id,
+                "FORMID": "HYPO_EVENT_FORM",
+                "LNKID": f"{record_ids[0]}-HEF",
+                "AESPID": record_ids[0],
+                "GLUCVAL": reported, "GLUCUNIT": study.glucose_unit,
+                "SYMPTOMATIC": "Y" if truth.symptoms else "N",
+                "THIRDPARTY": "Y" if truth.third_party_assistance else "N",
+                "RESCUE": "Y" if truth.rescue_given else "N",
+                "HEFDTC": onset.isoformat(),
+                "SYNTHETIC": SYNTHETIC_FLAG,
+            })
+
+        narrative = self._narrative(truth, study, subject_id, narrative_doc_id, onset)
+        corpus.narratives.append(narrative)
+
+        # Routine laboratory surveillance, plus the event value where the study
+        # records glucose in the lab domain rather than on a form.
+        if truth.glucose_mgdl is not None and variant != "V-C":
+            reported, canonical = self._glucose_in(study.glucose_unit, truth.glucose_mgdl)
+            corpus.tables["lb"].append(
+                self._lb_row(study, subject_id, reported, canonical, onset)
+            )
+
+        return {
+            "record_ids": record_ids,
+            "narrative_doc_id": narrative_doc_id,
+            "onset": onset,
+            "end": end,
+        }
+
+    def _ae_row(
+        self, *, truth: EpisodeTruth, study: StudySemantics, subject_id: str,
+        source_record_id: str, seq: int, severity: str, onset: _dt.date,
+        end: _dt.date | None, outcome: str, is_last: bool,
+        narrative_doc_id: str | None, continuation_of: str | None,
+    ) -> dict[str, Any]:
+        """One AE row, blanked wherever this study did not collect the field."""
+
+        def emit(field_name: str, value: Any) -> Any:
+            if not study.collects(field_name):
+                return ""
+            # A small share of collected fields are simply not answered by the
+            # site. That is `unknown` — asked, unanswered, reason unrecorded —
+            # and it is distinct from every other kind of blank.
+            if field_name in ("relatedness", "outcome") and self.rng.random() < 0.05:
+                return ""
+            return value
+
+        coded = ""
+        if study.collects("coded_term") and truth.coded_by_study:
+            coded = self.coded_term_for(truth.concept, study.dictionary_version) or ""
+
+        # A restricted codelist cannot express every clinical concept. Where it
+        # cannot, the cell is left empty and the semantics layer resolves it to
+        # `not_representable` rather than substituting a nearby code.
+        action_value = ""
+        codelist = study.codelist_for("action_taken")
+        if study.collects("action_taken") and truth.action_taken:
+            if codelist is None or truth.action_taken in codelist.permissible:
+                action_value = truth.action_taken
+
+        serious = truth.seriousness and is_last
+        return {
+            "STUDYID": study.study_id,
+            "USUBJID": subject_id,
+            "AESEQ": seq,
+            "AESPID": source_record_id,
+            "AETERM": emit("verbatim_term", self._pick(VERBATIM_TERMS)
+                           if truth.concept == "HYPOGLYCEMIA"
+                           else truth.concept.lower()),
+            "AEDECOD": coded,
+            "AEDICTVER": study.dictionary_version if coded else "",
+            "AESTDTC": emit("onset_datetime", onset.isoformat()),
+            "AEENDTC": emit("end_datetime", end.isoformat() if end else ""),
+            "AESEV": emit("severity", severity),
+            "AESER": emit("seriousness", "Y" if serious else "N"),
+            "AESCAT": "|".join(truth.seriousness_criteria) if serious else "",
+            "AEREL": emit("relatedness", truth.relatedness),
+            "AEACN": action_value,
+            "AEOUT": emit("outcome", outcome),
+            "AELNKID": f"{source_record_id}-HEF" if study.representation == "V-C" else "",
+            "AECONTRP": continuation_of or "",
+            "DOCID": narrative_doc_id or "",
+            "SYNTHETIC": SYNTHETIC_FLAG,
+        }
+
+    def _gold_record(
+        self, truth: EpisodeTruth, study: StudySemantics, row: dict[str, Any],
+        severity: str, onset: _dt.date, end: _dt.date | None, outcome: str,
+    ) -> dict[str, Any]:
+        """The true field values and true collection states for one record."""
+        states: dict[str, str] = {}
+        values: dict[str, Any] = {}
+
+        def note(name: str, value: Any, cell: Any) -> None:
+            # The answer key asks the resolver what a blank means here rather
+            # than restating the rule; if the two could disagree, the metric
+            # would be measuring the duplication, not the pipeline.
+            values[name] = value if cell not in (None, "") else None
+            states[name] = (
+                "collected" if cell not in (None, "") else study.state_for_blank(name)
+            )
+
+        note("verbatim_term", row["AETERM"] or None, row["AETERM"])
+        note("coded_term", row["AEDECOD"] or None, row["AEDECOD"])
+        note("severity", severity, row["AESEV"])
+        note("relatedness", truth.relatedness, row["AEREL"])
+        note("outcome", outcome, row["AEOUT"])
+        note("onset_datetime", onset.isoformat(), row["AESTDTC"])
+
+        # End date is gated on the outcome being terminal.
+        if row["AEENDTC"]:
+            values["end_datetime"] = row["AEENDTC"]
+            states["end_datetime"] = "collected"
+        elif not study.collects("end_datetime"):
+            values["end_datetime"] = None
+            states["end_datetime"] = study.state_for_blank("end_datetime")
+        elif outcome not in TERMINAL_OUTCOMES:
+            values["end_datetime"] = None
+            states["end_datetime"] = "pending_ongoing"
+        else:
+            values["end_datetime"] = None
+            states["end_datetime"] = "unknown"
+
+        # Action taken: collected, never asked, or not expressible here.
+        codelist = study.codelist_for("action_taken")
+        if row["AEACN"]:
+            values["action_taken"] = row["AEACN"]
+            states["action_taken"] = "collected"
+        elif not study.collects("action_taken"):
+            values["action_taken"] = None
+            states["action_taken"] = study.state_for_blank("action_taken")
+        elif (
+            truth.action_taken
+            and codelist is not None
+            and truth.action_taken in codelist.absent_concepts
+        ):
+            values["action_taken"] = None
+            states["action_taken"] = "not_representable"
+        else:
+            values["action_taken"] = None
+            states["action_taken"] = "unknown"
+
+        # Seriousness criteria are gated on the seriousness answer.
+        gate = row["AESER"] == "Y"
+        for criterion in SERIOUSNESS_CRITERIA:
+            name = f"seriousness_criteria.{criterion}"
+            if not study.collects("seriousness"):
+                states[name] = study.state_for_blank("seriousness")
+                values[name] = None
+            elif not gate:
+                states[name] = "not_applicable_gated"
+                values[name] = None
+            else:
+                states[name] = "collected"
+                values[name] = criterion in truth.seriousness_criteria
+
+        return {
+            "source_record_id": row["AESPID"],
+            "study_id": study.study_id,
+            "subject_id": row["USUBJID"],
+            "truth_id": truth.truth_id,
+            "representation": study.representation,
+            "values": values,
+            "collection_states": states,
+        }
+
+    def _narrative(
+        self, truth: EpisodeTruth, study: StudySemantics, subject_id: str,
+        doc_id: str, onset: _dt.date,
+    ) -> dict[str, Any]:
         header = (
             f"{NARRATIVE_HEADER}\n"
-            f"Study {convention.study_id} | Subject {subject_id} | "
-            f"Narrative {doc_id} | synthetic"
+            f"Study {study.study_id} | Subject {subject_id} | Narrative {doc_id} "
+            f"| representation {study.representation} | synthetic"
         )
         builder = NarrativeBuilder(header)
-        unit = convention.glucose_unit
-        anchor_surface = self._pick(ANCHOR_SURFACES)
-
-        intent: dict[str, Any] = {
-            "pattern": pattern,
-            "concept": "HYPOGLYCEMIA",
-            "assertion": "present",
-            "coded_term": None,
-            "coded_term_matches_concept": False,
-            "coded_term_version": convention.dictionary_version,
-            "explicit_mention": False,
-            "onset_expressed_in_text": False,
-            "onset_in_ae_table": False,
-            "suppress_extra_rescue": False,
-            "symptoms": [],
-            "labs": [],
-            "onset_offset_days": None,
-            "onset_phrasing": None,
-            "anchor_event": "dose_escalation",
-            "severity": None,
-            "seriousness": [],
-            "relatedness": None,
-            "action_taken": None,
-            "rechallenge": None,
-            "rescue_treatment": False,
-            "outcome": None,
-        }
-        extra_rows: list[Row] = []
+        surface = self._pick(CONCEPT_SURFACES.get(truth.concept, [truth.concept.lower()]))
+        detail = study.narrative_detail
 
         builder.sentence(
-            f"Subject {subject_id} in study {convention.study_id} was receiving "
-            f"study drug per protocol."
+            f"Subject {subject_id} in study {study.study_id} was receiving study "
+            f"drug per protocol."
         )
-
-        handler = getattr(self, f"_pattern_{pattern}")
-        handler(
-            builder=builder,
-            intent=intent,
-            convention=convention,
-            subject_id=subject_id,
-            anchor_date=anchor_date,
-            anchor_surface=anchor_surface,
-            ref_start=ref_start,
-            unit=unit,
-            extra_rows=extra_rows,
-        )
-
-        self._add_management(builder, intent, convention)
-
-        state = self.gold_state(intent)
-        verdict = self.gold_verdict(intent, state)
-
-        onset_date = (
-            anchor_date + _dt.timedelta(days=intent["onset_offset_days"])
-            if intent["onset_offset_days"] is not None
-            else None
-        )
-        # The AE table carries the onset date only where the study recorded it.
-        table_onset_date = onset_date if intent["onset_in_ae_table"] else None
-
-        ae_row = self._ae_row(
-            convention, subject_id, ae_seq, doc_id, intent, table_onset_date
-        )
-        for lab in intent["labs"]:
-            extra_rows.append(
-                Row(
-                    "lb",
-                    self._lb_row(
-                        convention, subject_id, len(extra_rows) + 1, lab,
-                        onset_date or anchor_date,
-                    ),
-                )
-            )
-        if intent["rescue_treatment"]:
-            extra_rows.append(
-                Row(
-                    "cm",
-                    {
-                        "STUDYID": convention.study_id,
-                        "USUBJID": subject_id,
-                        "CMSEQ": ae_seq,
-                        "CMTRT": self._pick(["Glucose gel", "Dextrose 50%", "Glucagon", "Orange juice"]),
-                        "CMINDC": "Rescue for low blood glucose",
-                        "CMSTDTC": (onset_date or anchor_date).isoformat(),
-                        "SYNTHETIC": SYNTHETIC_FLAG,
-                    },
-                )
-            )
-
-        gold = {
-            "doc_id": doc_id,
-            "study_id": convention.study_id,
-            "subject_id": subject_id,
-            "ae_seq": ae_seq,
-            "pattern": pattern,
-            "concept": intent["concept"],
-            "assertion": intent["assertion"] if intent["concept"] else None,
-            "coded_term": intent["coded_term"],
-            "coded_term_version": intent["coded_term_version"] if intent["coded_term"] else None,
-            "symptoms": sorted(intent["symptoms"]),
-            "labs": intent["labs"],
-            "onset_offset_days": intent["onset_offset_days"],
-            "onset_phrasing": intent["onset_phrasing"],
-            "onset_date": onset_date.isoformat() if onset_date else None,
-            "anchor_event": intent["anchor_event"] if intent["onset_offset_days"] is not None else None,
-            "severity": intent["severity"],
-            "seriousness": sorted(intent["seriousness"]),
-            "relatedness": intent["relatedness"],
-            "action_taken": intent["action_taken"],
-            "rechallenge": intent["rechallenge"],
-            "rescue_treatment": intent["rescue_treatment"],
-            "outcome": intent["outcome"],
-            "concept_mention": builder.mark("concept"),
-            "evidence_state": state,
-            "verdict": verdict,
-        }
-
-        return {
-            "ae_row": ae_row,
-            "extra_rows": extra_rows,
-            "narrative": {
-                "doc_id": doc_id,
-                "study_id": convention.study_id,
-                "subject_id": subject_id,
-                "ae_seq": ae_seq,
-                "header": header,
-                "text": builder.body(),
-            },
-            "gold": gold,
-        }
-
-    # -- individual patterns ------------------------------------------------
-
-    def _onset(self, builder, intent, anchor_date, anchor_surface, ref_start, *, offset=None):
-        offset = offset if offset is not None else self.rng.randint(0, 14)
-        phrase, phrasing, _ = self._onset_phrase(offset, anchor_surface, anchor_date, ref_start)
-        intent["onset_offset_days"] = offset
-        intent["onset_phrasing"] = phrasing
-        intent["onset_expressed_in_text"] = True
-        # AESTDTC is recorded about half the time. Where it is missing the onset
-        # is recoverable only from the narrative, which is the case the temporal
-        # extractor exists for; where both are present they must agree.
-        intent["onset_in_ae_table"] = self.rng.random() < 0.5
-        return phrase
-
-    def _concept_sentence(self, builder, intent, surface, onset_phrase, severity=None):
-        prefix = "The subject experienced "
-        if severity:
-            prefix += f"{SEVERITY_WORDS[severity]} "
-            intent["severity"] = severity
-        builder.marked_sentence(prefix, surface, f" {onset_phrase}.", "concept")
-        intent["explicit_mention"] = True
-
-    def _pattern_explicit_coded(self, builder, intent, convention, subject_id,
-                                anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        surface = self._pick(CONCEPT_SURFACES_US)
-        onset = self._onset(builder, intent, anchor_date, anchor_surface, ref_start)
-        severity = self._severity_for(convention)
-        self._concept_sentence(builder, intent, surface, onset, severity)
-        self._set_coded_term(intent, self._concept_coded_term(), matches=True)
-        if self.rng.random() < 0.6:
-            self._add_symptoms(builder, intent)
-        if self.rng.random() < 0.5:
-            self._add_lab(builder, intent, unit, level="low")
-
-    def _pattern_explicit_verbatim_only(self, builder, intent, convention, subject_id,
-                                        anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        surface = self._pick(CONCEPT_SURFACES_US + CONCEPT_SURFACES_GB)
-        onset = self._onset(builder, intent, anchor_date, anchor_surface, ref_start)
-        self._concept_sentence(builder, intent, surface, onset, self._severity_for(convention))
-        if not convention.codes_hypoglycemia:
-            self._set_coded_term(
-                intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False
-            )
-        self._add_symptoms(builder, intent)
-
-    def _pattern_explicit_british(self, builder, intent, convention, subject_id,
-                                  anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        surface = self._pick(CONCEPT_SURFACES_GB)
-        onset = self._onset(builder, intent, anchor_date, anchor_surface, ref_start)
-        self._concept_sentence(builder, intent, surface, onset, self._severity_for(convention))
-        self._set_coded_term(intent, "Hypoglycaemia", matches=True)
-
-    def _pattern_explicit_misspelled(self, builder, intent, convention, subject_id,
-                                     anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        surface = self._pick(MISSPELLINGS)
-        onset = self._onset(builder, intent, anchor_date, anchor_surface, ref_start)
-        self._concept_sentence(builder, intent, surface, onset, self._severity_for(convention))
-        self._add_symptoms(builder, intent)
-
-    def _pattern_abbrev_gated(self, builder, intent, convention, subject_id,
-                              anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        onset = self._onset(builder, intent, anchor_date, anchor_surface, ref_start)
-        symptoms = self._choose_symptoms(2)
-        intent["symptoms"] = symptoms
-        value, canonical = self._glucose_value(unit, level="low")
-        intent["labs"].append(
-            {"test": "GLUCOSE", "value": value, "unit": unit, "canonical_mgdl": canonical}
-        )
-        # The abbreviation and its context gate sit in the same sentence.
-        builder.marked_sentence(
-            f"The subject had a symptomatic ",
-            "hypo",
-            f" {onset}, with {self._symptom_phrase(symptoms)} and a "
-            f"capillary glucose of {value} {unit}.",
-            "concept",
-        )
-        intent["explicit_mention"] = True
-
-    def _pattern_abbrev_ungated(self, builder, intent, convention, subject_id,
-                                anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        # "hypo" with no glucose value and no qualifying symptom in scope. The
-        # gate must suppress it: an ungated abbreviation is not an event.
-        intent["concept"] = None
-        intent["assertion"] = None
-        self._set_coded_term(intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False)
-        intent["coded_term_version"] = convention.dictionary_version
-        builder.sentence(
-            "The site coordinator noted in passing that the subject uses the word "
-            "hypo to describe any unwell feeling."
-        )
-        builder.sentence("No glucose measurement was taken at that visit.")
-
-    def _pattern_lab_symptom(self, builder, intent, convention, subject_id,
-                             anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        onset = self._onset(builder, intent, anchor_date, anchor_surface, ref_start)
-        symptoms = self._choose_symptoms(2)
-        intent["symptoms"] = symptoms
-        builder.sentence(
-            f"{self._ucfirst(onset)} the subject "
-            f"reported {self._symptom_phrase(symptoms)}."
-        )
-        self._add_lab(builder, intent, unit, level="low")
-        if not convention.codes_hypoglycemia or self.rng.random() < 0.5:
-            self._set_coded_term(intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False)
-
-    def _pattern_split_sentence(self, builder, intent, convention, subject_id,
-                                anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        onset = self._onset(builder, intent, anchor_date, anchor_surface, ref_start)
-        symptoms = self._choose_symptoms(2)
-        intent["symptoms"] = symptoms
-        builder.sentence(
-            f"The subject became unwell {onset}."
-        )
-        builder.sentence(f"They described {self._symptom_phrase(symptoms)}.")
-        self._add_lab(builder, intent, unit, level="low")
-        self._set_coded_term(intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False)
-
-    def _pattern_context_rescue(self, builder, intent, convention, subject_id,
-                                anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        onset = self._onset(builder, intent, anchor_date, anchor_surface, ref_start)
-        symptoms = self._choose_symptoms(2)
-        intent["symptoms"] = symptoms
-        builder.sentence(
-            f"{self._ucfirst(onset)} the subject "
-            f"reported {self._symptom_phrase(symptoms)}."
-        )
-        builder.sentence(self._pick(RESCUE_PHRASES))
-        intent["rescue_treatment"] = True
-        self._set_coded_term(intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False)
-
-    def _pattern_context_action(self, builder, intent, convention, subject_id,
-                                anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        onset = self._onset(builder, intent, anchor_date, anchor_surface, ref_start)
-        symptoms = self._choose_symptoms(2)
-        intent["symptoms"] = symptoms
-        builder.sentence(
-            f"{self._ucfirst(onset)} the subject "
-            f"reported {self._symptom_phrase(symptoms)}."
-        )
-        action = self._pick(["dose_reduced", "dose_interrupted"])
-        builder.sentence(ACTION_PHRASES[action])
-        intent["action_taken"] = action
-        self._set_coded_term(intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False)
-
-    def _pattern_symptom_only(self, builder, intent, convention, subject_id,
-                              anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        # Symptoms with nothing corroborating: no value, no rescue, no action.
-        # v1 assigns `none`. Counting these would manufacture signal.
-        onset = self._onset(builder, intent, anchor_date, anchor_surface, ref_start)
-        symptoms = self._choose_symptoms(1)
-        intent["symptoms"] = symptoms
-        builder.sentence(
-            f"{self._ucfirst(onset)} the subject "
-            f"mentioned {self._symptom_phrase(symptoms)}."
-        )
-        builder.sentence("No glucose measurement was available.")
-        builder.sentence(ACTION_PHRASES["none"])
-        self._set_coded_term(intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False)
-        intent["action_taken"] = "none"
-        intent["suppress_extra_rescue"] = True
-
-    def _pattern_negated(self, builder, intent, convention, subject_id,
-                         anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        surface = self._pick(CONCEPT_SURFACES_US + CONCEPT_SURFACES_GB)
-        template = self._pick(NEGATION_PHRASES)
-        self._templated_concept(builder, template, surface)
-        intent["assertion"] = "absent"
-        self._structured_only_onset(intent)
-        self._set_coded_term(intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False)
-
-    def _pattern_hypothetical(self, builder, intent, convention, subject_id,
-                              anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        surface = self._pick(CONCEPT_SURFACES_US + CONCEPT_SURFACES_GB)
-        self._templated_concept(builder, self._pick(HYPOTHETICAL_PHRASES), surface)
-        intent["assertion"] = "hypothetical"
-        self._structured_only_onset(intent)
-        self._set_coded_term(intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False)
-
-    def _pattern_historical(self, builder, intent, convention, subject_id,
-                            anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        surface = self._pick(CONCEPT_SURFACES_US + CONCEPT_SURFACES_GB)
-        self._templated_concept(builder, self._pick(HISTORICAL_PHRASES), surface)
-        intent["assertion"] = "historical"
-        self._structured_only_onset(intent)
-        self._set_coded_term(intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False)
-
-    def _pattern_family_history(self, builder, intent, convention, subject_id,
-                                anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        surface = self._pick(CONCEPT_SURFACES_US + CONCEPT_SURFACES_GB)
-        self._templated_concept(builder, self._pick(FAMILY_PHRASES), surface)
-        intent["assertion"] = "family_history"
-        self._structured_only_onset(intent)
-        self._set_coded_term(intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False)
-
-    def _pattern_uncertain(self, builder, intent, convention, subject_id,
-                           anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        surface = self._pick(CONCEPT_SURFACES_US + CONCEPT_SURFACES_GB)
-        self._templated_concept(builder, self._pick(UNCERTAIN_PHRASES), surface)
-        intent["assertion"] = "uncertain"
-        self._structured_only_onset(intent)
-        self._add_symptoms(builder, intent)
-        self._set_coded_term(intent, self._pick(NON_SPECIFIC_CODED_TERMS), matches=False)
-
-    def _pattern_out_of_window(self, builder, intent, convention, subject_id,
-                               anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        offset = self.rng.randint(21, 60)
-        onset = self._onset(builder, intent, anchor_date, anchor_surface, ref_start, offset=offset)
-        surface = self._pick(CONCEPT_SURFACES_US + CONCEPT_SURFACES_GB)
-        self._concept_sentence(builder, intent, surface, onset, self._severity_for(convention))
-        self._set_coded_term(
-            intent,
-            "Hypoglycaemia" if convention.codes_hypoglycemia else None,
-            matches=True,
-        )
-
-    def _pattern_unresolved_onset(self, builder, intent, convention, subject_id,
-                                  anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        # No temporal expression in the narrative and no AESTDTC in the table.
-        # The offset cannot be resolved, and the definition — not the extractor
-        # — decides what happens to it.
-        surface = self._pick(CONCEPT_SURFACES_US + CONCEPT_SURFACES_GB)
-        builder.marked_sentence(
+        builder.marked(
             "The subject experienced ", surface,
-            " at an unrecorded time during the treatment period.", "concept",
+            f" {truth.onset_offset_days} days after the dose escalation.", "concept",
         )
-        intent["explicit_mention"] = True
-        intent["onset_offset_days"] = None
-        intent["onset_phrasing"] = "none"
-        self._set_coded_term(
-            intent,
-            "Hypoglycaemia" if convention.codes_hypoglycemia else None,
-            matches=True,
-        )
-        self._add_symptoms(builder, intent)
 
-    def _pattern_distractor(self, builder, intent, convention, subject_id,
-                            anchor_date, anchor_surface, ref_start, unit, extra_rows):
-        concept_id = self._pick(sorted(DISTRACTOR_CONCEPTS))
-        coded, surfaces = DISTRACTOR_CONCEPTS[concept_id]
-        surface = self._pick(surfaces)
-        onset = self._onset(builder, intent, anchor_date, anchor_surface, ref_start)
-        intent["concept"] = concept_id
-        self._set_coded_term(intent, coded, matches=True)
-        builder.marked_sentence("The subject reported ", surface, f" {onset}.", "concept")
-        intent["explicit_mention"] = True
-        intent["symptoms"] = sorted(
-            set(intent["symptoms"]) | set(DISTRACTOR_SYMPTOMS.get(concept_id, []))
-        )
-        intent["severity"] = self._severity_for(convention)
-        if intent["severity"]:
+        if truth.symptoms and detail != "brief":
             builder.sentence(
-                f"The event was graded as {SEVERITY_WORDS[intent['severity']]} in intensity."
+                f"The subject reported {self._symptom_phrase(truth.symptoms)}."
             )
-        if concept_id == "HYPERGLYCEMIA":
-            self._add_lab(builder, intent, unit, level="high")
-
-    # -- shared narrative fragments ----------------------------------------
-
-    def _templated_concept(self, builder, template: str, surface: str) -> None:
-        """Render a template containing ``{concept}`` while tracking its offset."""
-        token = "{concept_cap}" if "{concept_cap}" in template else "{concept}"
-        mention = surface.capitalize() if token == "{concept_cap}" else surface
-        before, _, after = template.partition(token)
-        builder.marked_sentence(before, mention, after, "concept")
-
-    def _structured_only_onset(self, intent) -> int | None:
-        """An onset present in the AE table but expressed nowhere in the text.
-
-        These records still sit somewhere in time; the window never gets to
-        matter because the assertion policy removes them first.  Where the
-        table is also silent the onset is genuinely unknown, and gold records
-        it as unknown rather than as a miss the extractor could never make good.
-        """
-        if self.rng.random() < 0.35:
-            intent["onset_offset_days"] = self.rng.randint(0, 20)
-            intent["onset_phrasing"] = "structured"
-            intent["onset_in_ae_table"] = True
-        else:
-            intent["onset_offset_days"] = None
-            intent["onset_phrasing"] = "none"
-        return intent["onset_offset_days"]
-
-    def _severity_for(self, convention: StudyConvention) -> str | None:
-        if convention.severe_events_only:
-            return "severe"
-        return self._pick(["mild", "moderate", "severe", "moderate", "mild"])
-
-    def _add_symptoms(self, builder, intent, count: int = 0) -> None:
-        symptoms = self._choose_symptoms(count)
-        intent["symptoms"] = sorted(set(intent["symptoms"]) | set(symptoms))
-        adjectival = [s for s in symptoms if s in SYMPTOM_ADJ_FORMS]
-        if len(symptoms) == 1 and adjectival and self.rng.random() < 0.35:
+        # V-C keeps the objective value on the linked form and out of the text;
+        # V-D is the study where the narrative is the only place it appears.
+        if truth.glucose_mgdl is not None and study.representation != "V-C":
+            reported, _canonical = self._glucose_in(study.glucose_unit, truth.glucose_mgdl)
             builder.sentence(
-                self._pick(SYMPTOM_ADJ_PHRASES).format(
-                    adj=self._pick(SYMPTOM_ADJ_FORMS[adjectival[0]])
-                )
+                f"Capillary glucose was {reported} {study.glucose_unit}."
             )
-            return
-        template = self._pick(SYMPTOM_PHRASES)
-        phrase = self._symptom_phrase(symptoms)
-        builder.sentence(
-            template.format(
-                symptoms=phrase,
-                symptoms_cap=self._ucfirst(phrase),
-                was_were="was" if len(symptoms) == 1 else "were",
+        if truth.rescue_given:
+            builder.sentence("Oral glucose gel was administered.")
+        if detail == "rich":
+            # The study that collected almost nothing structurally puts
+            # severity, causality, action and outcome in prose instead.
+            builder.sentence(
+                f"The event was graded as {truth.peak_severity} in intensity."
             )
-        )
+            if truth.action_taken:
+                builder.sentence(ACTION_PHRASES[truth.action_taken])
+            builder.sentence(RELATEDNESS_PHRASES[truth.relatedness])
+            builder.sentence(OUTCOME_PHRASES[truth.outcome])
+        elif detail == "standard":
+            if truth.action_taken and self.rng.random() < 0.5:
+                builder.sentence(ACTION_PHRASES[truth.action_taken])
+            builder.sentence(OUTCOME_PHRASES[truth.outcome])
+        for criterion in truth.seriousness_criteria:
+            builder.sentence(CRITERION_PHRASES[criterion])
 
-    def _add_lab(self, builder, intent, unit: str, *, level: str = "normal") -> None:
-        value, canonical = self._glucose_value(unit, level=level)
-        intent["labs"].append(
-            {"test": "GLUCOSE", "value": value, "unit": unit, "canonical_mgdl": canonical}
-        )
-        builder.sentence(self._pick(LAB_PHRASES).format(value=value, unit=unit))
+        # Assertion-bearing asides. These are where assertion actually matters:
+        # a coded AE row asserts presence by construction, but a narrative can
+        # mention a concept in order to rule it out.
+        aside_assertion = None
+        if self.rng.random() < 0.30:
+            aside_assertion = self._pick(["absent", "hypothetical", "historical"])
+            pool = {
+                "absent": NEGATED_ASIDES,
+                "hypothetical": HYPOTHETICAL_ASIDES,
+                "historical": HISTORICAL_ASIDES,
+            }[aside_assertion]
+            other = self._pick(CONCEPT_SURFACES["HYPOGLYCEMIA"])
+            template = self._pick(pool)
+            builder.sentence(
+                template.format(concept=other, concept_cap=other.capitalize())
+            )
 
-    def _add_management(self, builder, intent, convention: StudyConvention) -> None:
-        """Management, outcome, seriousness and causality sentences.
+        return {
+            "doc_id": doc_id,
+            "study_id": study.study_id,
+            "subject_id": subject_id,
+            "truth_id": truth.truth_id,
+            "header": header,
+            "text": builder.body(),
+            "concept_mention": builder.mark("concept"),
+            "aside_assertion": aside_assertion,
+        }
 
-        Kept in their own sentences so their cue words never fall inside the
-        assertion scope of a concept mention.
-        """
-        if intent["concept"] is None:
-            return
-        if intent["assertion"] in ("hypothetical", "historical", "family_history", "absent"):
-            # These records still carry a coded AE of some kind, but management
-            # language would confuse the picture; keep them short.
-            builder.sentence("Study drug continued unchanged.")
-            intent["action_taken"] = "none"
-            intent["outcome"] = "unknown" if self.rng.random() < 0.3 else None
-            if intent["outcome"]:
-                builder.sentence(OUTCOME_PHRASES["unknown"])
-            return
+    def _lb_row(
+        self, study: StudySemantics, subject_id: str, reported: float,
+        canonical: float, when: _dt.date,
+    ) -> dict[str, Any]:
+        seq = self._lb_seq.get(subject_id, 0) + 1
+        self._lb_seq[subject_id] = seq
+        return {
+            "STUDYID": study.study_id, "USUBJID": subject_id, "LBSEQ": seq,
+            "LBTESTCD": "GLUC", "LBTEST": "Glucose", "LBORRES": reported,
+            "LBORRESU": study.glucose_unit, "LBSTRESN": canonical,
+            "LBSTRESU": "mg/dL", "LBDTC": when.isoformat(),
+            "SYNTHETIC": SYNTHETIC_FLAG,
+        }
 
-        if intent["action_taken"] is None and self.rng.random() < 0.55:
-            action = self._pick(["dose_reduced", "dose_interrupted", "drug_withdrawn", "none"])
-            builder.sentence(ACTION_PHRASES[action])
-            intent["action_taken"] = action
+    # -- subject scaffolding ------------------------------------------------
 
-        if (
-            not intent["rescue_treatment"]
-            and not intent["suppress_extra_rescue"]
-            and intent["concept"] == "HYPOGLYCEMIA"
+    def _subject(
+        self, study: StudySemantics, subject_id: str, corpus: GeneratedCorpus,
+        start: _dt.date,
+    ) -> _dt.date:
+        """Emit DM and EX rows; return the dose-escalation date."""
+        corpus.tables["dm"].append({
+            "STUDYID": study.study_id, "USUBJID": subject_id,
+            "AGE": self.rng.randint(38, 79), "SEX": self._pick(["M", "F"]),
+            "ARM": self._pick(["Study drug", "Study drug", "Placebo"]),
+            "RFSTDTC": start.isoformat(),
+            "COUNTRY": self._pick(["USA", "GBR", "DEU", "JPN", "BRA"]),
+            "SYNTHETIC": SYNTHETIC_FLAG,
+        })
+        dose = self._pick([5.0, 10.0, 20.0])
+        escalation = start + _dt.timedelta(days=self.rng.randint(21, 84))
+        for seq, (when, amount) in enumerate(
+            [(start, dose), (escalation, dose * 2)], start=1
         ):
-            if self.rng.random() < 0.3:
-                builder.sentence(self._pick(RESCUE_PHRASES))
-                intent["rescue_treatment"] = True
-
-        if intent["severity"] == "severe" and self.rng.random() < 0.55:
-            category = self._pick(["hospitalisation", "life_threatening", "other_medically_important"])
-            builder.sentence(SERIOUSNESS_PHRASES[category])
-            intent["seriousness"] = sorted(set(intent["seriousness"]) | {category})
-        elif self.rng.random() < 0.12:
-            # A mild event can be serious. Severity and seriousness are separate
-            # fields and this corpus contains counterexamples to their conflation.
-            builder.sentence(SERIOUSNESS_PHRASES["hospitalisation"])
-            intent["seriousness"] = sorted(set(intent["seriousness"]) | {"hospitalisation"})
-
-        if self.rng.random() < 0.6:
-            relatedness = self._pick(["possible", "probable", "not_related", "unlikely"])
-            builder.sentence(RELATEDNESS_PHRASES[relatedness])
-            intent["relatedness"] = relatedness
-
-        if self.rng.random() < 0.22:
-            rechallenge = self._pick(["done_recurred", "done_no_recurrence", "not_done"])
-            builder.sentence(RECHALLENGE_PHRASES[rechallenge])
-            intent["rechallenge"] = rechallenge
-
-        if self.rng.random() < 0.8:
-            outcome = self._pick(["resolved", "resolved", "resolving", "not_resolved"])
-            builder.sentence(OUTCOME_PHRASES[outcome])
-            intent["outcome"] = outcome
-
-    # -- table rows ---------------------------------------------------------
-
-    #: Which AE columns each study populates. What is not in the table is
-    #: recoverable only from the narrative, which is the point.
-    _STRUCTURED_AE_COLUMNS = {
-        "full": {"AESEV", "AESER", "AESCAT", "AEREL", "AEACN", "AEOUT"},
-        "partial": {"AESEV", "AESER", "AESCAT", "AEREL"},
-        "minimal": {"AESER"},
-    }
-
-    def _ae_row(self, convention, subject_id, ae_seq, doc_id, intent, onset_date):
-        seriousness = intent["seriousness"]
-        populated = self._STRUCTURED_AE_COLUMNS[convention.structured_ae_detail]
-
-        def col(name: str, value):
-            return value if name in populated else ""
-
-        return {
-            "STUDYID": convention.study_id,
-            "USUBJID": subject_id,
-            "AESEQ": ae_seq,
-            "DOCID": doc_id,
-            "AETERM": self._verbatim_for(intent),
-            "AEDECOD": intent["coded_term"] or "",
-            "AEDICTVER": convention.dictionary_version if intent["coded_term"] else "",
-            "AESTDTC": onset_date.isoformat() if onset_date else "",
-            "AESEV": col("AESEV", intent["severity"] or ""),
-            "AESER": col("AESER", "Y" if seriousness else "N"),
-            "AESCAT": col("AESCAT", "|".join(seriousness)),
-            "AEREL": col("AEREL", intent["relatedness"] or ""),
-            "AEACN": col("AEACN", intent["action_taken"] or ""),
-            "AEOUT": col("AEOUT", intent["outcome"] or ""),
-            "SYNTHETIC": SYNTHETIC_FLAG,
-        }
-
-    def _verbatim_for(self, intent) -> str:
-        if intent["concept"] == "HYPOGLYCEMIA":
-            return self._pick(
-                ["low blood sugar episode", "hypoglycaemic event", "feeling shaky and sweaty",
-                 "symptomatic low glucose", "unwell episode"]
-            )
-        if intent["concept"]:
-            return DISTRACTOR_CONCEPTS.get(intent["concept"], (intent["concept"], []))[0].lower()
-        return "unwell episode"
-
-    def _lb_row(self, convention, subject_id, seq, lab, when):
-        canonical = lab["canonical_mgdl"]
-        return {
-            "STUDYID": convention.study_id,
-            "USUBJID": subject_id,
-            "LBSEQ": seq,
-            "LBTESTCD": "GLUC",
-            "LBTEST": "Glucose",
-            "LBORRES": lab["value"],
-            "LBORRESU": lab["unit"],
-            "LBSTRESN": canonical,
-            "LBSTRESU": "mg/dL",
-            "LBDTC": when.isoformat(),
-            "SYNTHETIC": SYNTHETIC_FLAG,
-        }
+            corpus.tables["ex"].append({
+                "STUDYID": study.study_id, "USUBJID": subject_id, "EXSEQ": seq,
+                "EXTRT": "Study drug", "EXDOSE": amount, "EXDOSU": "mg",
+                "EXSTDTC": when.isoformat(), "EXENDTC": "",
+                "SYNTHETIC": SYNTHETIC_FLAG,
+            })
+        return escalation
 
     # -- top level ----------------------------------------------------------
 
     def generate(self) -> GeneratedCorpus:
-        corpus = GeneratedCorpus(
-            tables={"dm": [], "ae": [], "ex": [], "lb": [], "cm": []}
-        )
-        lb_seq_by_subject: dict[str, int] = {}
+        corpus = GeneratedCorpus(tables={
+            "dm": [], "ae": [], "ex": [], "lb": [], "linked_hypo_event": []
+        })
+        studies = [self.semantics.for_study(s) for s in self.study_ids]
 
-        for convention in self.conventions:
-            n_subjects = self.subjects_per_study or convention.n_subjects
-            for index in range(1, n_subjects + 1):
-                subject_id = f"{convention.study_id}-{index:03d}"
-                ref_start = convention.start + _dt.timedelta(days=self.rng.randint(0, 240))
-                age = self.rng.randint(38, 79)
-                sex = self._pick(["M", "F"])
-                corpus.tables["dm"].append(
-                    {
-                        "STUDYID": convention.study_id,
-                        "USUBJID": subject_id,
-                        "SUBJID": f"{index:03d}",
-                        "AGE": age,
-                        "SEX": sex,
-                        "ARM": self._pick(["Study drug", "Study drug", "Placebo"]),
-                        "RFSTDTC": ref_start.isoformat(),
-                        "COUNTRY": self._pick(["USA", "GBR", "DEU", "JPN", "BRA"]),
-                        "SYNTHETIC": SYNTHETIC_FLAG,
-                    }
+        # 1. The invariance cohort: every truth rendered in every study, so the
+        #    harness can ask whether representation changes the conclusion.
+        for index in range(self.invariance_truths):
+            kind = ["case", "case", "case", "review", "out_of_window", "no_symptoms"][
+                index % 6
+            ]
+            truth = self.sample_truth(f"T{index + 1:04d}", kind=kind)
+            for study in studies:
+                subject_id = f"{study.study_id}-INV-{index + 1:03d}"
+                # V-D never codes the term; that is the point of the variant.
+                rendered_truth = EpisodeTruth(**{
+                    **asdict(truth),
+                    "coded_by_study": study.collects("coded_term"),
+                })
+                start = _dt.date(2019, 1, 7) + _dt.timedelta(
+                    days=self.rng.randint(0, 300)
                 )
-
-                # Exposure: an initial dose, then one or two escalations. SDTM
-                # represents an escalation as a new record with a higher dose,
-                # not as a flag, so that is how the anchor must be found.
-                dose = self._pick([5.0, 10.0, 20.0])
-                ex_rows = [
-                    {
-                        "STUDYID": convention.study_id,
-                        "USUBJID": subject_id,
-                        "EXSEQ": 1,
-                        "EXTRT": "Study drug",
-                        "EXDOSE": dose,
-                        "EXDOSU": "mg",
-                        "EXSTDTC": ref_start.isoformat(),
-                        "EXENDTC": "",
-                        "SYNTHETIC": SYNTHETIC_FLAG,
-                    }
-                ]
-                escalation_date = ref_start + _dt.timedelta(days=self.rng.randint(21, 84))
-                ex_rows.append(
-                    {
-                        "STUDYID": convention.study_id,
-                        "USUBJID": subject_id,
-                        "EXSEQ": 2,
-                        "EXTRT": "Study drug",
-                        "EXDOSE": dose * 2,
-                        "EXDOSU": "mg",
-                        "EXSTDTC": escalation_date.isoformat(),
-                        "EXENDTC": "",
-                        "SYNTHETIC": SYNTHETIC_FLAG,
-                    }
+                anchor = self._subject(study, subject_id, corpus, start)
+                emitted = self.render(
+                    rendered_truth, study, subject_id, anchor, corpus
                 )
-                if self.rng.random() < 0.35:
-                    second = escalation_date + _dt.timedelta(days=self.rng.randint(28, 70))
-                    ex_rows.append(
-                        {
-                            "STUDYID": convention.study_id,
-                            "USUBJID": subject_id,
-                            "EXSEQ": 3,
-                            "EXTRT": "Study drug",
-                            "EXDOSE": dose * 3,
-                            "EXDOSU": "mg",
-                            "EXSTDTC": second.isoformat(),
-                            "EXENDTC": "",
-                            "SYNTHETIC": SYNTHETIC_FLAG,
-                        }
+                corpus.gold_episodes.append(
+                    self._gold_episode(truth, rendered_truth, study, subject_id,
+                                       emitted, anchor, episode_index=0)
+                )
+                if truth.recurrence_gap_days is not None:
+                    # A second, distinct episode a few days later. For a concept
+                    # where recurrence is expected these must stay separate.
+                    second = EpisodeTruth(**{
+                        **asdict(rendered_truth),
+                        "truth_id": f"{truth.truth_id}R",
+                        "onset_offset_days": (
+                            truth.onset_offset_days + truth.duration_days
+                            + truth.recurrence_gap_days
+                        ),
+                        "recurrence_gap_days": None,
+                    })
+                    emitted2 = self.render(
+                        second, study, subject_id, anchor, corpus, episode_index=1
                     )
-                corpus.tables["ex"].extend(ex_rows)
+                    corpus.gold_episodes.append(
+                        self._gold_episode(second, second, study, subject_id,
+                                           emitted2, anchor, episode_index=1)
+                    )
+            corpus.truths.append({
+                **asdict(truth),
+                "true_evidence_state": truth.true_evidence_state(),
+                "true_verdict": truth.true_verdict(),
+                "rendered_in": [s.study_id for s in studies],
+            })
 
-                n_events = self.rng.choice([0, 1, 1, 1, 2, 2, 3])
-                for ae_seq in range(1, n_events + 1):
-                    record = self._build_record(
-                        convention, subject_id, ae_seq, escalation_date, ref_start
-                    )
-                    corpus.tables["ae"].append(record["ae_row"])
-                    corpus.narratives.append(record["narrative"])
-                    corpus.gold.append(record["gold"])
-                    for row in record["extra_rows"]:
-                        if row.table == "lb":
-                            seq = lb_seq_by_subject.get(subject_id, 0) + 1
-                            lb_seq_by_subject[subject_id] = seq
-                            row.values["LBSEQ"] = seq
-                        corpus.tables[row.table].append(row.values)
+        # 2. Study-local background subjects, so the corpus is not composed
+        #    solely of the invariance cohort.
+        counter = 0
+        for study in studies:
+            for index in range(self.background_per_study):
+                counter += 1
+                kind = self._pick(
+                    ["case", "case", "review", "out_of_window", "no_symptoms",
+                     "distractor", "distractor"]
+                )
+                truth = self.sample_truth(f"B{counter:04d}", kind=kind)
+                truth.coded_by_study = study.collects("coded_term")
+                subject_id = f"{study.study_id}-{index + 1:03d}"
+                start = _dt.date(2019, 1, 7) + _dt.timedelta(
+                    days=self.rng.randint(0, 300)
+                )
+                anchor = self._subject(study, subject_id, corpus, start)
+                emitted = self.render(truth, study, subject_id, anchor, corpus)
+                corpus.gold_episodes.append(
+                    self._gold_episode(truth, truth, study, subject_id, emitted,
+                                       anchor, episode_index=0)
+                )
+                corpus.truths.append({
+                    **asdict(truth),
+                    "true_evidence_state": truth.true_evidence_state(),
+                    "true_verdict": truth.true_verdict(),
+                    "rendered_in": [study.study_id],
+                })
 
-                # Routine, non-event glucose measurements, so the LB table is not
-                # composed exclusively of qualifying values.
-                for offset in (7, 28, 56):
-                    value, canonical = self._glucose_value(
-                        convention.glucose_unit, level="normal"
-                    )
-                    seq = lb_seq_by_subject.get(subject_id, 0) + 1
-                    lb_seq_by_subject[subject_id] = seq
-                    corpus.tables["lb"].append(
-                        self._lb_row(
-                            convention, subject_id, seq,
-                            {"test": "GLUCOSE", "value": value, "unit": convention.glucose_unit,
-                             "canonical_mgdl": canonical},
-                            ref_start + _dt.timedelta(days=offset),
-                        )
-                    )
+        corpus.manifest = self._manifest(studies, corpus)
+        return corpus
 
-        corpus.gold_cases = self._subject_gold(corpus.gold)
-        corpus.manifest = {
+    def _gold_episode(
+        self, base_truth: EpisodeTruth, rendered: EpisodeTruth,
+        study: StudySemantics, subject_id: str, emitted: dict[str, Any],
+        anchor: _dt.date, episode_index: int,
+    ) -> dict[str, Any]:
+        return {
+            "truth_id": rendered.truth_id,
+            "base_truth_id": base_truth.truth_id,
+            "study_id": study.study_id,
+            "subject_id": subject_id,
+            "representation": study.representation,
+            "episode_index": episode_index,
+            "concept": rendered.concept,
+            "source_record_ids": emitted["record_ids"],
+            "n_records": len(emitted["record_ids"]),
+            "episode_start": emitted["onset"].isoformat(),
+            "episode_end": emitted["end"].isoformat(),
+            "onset_offset_days": rendered.onset_offset_days,
+            "peak_severity": rendered.peak_severity,
+            "true_evidence_state": rendered.true_evidence_state(),
+            "true_verdict": rendered.true_verdict(),
+            "representation_independent_verdict": base_truth.true_verdict(),
+        }
+
+    def _manifest(
+        self, studies: list[StudySemantics], corpus: GeneratedCorpus
+    ) -> dict[str, Any]:
+        return {
             "generator": "aelayer.generate",
             "seed": self.seed,
             "synthetic": True,
@@ -1271,53 +862,27 @@ class CorpusGenerator:
                 "present in this repository."
             ),
             "gold_case_definition": "te_symptomatic_hypoglycemia.v1",
+            "invariance_truths": self.invariance_truths,
             "studies": {
-                c.study_id: {
-                    "label": c.label,
-                    "glucose_unit": c.glucose_unit,
-                    "dictionary_version": c.dictionary_version,
-                    "codes_hypoglycemia": c.codes_hypoglycemia,
-                    "severe_events_only": c.severe_events_only,
-                    "structured_ae_detail": c.structured_ae_detail,
-                    "note": c.note,
+                s.study_id: {
+                    "label": s.label, "representation": s.representation,
+                    "dictionary_version": s.dictionary_version,
+                    "glucose_unit": s.glucose_unit,
+                    "record_splitting": s.record_splitting,
+                    "linked_forms": list(s.linked_forms),
+                    "narrative_detail": s.narrative_detail,
+                    "note": s.note,
                 }
-                for c in self.conventions
+                for s in studies
             },
             "counts": {
-                "studies": len(self.conventions),
+                "studies": len(studies),
                 "subjects": len(corpus.tables["dm"]),
                 "ae_records": len(corpus.tables["ae"]),
+                "episodes_expected": len(corpus.gold_episodes),
+                "narratives": len(corpus.narratives),
             },
         }
-        return corpus
-
-    @staticmethod
-    def _subject_gold(gold_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Roll record-level truth up to one gold verdict per subject.
-
-        The same aggregation the evaluator uses: strongest verdict wins, and
-        within a verdict the strongest evidence state wins.
-        """
-        verdict_rank = {"excluded": 0, "review": 1, "case": 2}
-        best: dict[str, dict[str, Any]] = {}
-        for row in gold_rows:
-            subject = row["subject_id"]
-            key = (verdict_rank[row["verdict"]], EVIDENCE_STATE_RANK[row["evidence_state"]])
-            current = best.get(subject)
-            if current is None or key > current["_key"]:
-                best[subject] = {
-                    "_key": key,
-                    "subject_id": subject,
-                    "study_id": row["study_id"],
-                    "verdict": row["verdict"],
-                    "evidence_state": row["evidence_state"],
-                    "doc_id": row["doc_id"],
-                    "pattern": row["pattern"],
-                }
-        return [
-            {k: v for k, v in entry.items() if k != "_key"}
-            for entry in sorted(best.values(), key=lambda e: e["subject_id"])
-        ]
 
 
 # --------------------------------------------------------------------------
@@ -1325,61 +890,68 @@ class CorpusGenerator:
 # --------------------------------------------------------------------------
 
 TABLE_COLUMNS: dict[str, list[str]] = {
-    "dm": ["STUDYID", "USUBJID", "SUBJID", "AGE", "SEX", "ARM", "RFSTDTC", "COUNTRY", "SYNTHETIC"],
-    "ae": ["STUDYID", "USUBJID", "AESEQ", "DOCID", "AETERM", "AEDECOD", "AEDICTVER",
-           "AESTDTC", "AESEV", "AESER", "AESCAT", "AEREL", "AEACN", "AEOUT", "SYNTHETIC"],
-    "ex": ["STUDYID", "USUBJID", "EXSEQ", "EXTRT", "EXDOSE", "EXDOSU", "EXSTDTC", "EXENDTC", "SYNTHETIC"],
-    "lb": ["STUDYID", "USUBJID", "LBSEQ", "LBTESTCD", "LBTEST", "LBORRES", "LBORRESU",
-           "LBSTRESN", "LBSTRESU", "LBDTC", "SYNTHETIC"],
-    "cm": ["STUDYID", "USUBJID", "CMSEQ", "CMTRT", "CMINDC", "CMSTDTC", "SYNTHETIC"],
+    "dm": ["STUDYID", "USUBJID", "AGE", "SEX", "ARM", "RFSTDTC", "COUNTRY",
+           "SYNTHETIC"],
+    "ae": ["STUDYID", "USUBJID", "AESEQ", "AESPID", "AETERM", "AEDECOD",
+           "AEDICTVER", "AESTDTC", "AEENDTC", "AESEV", "AESER", "AESCAT",
+           "AEREL", "AEACN", "AEOUT", "AELNKID", "AECONTRP", "DOCID",
+           "SYNTHETIC"],
+    "ex": ["STUDYID", "USUBJID", "EXSEQ", "EXTRT", "EXDOSE", "EXDOSU",
+           "EXSTDTC", "EXENDTC", "SYNTHETIC"],
+    "lb": ["STUDYID", "USUBJID", "LBSEQ", "LBTESTCD", "LBTEST", "LBORRES",
+           "LBORRESU", "LBSTRESN", "LBSTRESU", "LBDTC", "SYNTHETIC"],
+    "linked_hypo_event": ["STUDYID", "USUBJID", "FORMID", "LNKID", "AESPID",
+                          "GLUCVAL", "GLUCUNIT", "SYMPTOMATIC", "THIRDPARTY",
+                          "RESCUE", "HEFDTC", "SYNTHETIC"],
 }
 
 
 def write_corpus(corpus: GeneratedCorpus, out_dir: str | Path | None = None) -> Path:
     root = Path(out_dir or paths.DATA_DIR)
     root.mkdir(parents=True, exist_ok=True)
-
     for table, columns in TABLE_COLUMNS.items():
-        path = root / f"{table}.csv"
-        with path.open("w", encoding="utf-8", newline="\n") as handle:
+        with (root / f"{table}.csv").open("w", encoding="utf-8", newline="\n") as handle:
             writer = csv.DictWriter(handle, fieldnames=columns, lineterminator="\n")
             writer.writeheader()
             for row in corpus.tables.get(table, []):
                 writer.writerow({c: row.get(c, "") for c in columns})
 
     _write_jsonl(root / "narratives.jsonl", corpus.narratives)
-    _write_jsonl(root / "gold.jsonl", corpus.gold)
-    _write_jsonl(root / "gold_cases.jsonl", corpus.gold_cases)
+    _write_jsonl(root / "truths.jsonl", corpus.truths)
+    _write_jsonl(root / "gold_records.jsonl", corpus.gold_records)
+    _write_jsonl(root / "gold_episodes.jsonl", corpus.gold_episodes)
     (root / "manifest.json").write_text(
         json.dumps(corpus.manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     (root / "README.txt").write_text(
         "SYNTHETIC DATA ONLY\n"
         "===================\n\n"
-        "Every file in this directory is computer generated by aelayer.generate.\n"
-        "No real patient data, and no data derived from real patients, is present.\n"
-        "The gold.jsonl and gold_cases.jsonl files hold the generator's intent and\n"
-        "are read only by the evaluation harness.\n",
+        "Every file here is computer generated by aelayer.generate. No real\n"
+        "patient data, and nothing derived from real patients, is present.\n\n"
+        "truths.jsonl holds the sampled ground truth; gold_records.jsonl and\n"
+        "gold_episodes.jsonl hold the answer key. All three are read only by\n"
+        "the evaluation harness.\n",
         encoding="utf-8",
     )
     return root
 
 
-def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8", newline="\n") as handle:
         for row in rows:
-            handle.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(row, sort_keys=True, ensure_ascii=False, default=str) + "\n")
 
 
 def generate_corpus(
     seed: int = 7,
-    n_studies: int = 4,
+    n_studies: int = 6,
     out_dir: str | Path | None = None,
-    subjects_per_study: int | None = None,
+    invariance_truths: int = 24,
+    background_per_study: int = 18,
 ) -> tuple[Path, dict[str, Any]]:
     generator = CorpusGenerator(
-        seed=seed, n_studies=n_studies, subjects_per_study=subjects_per_study
+        seed=seed, n_studies=n_studies, invariance_truths=invariance_truths,
+        background_per_study=background_per_study,
     )
     corpus = generator.generate()
-    root = write_corpus(corpus, out_dir)
-    return root, corpus.manifest
+    return write_corpus(corpus, out_dir), corpus.manifest

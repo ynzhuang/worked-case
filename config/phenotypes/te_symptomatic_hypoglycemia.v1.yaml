@@ -1,69 +1,79 @@
 id: te_symptomatic_hypoglycemia
 version: 1
-status: frozen                       # draft | frozen | superseded
+status: frozen
 label: Treatment-emergent symptomatic hypoglycemia
+operates_on: episode
 description: >
-  Symptomatic hypoglycemia with onset within 14 days of a documented
-  dose escalation, in completed cardiometabolic studies.
+  Symptomatic hypoglycemia with onset within 14 days of a documented dose
+  escalation, in completed cardiometabolic studies. Evaluated over derived
+  episodes, not over source records.
 supersedes: null
 authors: ["clinical-evidence-prototype"]
-created: 2026-08-31
+created: 2026-09-01
 
 concept:
   primary: HYPOGLYCEMIA
+  # Terminology moves between dictionary versions. Bridging unions the coded
+  # terms the catalogue lists for each version; without it, studies coded under
+  # an earlier dictionary undercount.
+  bridge_dictionary_versions: true
   include_coded_terms: true
   include_lexicon: true
 
-assertion:
-  require: [present]
-  route_to_review: [uncertain]
-  exclude: [absent, hypothetical, historical, family_history]
-
-anchor:
-  event: dose_escalation
-  source_domain: EX
-  index_rule: first_occurrence       # first_occurrence | most_recent_before_onset
-
-window:
-  unit: days
-  min: 0
-  max: 14
-  on_unresolved_onset: review        # case | review | exclude
-
-evidence_rules:                      # ordered; first match assigns the state
+evidence_rules:                      # ordered; the first match assigns the state
   - id: explicit
     state: explicit
-    description: A coded term or an asserted verbatim mention of the concept.
+    description: The episode carries a coded term for the concept.
     when:
-      any:
-        - coded_term_matches_concept: true
-        - lexicon_match: {assertion: present}
+      coded_term_matches_concept: true
 
   - id: supported
     state: supported
     description: >
-      No explicit mention, but a qualifying glucose value together with at
-      least one compatible clinical feature.
+      No coded term for the concept, but a qualifying glucose value together
+      with at least one compatible clinical feature.
     when:
       all:
         - lab: {test: GLUCOSE, op: "<", value: 70, unit: mg/dL}
         - symptoms: {min_count: 1, from: [neuroglycopenic, autonomic]}
 
-  - id: possible
-    state: possible
+  - id: insufficient
+    state: insufficient
     description: >
-      Clinical features plus contextual evidence of management, without
-      confirmation by value or explicit term.
+      Compatible clinical features, but nothing that confirms the concept.
+      Routed to adjudication and counted separately, not discarded.
     when:
-      all:
-        - symptoms: {min_count: 1, from: [neuroglycopenic, autonomic]}
-        - any:
-            - rescue_treatment: true
-            - action_taken: [dose_reduced, dose_interrupted, drug_withdrawn]
+      symptoms: {min_count: 1, from: [neuroglycopenic, autonomic]}
+
+anchor:
+  event: dose_escalation
+  source_domain: EX
+  index_rule: first_occurrence
+
+window:
+  unit: days
+  min: 0
+  max: 14
+  on_unresolved_onset: review
+
+# Treatment action is deliberately absent from every rule above. It is an
+# attribute of the episode, not a criterion for it: gating a hypoglycemia case
+# definition on what the site did to the dose imports a field the clinical
+# question never referenced, and one that some studies cannot even express.
+
+missingness:
+  # Nothing is assumed absent. A field that was never collected, or that a gate
+  # made inapplicable, says nothing about the patient.
+  treat_as_absent: []
+  route_to_review: [pending_ongoing, unknown, not_representable]
+
+episode:
+  require_linkage_confidence: 0.8
+  on_review_required: review
 
 case_definition:
-  primary_set: [explicit, supported]
-  review_set: [possible]
+  primary: [explicit, supported]
+  review: [insufficient]
   excluded: [absent, none]
 
 reporting:

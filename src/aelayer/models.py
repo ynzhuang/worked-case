@@ -1,62 +1,44 @@
-"""Core data models.
+"""Core data models for the evidence layer.
 
-The two artifacts this system keeps deliberately apart:
+Three ideas carry most of the weight here.
 
-``EventObject``
-    What happened to this patient.  Per-record, extracted, evidence-bearing,
-    stamped with the extractor version that produced it.  Produced by
-    ``aelayer.extract``.  It carries *no* evidence state and *no* case verdict.
+**A blank is not a value.**  Every clinical field is a ``Field[T]``: a value
+*and* a ``collection_state``.  A field left empty because the protocol never
+collected it, because a parent gate was answered No, because the event is still
+ongoing, or because the study's codelist had no permissible value for the
+concept, are four different facts.  Flattening them to ``None`` throws away the
+only information that says whether absence is evidence of anything.
 
-``PhenotypeDefinition``
-    For this scientific question, which event objects make this patient a case.
-    A declarative, versioned rule over event objects.  Configuration, not code.
-    Loaded by ``aelayer.phenotype.loader``.
+**Two levels, and the lower one is never destroyed.**  A
+``CanonicalAERecord`` is source-faithful: one per source CRF record, never
+merged, never overwritten.  A ``CanonicalAEEpisode`` is derived above it and is
+purely additive.  Collapsing grade-change rows into one row is irreversible;
+deriving an episode view alongside the records is not.
 
-Severity and seriousness are separate fields and are never collapsed.  Severity
-is the intensity of the event.  Seriousness is a regulatory category defined by
-outcome.  A mild event can be serious; a severe event can be non-serious.
+**Coded and verbatim both survive.**  The coded term gives comparability across
+studies; the verbatim preserves what coding compressed.  Neither replaces the
+other, so both are stored, along with the dictionary version in force.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Generic, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import Field as _PydanticField
+
+T = TypeVar("T")
 
 # --------------------------------------------------------------------------
-# Enumerations (as Literals so they serialise as plain strings)
+# Enumerations
 # --------------------------------------------------------------------------
-
-Assertion = Literal[
-    "present",
-    "absent",
-    "hypothetical",
-    "historical",
-    "family_history",
-    "uncertain",
-]
-ASSERTION_VALUES: tuple[str, ...] = (
-    "present",
-    "absent",
-    "hypothetical",
-    "historical",
-    "family_history",
-    "uncertain",
-)
 
 Severity = Literal["mild", "moderate", "severe"]
 SEVERITY_VALUES: tuple[str, ...] = ("mild", "moderate", "severe")
 
-Seriousness = Literal[
-    "death",
-    "life_threatening",
-    "hospitalisation",
-    "disability",
-    "congenital_anomaly",
-    "other_medically_important",
-]
-SERIOUSNESS_VALUES: tuple[str, ...] = (
+#: The regulatory seriousness criteria. Seriousness itself is a separate gate.
+SERIOUSNESS_CRITERIA: tuple[str, ...] = (
     "death",
     "life_threatening",
     "hospitalisation",
@@ -69,62 +51,72 @@ Relatedness = Literal[
     "not_related", "unlikely", "possible", "probable", "definite", "unknown"
 ]
 RELATEDNESS_VALUES: tuple[str, ...] = (
-    "not_related",
-    "unlikely",
-    "possible",
-    "probable",
-    "definite",
-    "unknown",
+    "not_related", "unlikely", "possible", "probable", "definite", "unknown",
 )
 
 ActionTaken = Literal[
-    "dose_reduced", "dose_interrupted", "drug_withdrawn", "none", "unknown"
+    "dose_not_changed",
+    "dose_reduced",
+    "drug_interrupted",
+    "drug_withdrawn",
+    "not_applicable",
+    "unknown",
 ]
 ACTION_TAKEN_VALUES: tuple[str, ...] = (
-    "dose_reduced",
-    "dose_interrupted",
-    "drug_withdrawn",
-    "none",
-    "unknown",
+    "dose_not_changed", "dose_reduced", "drug_interrupted", "drug_withdrawn",
+    "not_applicable", "unknown",
 )
 
-Rechallenge = Literal["not_done", "done_recurred", "done_no_recurrence"]
-RECHALLENGE_VALUES: tuple[str, ...] = (
-    "not_done",
-    "done_recurred",
-    "done_no_recurrence",
-)
-
-Outcome = Literal["resolved", "resolving", "not_resolved", "fatal", "unknown"]
+Outcome = Literal[
+    "recovered", "recovering", "not_recovered", "recovered_with_sequelae",
+    "fatal", "unknown",
+]
 OUTCOME_VALUES: tuple[str, ...] = (
-    "resolved",
-    "resolving",
-    "not_resolved",
-    "fatal",
-    "unknown",
+    "recovered", "recovering", "not_recovered", "recovered_with_sequelae",
+    "fatal", "unknown",
 )
 
-EvidenceState = Literal["explicit", "supported", "possible", "absent", "none"]
+Assertion = Literal[
+    "present", "absent", "hypothetical", "historical", "family_history", "uncertain"
+]
+ASSERTION_VALUES: tuple[str, ...] = (
+    "present", "absent", "hypothetical", "historical", "family_history", "uncertain",
+)
+
+#: What a blank in a source field actually means. These are not interchangeable
+#: and the phenotype definition decides how each is treated.
+CollectionState = Literal[
+    "collected",
+    "not_collected_by_protocol",   # the CRF never asked
+    "not_applicable_gated",        # a parent gate was answered No
+    "pending_ongoing",             # the event has not ended yet
+    "intentionally_blank",         # protocol instructed the site to leave it blank
+    "not_representable",           # the concept exists but the codelist cannot express it
+    "unknown",                     # asked, not answered, reason unrecorded
+]
+COLLECTION_STATES: tuple[str, ...] = (
+    "collected", "not_collected_by_protocol", "not_applicable_gated",
+    "pending_ongoing", "intentionally_blank", "not_representable", "unknown",
+)
+
+#: States that are never, on their own, evidence that something did not happen.
+#: A field the protocol never collected says nothing about the patient.
+NOT_EVIDENCE_OF_ABSENCE: frozenset[str] = frozenset(
+    {"not_collected_by_protocol", "not_applicable_gated", "unknown",
+     "pending_ongoing", "not_representable", "intentionally_blank"}
+)
+
+FieldSource = Literal["structured", "text", "derived"]
+
+EvidenceState = Literal["explicit", "supported", "insufficient", "absent", "none"]
 EVIDENCE_STATE_VALUES: tuple[str, ...] = (
-    "explicit",
-    "supported",
-    "possible",
-    "absent",
-    "none",
+    "explicit", "supported", "insufficient", "absent", "none",
 )
-
-#: Ordering used when a subject has several qualifying events and the strongest
-#: state must win.  Higher is stronger.
 EVIDENCE_STATE_RANK: dict[str, int] = {
-    "none": 0,
-    "absent": 1,
-    "possible": 2,
-    "supported": 3,
-    "explicit": 4,
+    "none": 0, "absent": 1, "insufficient": 2, "supported": 3, "explicit": 4,
 }
 
 Verdict = Literal["case", "review", "excluded"]
-
 DefinitionStatus = Literal["draft", "frozen", "superseded"]
 
 
@@ -134,27 +126,25 @@ DefinitionStatus = Literal["draft", "frozen", "superseded"]
 
 
 class Span(BaseModel):
-    """A character range in a source document backing one extracted value.
+    """A pointer back to the exact evidence a value came from.
 
-    Every non-null field on an ``EventObject`` must be backed by at least one
-    span.  A derived value without provenance is a bug, not a degraded result.
+    For text, a character range in a document.  For a structured CRF field, the
+    record and column it was read from, rendered so the pointer resolves to
+    something a person can check.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     doc_id: str
-    start: int = Field(ge=0)
-    end: int = Field(ge=0)
-    field: str = Field(description="The EventObject field this span supports.")
-    extracted_value: str = Field(
-        description="The value derived from this span, rendered as text."
-    )
-    text: str = Field(
-        default="", description="The literal source substring, for display."
-    )
+    start: int = _PydanticField(default=0, ge=0)
+    end: int = _PydanticField(default=0, ge=0)
+    field: str
+    extracted_value: str = ""
+    text: str = ""
+    kind: Literal["text", "structured", "derived"] = "text"
 
     @model_validator(mode="after")
-    def _check_range(self) -> "Span":
+    def _ordered(self) -> "Span":
         if self.end < self.start:
             raise ValueError(f"span end {self.end} precedes start {self.start}")
         return self
@@ -163,147 +153,275 @@ class Span(BaseModel):
         return (self.doc_id, self.start, self.end, self.field, self.extracted_value)
 
 
-class LabValue(BaseModel):
-    """A laboratory result, kept in both reported and canonical units.
+# --------------------------------------------------------------------------
+# Field
+# --------------------------------------------------------------------------
 
-    Trials report glucose in mg/dL or mmol/L depending on region.  A threshold
-    rule that ignores this silently misclassifies entire studies, so the
-    canonical value is computed once, at extraction, and carried alongside the
-    value as reported.
+
+class Field(BaseModel, Generic[T]):
+    """A clinical value together with why it looks the way it does.
+
+    ``value`` alone cannot distinguish "the site said No" from "the CRF never
+    asked".  ``collection_state`` carries that, and downstream rules consult it
+    rather than guessing from a null.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    test: str = Field(description="Catalogue key, e.g. GLUCOSE.")
+    value: T | None = None
+    collection_state: CollectionState = "unknown"
+    source: FieldSource = "structured"
+    spans: list[Span] = _PydanticField(default_factory=list)
+    confidence: float | None = None
+    note: str = ""
+
+    @property
+    def populated(self) -> bool:
+        return self.value is not None
+
+    @property
+    def is_evidence_of_absence(self) -> bool:
+        """Can a false or empty reading here be taken as "it did not happen"?
+
+        Only a value the study actually collected can carry that weight.
+        """
+        return self.collection_state == "collected"
+
+    def has_provenance(self) -> bool:
+        """A populated value must point at where it came from."""
+        return (not self.populated) or bool(self.spans)
+
+    @classmethod
+    def collected(
+        cls, value: T, spans: list[Span] | None = None, *,
+        source: FieldSource = "structured", confidence: float | None = None,
+    ) -> "Field[T]":
+        return cls(
+            value=value, collection_state="collected", source=source,
+            spans=list(spans or []), confidence=confidence,
+        )
+
+    @classmethod
+    def missing(
+        cls, state: CollectionState, *, note: str = "",
+        spans: list[Span] | None = None, source: FieldSource = "structured",
+    ) -> "Field[T]":
+        """An empty field that says why it is empty.
+
+        Abstention is a valid answer and must be recorded as one; a guess is a
+        defect.
+        """
+        if state == "collected":
+            raise ValueError("a missing field cannot be in state 'collected'")
+        return cls(
+            value=None, collection_state=state, source=source,
+            spans=list(spans or []), note=note,
+        )
+
+
+class LabValue(BaseModel):
+    """A laboratory result in both reported and canonical units.
+
+    Trials report glucose in mg/dL or mmol/L by region.  A threshold applied to
+    an unconverted value misclassifies an entire study in silence.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    test: str
     value: float
-    unit: str = Field(description="Unit as reported in the source.")
-    canonical_value: float | None = Field(
-        default=None, description="Value converted to the catalogue's canonical unit."
-    )
+    unit: str
+    canonical_value: float | None = None
     canonical_unit: str | None = None
-    collection_date: _dt.date | None = None
+    collection_datetime: _dt.datetime | None = None
+    source: FieldSource = "structured"
     span: Span
 
 
 class SymptomMention(BaseModel):
-    """A normalised symptom concept with its own span."""
-
     model_config = ConfigDict(extra="forbid")
 
     symptom: str
     span: Span
+    assertion: Assertion = "present"
 
 
 # --------------------------------------------------------------------------
-# Event object
+# Level 1 — the source-faithful record
 # --------------------------------------------------------------------------
 
 
-class EventObject(BaseModel):
-    """One record per (patient, candidate clinical concept, occurrence).
+class CanonicalAERecord(BaseModel):
+    """One per source CRF record. Never merged, never overwritten.
 
-    Produced by the extraction engine.  It reports what the text and the
-    structured tables say.  It deliberately does not assign an evidence state
-    and does not decide whether the subject is a case; that is the phenotype
-    definition's job.
+    This is the grain the study actually collected.  Everything above it is
+    derived and can be recomputed; this cannot, so it is never edited in place.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    event_id: str
-    subject_id: str
+    record_id: str
     study_id: str
-    doc_id: str
-    source_record_id: str | None = Field(
-        default=None, description="AE table record this event was derived from."
+    subject_id: str
+    source_record_id: str
+    source_form_id: str = "AE"
+
+    verbatim_term: Field[str] = _PydanticField(default_factory=Field)
+    coded_term: Field[str] = _PydanticField(default_factory=Field)
+    dictionary: str | None = None
+    dictionary_version: str | None = None
+    standardized_concept: str | None = _PydanticField(
+        default=None,
+        description="Catalogue concept the coded term maps to, by explicit "
+                    "membership. Null when no catalogue term matches.",
     )
 
-    concept_id: str = Field(description="Reference into the concept catalogue.")
-    coded_term: str | None = Field(
-        default=None, description="Existing MedDRA PT where one exists, verbatim."
-    )
-    coded_term_version: str | None = Field(
-        default=None, description="Dictionary version under which coding occurred."
-    )
-    verbatim_term: str | None = None
+    onset_datetime: Field[_dt.datetime] = _PydanticField(default_factory=Field)
+    end_datetime: Field[_dt.datetime] = _PydanticField(default_factory=Field)
 
-    assertion: Assertion = "present"
-    #: How this concept came to be identified on this record: any of
-    #: ``lexicon``, ``lexicon_fuzzy``, ``abbreviation``, ``coded_term``,
-    #: ``contextual``. A rule that asks for a verbatim mention needs to be able
-    #: to tell a mention from an inference drawn off surrounding evidence.
-    concept_match_kinds: list[str] = Field(default_factory=list)
-    symptoms: list[SymptomMention] = Field(default_factory=list)
-    labs: list[LabValue] = Field(default_factory=list)
+    severity: Field[str] = _PydanticField(default_factory=Field)
+    seriousness: Field[bool] = _PydanticField(default_factory=Field)
+    seriousness_criteria: dict[str, Field[bool]] = _PydanticField(default_factory=dict)
 
-    onset_date: _dt.date | None = None
-    onset_offset_days: int | None = None
-    anchor_event: str | None = Field(
-        default=None, description="The exposure event the offset is relative to."
-    )
-    anchor_date: _dt.date | None = None
+    relatedness: Field[str] = _PydanticField(default_factory=Field)
+    alternative_attribution: list[str] = _PydanticField(default_factory=list)
+    action_taken: Field[str] = _PydanticField(default_factory=Field)
+    outcome: Field[str] = _PydanticField(default_factory=Field)
 
-    severity: Severity | None = Field(
-        default=None, description="Intensity of the event. Never seriousness."
-    )
-    seriousness: list[Seriousness] = Field(
-        default_factory=list,
-        description="Regulatory categories. Never collapsed into severity.",
-    )
-    relatedness: Relatedness | None = None
-    action_taken: ActionTaken | None = None
-    rechallenge: Rechallenge | None = None
-    rescue_treatment: bool = False
-    outcome: Outcome | None = None
+    #: Clinical detail that lives on linked event forms or in narrative.
+    symptoms: list[SymptomMention] = _PydanticField(default_factory=list)
+    labs: list[LabValue] = _PydanticField(default_factory=list)
+    assertion: Field[str] = _PydanticField(default_factory=Field)
 
-    evidence: list[Span] = Field(default_factory=list)
-    confidence: dict[str, float] = Field(
-        default_factory=dict, description="Extractor confidence, per field."
+    linked_form_ids: list[str] = _PydanticField(default_factory=list)
+    narrative_doc_id: str | None = None
+    continuation_of: str | None = _PydanticField(
+        default=None,
+        description="Source record this one explicitly continues, where the "
+                    "CRF records that. Never inferred.",
     )
+
+    evidence: list[Span] = _PydanticField(default_factory=list)
+    normalizer_version: str = ""
     extractor_version: str = ""
+    model_version: str | None = None
+    prompt_version: str | None = None
 
-    # -- provenance helpers -------------------------------------------------
-
-    #: Fields that must be backed by a span whenever they hold a value.
-    PROVENANCE_FIELDS: tuple[str, ...] = (
-        "concept_id",
-        "coded_term",
+    #: Field names that are `Field[...]` instances on this model.
+    CLINICAL_FIELDS: tuple[str, ...] = (
+        "verbatim_term", "coded_term", "onset_datetime", "end_datetime",
+        "severity", "seriousness", "relatedness", "action_taken", "outcome",
         "assertion",
-        "onset_date",
-        "onset_offset_days",
-        "severity",
-        "seriousness",
-        "relatedness",
-        "action_taken",
-        "rechallenge",
-        "rescue_treatment",
-        "outcome",
     )
 
-    def spans_for(self, field: str) -> list[Span]:
-        return [s for s in self.evidence if s.field == field]
+    def fields(self) -> dict[str, Field[Any]]:
+        """Every ``Field`` on the record, including the criteria vector."""
+        out: dict[str, Field[Any]] = {
+            name: getattr(self, name) for name in self.CLINICAL_FIELDS
+        }
+        for criterion, field in self.seriousness_criteria.items():
+            out[f"seriousness_criteria.{criterion}"] = field
+        return out
 
     def missing_provenance(self) -> list[str]:
-        """Return the names of populated fields that carry no span.
-
-        Empty list means every value in this object traces to source text or a
-        source table row.  Anything else is a defect.
-        """
-        missing: list[str] = []
-        for name in self.PROVENANCE_FIELDS:
-            value = getattr(self, name)
-            populated = value not in (None, [], False, "")
-            if name == "assertion":
-                populated = True  # always set, always needs a cue or default span
-            if populated and not self.spans_for(name):
-                missing.append(name)
-        for sym in self.symptoms:
-            if sym.span is None:  # pragma: no cover - schema forbids
-                missing.append("symptoms")
-        return missing
+        """Populated fields that carry no span. Every one is a defect."""
+        missing = [
+            name for name, field in self.fields().items() if not field.has_provenance()
+        ]
+        missing.extend(
+            f"symptoms[{s.symptom}]" for s in self.symptoms if not s.span.doc_id
+        )
+        missing.extend(f"labs[{l.test}]" for l in self.labs if not l.span.doc_id)
+        return sorted(missing)
 
     def has_full_provenance(self) -> bool:
         return not self.missing_provenance()
+
+    def collection_states(self) -> dict[str, str]:
+        return {name: field.collection_state for name, field in self.fields().items()}
+
+
+# --------------------------------------------------------------------------
+# Level 2 — the derived episode
+# --------------------------------------------------------------------------
+
+
+LinkageRule = Literal[
+    "single_record",
+    "explicit_continuation",
+    "temporal_overlap",
+    "gap_within_tolerance",
+    "recurrence_split",
+    "model_proposed",
+]
+
+
+class CanonicalAEEpisode(BaseModel):
+    """A clinical episode derived over one or more records.
+
+    Derivation is additive: the records it was built from are untouched and
+    remain the authority.  Where the linkage rule cannot decide,
+    ``linkage_review_required`` is set and the episode is reported rather than
+    silently resolved.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    episode_id: str
+    study_id: str
+    subject_id: str
+    standardized_concept: str | None = None
+
+    episode_start: Field[_dt.datetime] = _PydanticField(default_factory=Field)
+    episode_end: Field[_dt.datetime] = _PydanticField(default_factory=Field)
+    source_record_ids: list[str] = _PydanticField(default_factory=list)
+
+    severity_trajectory: list[tuple[_dt.datetime | None, str]] = _PydanticField(
+        default_factory=list
+    )
+    seriousness_trajectory: list[tuple[_dt.datetime | None, list[str]]] = _PydanticField(
+        default_factory=list
+    )
+
+    relatedness: Field[str] = _PydanticField(default_factory=Field)
+    action_history: list[tuple[_dt.datetime | None, str]] = _PydanticField(
+        default_factory=list
+    )
+    outcome: Field[str] = _PydanticField(default_factory=Field)
+    seriousness: Field[bool] = _PydanticField(default_factory=Field)
+
+    symptoms: list[SymptomMention] = _PydanticField(default_factory=list)
+    labs: list[LabValue] = _PydanticField(default_factory=list)
+    coded_terms: list[str] = _PydanticField(default_factory=list)
+    verbatim_terms: list[str] = _PydanticField(default_factory=list)
+    dictionary_versions: list[str] = _PydanticField(default_factory=list)
+    assertions: list[str] = _PydanticField(default_factory=list)
+
+    onset_offset_days: Field[int] = _PydanticField(default_factory=Field)
+    anchor_event: str | None = None
+    anchor_datetime: _dt.datetime | None = None
+
+    linked_evidence: list[Span] = _PydanticField(default_factory=list)
+    linkage_rule: LinkageRule = "single_record"
+    linkage_confidence: float = 1.0
+    linkage_review_required: bool = False
+    linkage_note: str = ""
+
+    episode_provenance: dict[str, Any] = _PydanticField(default_factory=dict)
+
+    #: Discovery results are candidates and may not enter a cohort directly.
+    candidate: bool = False
+
+    @property
+    def peak_severity(self) -> str | None:
+        ranked = [s for _when, s in self.severity_trajectory if s in SEVERITY_VALUES]
+        if not ranked:
+            return None
+        return max(ranked, key=lambda s: SEVERITY_VALUES.index(s))
+
+    def field_for(self, name: str) -> Field[Any] | None:
+        value = getattr(self, name, None)
+        return value if isinstance(value, Field) else None
 
 
 # --------------------------------------------------------------------------
@@ -315,39 +433,19 @@ class ConceptSelector(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     primary: str
+    group: str | None = None
+    bridge_dictionary_versions: bool = True
     include_coded_terms: bool = True
     include_lexicon: bool = True
-    group: str | None = Field(
-        default=None,
-        description=(
-            "Named concept group from concepts.yaml. Grouping above term level "
-            "is always an explicit list; no hierarchy is walked as subsumption."
-        ),
-    )
 
 
-class AssertionPolicy(BaseModel):
+class EvidenceRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    require: list[Assertion] = Field(default_factory=lambda: ["present"])
-    route_to_review: list[Assertion] = Field(default_factory=list)
-    exclude: list[Assertion] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def _no_overlap(self) -> "AssertionPolicy":
-        seen: dict[str, str] = {}
-        for bucket, values in (
-            ("require", self.require),
-            ("route_to_review", self.route_to_review),
-            ("exclude", self.exclude),
-        ):
-            for value in values:
-                if value in seen:
-                    raise ValueError(
-                        f"assertion {value!r} appears in both {seen[value]} and {bucket}"
-                    )
-                seen[value] = bucket
-        return self
+    id: str
+    state: EvidenceState
+    when: dict[str, Any]
+    description: str | None = None
 
 
 class AnchorSpec(BaseModel):
@@ -378,47 +476,78 @@ class WindowSpec(BaseModel):
         return self.min <= offset <= self.max
 
 
-class EvidenceRule(BaseModel):
-    """One ordered rule: when ``when`` matches an event, assign ``state``."""
+class MissingnessPolicy(BaseModel):
+    """How the definition reads a field that is empty.
+
+    ``not_collected_by_protocol`` and ``not_applicable_gated`` are never
+    evidence of absence, and the loader refuses a definition that says they are.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    id: str
-    state: EvidenceState
-    when: dict[str, Any]
-    description: str | None = None
+    treat_as_absent: list[CollectionState] = _PydanticField(default_factory=list)
+    route_to_review: list[CollectionState] = _PydanticField(
+        default_factory=lambda: ["pending_ongoing", "unknown", "not_representable"]
+    )
+
+    @model_validator(mode="after")
+    def _absence_must_be_evidenced(self) -> "MissingnessPolicy":
+        forbidden = {"not_collected_by_protocol", "not_applicable_gated"}
+        offending = sorted(set(self.treat_as_absent) & forbidden)
+        if offending:
+            raise ValueError(
+                f"{offending} cannot be treated as evidence of absence: a field "
+                f"the protocol never collected, or that a gate made "
+                f"inapplicable, says nothing about the patient"
+            )
+        overlap = sorted(set(self.treat_as_absent) & set(self.route_to_review))
+        if overlap:
+            raise ValueError(
+                f"collection states {overlap} are both treated as absent and "
+                f"routed to review"
+            )
+        return self
+
+
+class EpisodePolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    require_linkage_confidence: float = _PydanticField(default=0.8, ge=0.0, le=1.0)
+    on_review_required: Literal["case", "review", "exclude"] = "review"
 
 
 class CaseDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    primary_set: list[EvidenceState] = Field(
+    primary: list[EvidenceState] = _PydanticField(
         default_factory=lambda: ["explicit", "supported"]
     )
-    review_set: list[EvidenceState] = Field(default_factory=lambda: ["possible"])
-    excluded: list[EvidenceState] = Field(default_factory=lambda: ["absent", "none"])
+    review: list[EvidenceState] = _PydanticField(
+        default_factory=lambda: ["insufficient"]
+    )
+    excluded: list[EvidenceState] = _PydanticField(
+        default_factory=lambda: ["absent", "none"]
+    )
 
     @model_validator(mode="after")
     def _no_overlap(self) -> "CaseDefinition":
         seen: dict[str, str] = {}
         for bucket, values in (
-            ("primary_set", self.primary_set),
-            ("review_set", self.review_set),
+            ("primary", self.primary), ("review", self.review),
             ("excluded", self.excluded),
         ):
             for value in values:
                 if value in seen:
                     raise ValueError(
-                        f"evidence state {value!r} appears in both "
-                        f"{seen[value]} and {bucket}"
+                        f"evidence state {value!r} is in both {seen[value]} and {bucket}"
                     )
                 seen[value] = bucket
         return self
 
     def verdict_for(self, state: str) -> Verdict:
-        if state in self.primary_set:
+        if state in self.primary:
             return "case"
-        if state in self.review_set:
+        if state in self.review:
             return "review"
         return "excluded"
 
@@ -432,47 +561,41 @@ class ReportingSpec(BaseModel):
 
 
 class PhenotypeDefinition(BaseModel):
-    """A versioned scientific artifact with its own lifecycle.
-
-    Changing what qualifies as a case creates a new version; it never rewrites
-    the cohort a prior analysis was built on.
-    """
+    """A versioned scientific artifact, evaluated over episodes."""
 
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    version: int = Field(ge=1)
+    version: int = _PydanticField(ge=1)
     status: DefinitionStatus = "draft"
     label: str
     description: str = ""
+    operates_on: Literal["episode"] = "episode"
     supersedes: str | None = None
-    authors: list[str] = Field(default_factory=list)
+    authors: list[str] = _PydanticField(default_factory=list)
     created: _dt.date | None = None
 
     concept: ConceptSelector
-    assertion: AssertionPolicy = Field(default_factory=AssertionPolicy)
+    evidence_rules: list[EvidenceRule]
     anchor: AnchorSpec | None = None
     window: WindowSpec | None = None
-    evidence_rules: list[EvidenceRule]
-    case_definition: CaseDefinition = Field(default_factory=CaseDefinition)
-    reporting: ReportingSpec = Field(default_factory=ReportingSpec)
+    missingness: MissingnessPolicy = _PydanticField(default_factory=MissingnessPolicy)
+    episode: EpisodePolicy = _PydanticField(default_factory=EpisodePolicy)
+    case_definition: CaseDefinition = _PydanticField(default_factory=CaseDefinition)
+    reporting: ReportingSpec = _PydanticField(default_factory=ReportingSpec)
 
-    # Populated by the loader, never read from the YAML body.
     definition_hash: str = ""
     source_path: str = ""
 
-    @field_validator("evidence_rules")
-    @classmethod
-    def _rules_non_empty_and_unique(
-        cls, rules: list[EvidenceRule]
-    ) -> list[EvidenceRule]:
-        if not rules:
-            raise ValueError("a phenotype definition needs at least one evidence rule")
-        ids = [r.id for r in rules]
-        dupes = {i for i in ids if ids.count(i) > 1}
-        if dupes:
-            raise ValueError(f"duplicate evidence rule ids: {sorted(dupes)}")
-        return rules
+    @model_validator(mode="after")
+    def _rules_are_usable(self) -> "PhenotypeDefinition":
+        if not self.evidence_rules:
+            raise ValueError("a definition needs at least one evidence rule")
+        ids = [r.id for r in self.evidence_rules]
+        duplicates = sorted({i for i in ids if ids.count(i) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate evidence rule ids: {duplicates}")
+        return self
 
     @property
     def key(self) -> str:
@@ -480,82 +603,134 @@ class PhenotypeDefinition(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# Evaluation output
+# Assignment, manifest, trace
 # --------------------------------------------------------------------------
 
 
 class CaseAssignment(BaseModel):
-    """One row per subject.
+    """One row per episode.
 
-    ``reason`` is not a nicety.  When a clinician disputes a case, the first
-    question is which rule fired and on what evidence, and the answer must be in
-    the row.
+    ``reason`` names the rule that decided.  When a clinician disputes a case,
+    that is the first question asked, and the answer has to be in the row.
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    episode_id: str
     subject_id: str
     study_id: str
     verdict: Verdict
     evidence_state: EvidenceState
     matched_rule_id: str | None = None
     reason: str
-    contributing_event_ids: list[str] = Field(default_factory=list)
-    evidence_spans: list[Span] = Field(default_factory=list)
+    source_record_ids: list[str] = _PydanticField(default_factory=list)
+    evidence_spans: list[Span] = _PydanticField(default_factory=list)
     definition_id: str
     definition_version: int
     definition_hash: str
+    linkage_review_required: bool = False
+    review_reasons: list[str] = _PydanticField(default_factory=list)
+
+
+class Manifest(BaseModel):
+    """The record of one governed execution.
+
+    A pointer, never a copy: duplicating result payloads here would create a
+    second, uncontrolled result store with its own drift problem.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    manifest_id: str
+    created_at: str
+    actor: str = "unknown"
+
+    question: str = ""
+    specification: dict[str, Any] = _PydanticField(default_factory=dict)
+
+    phenotype_definition_id: str
+    phenotype_definition_version: int
+    definition_hash: str
+    definition_status: DefinitionStatus = "frozen"
+
+    cohort_specification: dict[str, Any] = _PydanticField(default_factory=dict)
+    data_snapshot_id: str
+    terminology_versions: dict[str, str] = _PydanticField(default_factory=dict)
+    normalizer_version: str = ""
+    extractor_version: str = ""
+    model_version: str | None = None
+    prompt_version: str | None = None
+
+    analysis_method: str = "phenotype_evaluation"
+    parameters: dict[str, Any] = _PydanticField(default_factory=dict)
+    validation_status: Literal[
+        "unvalidated", "internally_validated", "externally_validated"
+    ] = "unvalidated"
+
+    output_pointer: str = ""
+    results_hash: str = ""
+    counts_by_state: dict[str, int] = _PydanticField(default_factory=dict)
+    counts_by_verdict: dict[str, int] = _PydanticField(default_factory=dict)
+    deterministic: bool = True
+    nondeterministic_paths: list[str] = _PydanticField(default_factory=list)
+    limitations: list[str] = _PydanticField(default_factory=list)
+
+
+class TraceLink(BaseModel):
+    """One hop in the chain from a reported number back to source text."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    level: Literal[
+        "number", "analysis", "cohort", "definition", "episode", "record", "span"
+    ]
+    identifier: str
+    detail: str = ""
+    payload: dict[str, Any] = _PydanticField(default_factory=dict)
+
+
+class Trace(BaseModel):
+    """The full chain behind a reported number.
+
+    A number that cannot be traced end to end is a failing test, not a caveat.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    number: float | int
+    label: str
+    complete: bool
+    broken_at: str | None = None
+    links: list[TraceLink] = _PydanticField(default_factory=list)
+
+    def levels(self) -> list[str]:
+        return [link.level for link in self.links]
 
 
 class PhenotypeQuerySpec(BaseModel):
-    """The compiled, inspectable plan the agent proposes before executing."""
+    """The compiled, inspectable plan an agent execution runs."""
 
     model_config = ConfigDict(extra="forbid")
 
     question: str
     definition_id: str
     definition_version: int
-    studies: list[str] = Field(default_factory=list)
+    studies: list[str] = _PydanticField(default_factory=list)
     concept: str | None = None
-    assertion: list[Assertion] = Field(default_factory=lambda: ["present"])
-    evidence_state: list[EvidenceState] = Field(default_factory=list)
     window: tuple[int, int] | None = None
     anchor: str | None = None
-    retrieval_mode: Literal["lexical", "dense", "hybrid"] = "lexical"
+    evidence_state: list[EvidenceState] = _PydanticField(default_factory=list)
+    assertion: list[Assertion] = _PydanticField(default_factory=list)
+    retrieval_mode: Literal["precise", "discovery", "hybrid"] = "precise"
     top_k: int = 20
-    notes: list[str] = Field(default_factory=list)
+    notes: list[str] = _PydanticField(default_factory=list)
     backend: Literal["deterministic", "llm"] = "deterministic"
 
 
 class Clarification(BaseModel):
-    """Returned instead of a spec when the question leaves a rule undetermined."""
-
     model_config = ConfigDict(extra="forbid")
 
     question: str
-    ambiguity: str = Field(description="The specific thing that is underdetermined.")
-    effect: str = Field(description="What changes in the result depending on it.")
-    options: list[str] = Field(default_factory=list)
-
-
-class RunManifest(BaseModel):
-    """The reproducibility record for one evaluation."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    run_id: str
-    created_at: str
-    spec: dict[str, Any]
-    extractor_version: str
-    definition_id: str
-    definition_version: int
-    definition_hash: str
-    definition_status: DefinitionStatus
-    snapshot_id: str
-    deterministic: bool = True
-    nondeterministic_paths: list[str] = Field(default_factory=list)
-    counts_by_state: dict[str, int] = Field(default_factory=dict)
-    counts_by_verdict: dict[str, int] = Field(default_factory=dict)
-    assignments: list[CaseAssignment] = Field(default_factory=list)
-    results_hash: str = ""
-    limitations: list[str] = Field(default_factory=list)
+    ambiguity: str
+    effect: str
+    options: list[str] = _PydanticField(default_factory=list)
