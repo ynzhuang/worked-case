@@ -467,7 +467,9 @@ def _field_states(chain: Sequence[CanonicalAERecord]) -> dict[str, str]:
     if "labs.GLUCOSE" not in summary:
         summary["labs.GLUCOSE"] = "unknown"
     summary["symptoms"] = (
-        "collected" if any(r.symptoms for r in chain) else "unknown"
+        "collected"
+        if any(r.symptoms_assessed.value is True for r in chain)
+        else "unknown"
     )
     return dict(sorted(summary.items()))
 

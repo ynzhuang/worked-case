@@ -42,6 +42,12 @@ NARRATIVE_HEADER = (
 
 TERMINAL_OUTCOMES = {"recovered", "recovered_with_sequelae", "fatal"}
 
+#: Terms a coder may assign when the verbatim does not clearly name the
+#: concept. They are real coded terms; they are simply not this concept's.
+NON_SPECIFIC_CODED_TERMS = [
+    "Malaise", "Asthenia", "Feeling abnormal", "General physical health deterioration",
+]
+
 
 # --------------------------------------------------------------------------
 # Ground truth
@@ -66,6 +72,13 @@ class EpisodeTruth:
     symptoms: list[str]
     rescue_given: bool
     third_party_assistance: bool
+    #: Whether the event was coded to a term that denotes the concept, as
+    #: opposed to a non-specific term like "Malaise". This is a property of how
+    #: the event was reported and coded, not of the study's conventions, so it
+    #: is the same across every rendering of this truth.
+    coded_specifically: bool = True
+    #: Whether *this study* collects coded terms at all. Representation-
+    #: dependent: V-D never does.
     coded_by_study: bool = True
     assertion: str = "present"
     #: A second, distinct episode for the same subject a few days later. For a
@@ -82,16 +95,23 @@ class EpisodeTruth:
     def onset_is_in_window(self) -> bool:
         return 0 <= self.onset_offset_days <= 14
 
-    def true_evidence_state(self) -> str:
-        """The state v1 should assign given the clinical facts.
+    def true_evidence_state(self, *, as_recorded: bool = False) -> str:
+        """The state v1 should assign.
 
-        Computed from the truth, independent of how any study recorded it.
+        With ``as_recorded`` false this is representation-independent: it uses
+        whether the event was coded *specifically*, not whether this particular
+        study collects coded terms at all. That is the reference invariance is
+        measured against.
+
+        With ``as_recorded`` true it accounts for the study's conventions, and
+        so is what this rendering can actually support.
         """
         if self.concept != "HYPOGLYCEMIA" or self.assertion != "present":
             return "none"
+        coded = self.coded_specifically and (self.coded_by_study or not as_recorded)
         has_symptom = bool(self.symptoms)
         low_glucose = self.glucose_mgdl is not None and self.glucose_mgdl < 70
-        if self.coded_by_study:
+        if coded:
             return "explicit"
         if low_glucose and has_symptom:
             return "supported"
@@ -99,22 +119,22 @@ class EpisodeTruth:
             return "insufficient"
         return "none"
 
-    def true_verdict(self) -> str:
-        """The verdict v1 should reach, independent of representation.
+    def true_verdict(self, *, as_recorded: bool = False) -> str:
+        """The verdict v1 should reach.
 
-        This is what invariance is measured against: a study that codes the
-        event and one that leaves it to the narrative should land in the same
-        bucket, even if they arrive by different rules.
+        Representation-independent by default. A study that codes the event and
+        one that leaves it to the narrative should land in the same bucket; the
+        invariance harness measures whether they do, and reports where they do
+        not rather than assuming they will.
         """
         if self.concept != "HYPOGLYCEMIA" or self.assertion != "present":
             return "excluded"
         if not self.onset_is_in_window:
             return "excluded"
-        low_glucose = self.glucose_mgdl is not None and self.glucose_mgdl < 70
-        has_symptom = bool(self.symptoms)
-        if low_glucose and has_symptom:
+        state = self.true_evidence_state(as_recorded=as_recorded)
+        if state in ("explicit", "supported"):
             return "case"
-        if has_symptom:
+        if state == "insufficient":
             return "review"
         return "excluded"
 
@@ -345,6 +365,12 @@ class CorpusGenerator:
              "drug_withdrawn", "dose_reduced"]
         )
 
+        # Some events are coded to a term that denotes the concept; others are
+        # coded non-specifically ("Malaise") while the narrative plainly
+        # describes hypoglycemia. Both happen, and the second is what the
+        # evidence ladder below `explicit` exists to catch.
+        coded_specifically = self.rng.random() < 0.55
+
         if kind == "case":
             glucose = float(self.rng.choice([38, 44, 48, 52, 54, 58, 62, 66, 68]))
             symptoms = sorted(self.rng.sample(symptom_pool, self.rng.choice([1, 2, 2, 3])))
@@ -387,6 +413,7 @@ class CorpusGenerator:
             symptoms=symptoms,
             rescue_given=bool(symptoms) and self.rng.random() < 0.6,
             third_party_assistance=severity_start == "severe" and self.rng.random() < 0.4,
+            coded_specifically=coded_specifically,
             recurrence_gap_days=(
                 self.rng.randint(2, 5) if self.rng.random() < 0.22 else None
             ),
@@ -503,7 +530,11 @@ class CorpusGenerator:
 
         coded = ""
         if study.collects("coded_term") and truth.coded_by_study:
-            coded = self.coded_term_for(truth.concept, study.dictionary_version) or ""
+            coded = (
+                self.coded_term_for(truth.concept, study.dictionary_version)
+                if truth.coded_specifically
+                else self._pick(NON_SPECIFIC_CODED_TERMS)
+            ) or ""
 
         # A restricted codelist cannot express every clinical concept. Where it
         # cannot, the cell is left empty and the semantics layer resolves it to
@@ -647,10 +678,14 @@ class CorpusGenerator:
             f" {truth.onset_offset_days} days after the dose escalation.", "concept",
         )
 
-        if truth.symptoms and detail != "brief":
+        if truth.symptoms:
             builder.sentence(
                 f"The subject reported {self._symptom_phrase(truth.symptoms)}."
             )
+        elif truth.concept == "HYPOGLYCEMIA":
+            # Stating the negative is what makes "asymptomatic" recoverable.
+            # Without it, an empty symptom list is merely undocumented.
+            builder.sentence("The subject reported no associated symptoms.")
         # V-C keeps the objective value on the linked form and out of the text;
         # V-D is the study where the narrative is the only place it appears.
         if truth.glucose_mgdl is not None and study.representation != "V-C":
@@ -804,6 +839,7 @@ class CorpusGenerator:
                 "true_evidence_state": truth.true_evidence_state(),
                 "true_verdict": truth.true_verdict(),
                 "rendered_in": [s.study_id for s in studies],
+                "cohort": "invariance",
             })
 
         # 2. Study-local background subjects, so the corpus is not composed
@@ -833,6 +869,7 @@ class CorpusGenerator:
                     "true_evidence_state": truth.true_evidence_state(),
                     "true_verdict": truth.true_verdict(),
                     "rendered_in": [study.study_id],
+                    "cohort": "background",
                 })
 
         corpus.manifest = self._manifest(studies, corpus)
@@ -857,8 +894,12 @@ class CorpusGenerator:
             "episode_end": emitted["end"].isoformat(),
             "onset_offset_days": rendered.onset_offset_days,
             "peak_severity": rendered.peak_severity,
-            "true_evidence_state": rendered.true_evidence_state(),
-            "true_verdict": rendered.true_verdict(),
+            "coded_specifically": rendered.coded_specifically,
+            "coded_by_study": rendered.coded_by_study,
+            "state_as_recorded": rendered.true_evidence_state(as_recorded=True),
+            "verdict_as_recorded": rendered.true_verdict(as_recorded=True),
+            "true_evidence_state": base_truth.true_evidence_state(),
+            "true_verdict": base_truth.true_verdict(),
             "representation_independent_verdict": base_truth.true_verdict(),
         }
 

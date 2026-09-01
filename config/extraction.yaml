@@ -214,6 +214,12 @@ values:
     done_no_recurrence: ["rechallenge without recurrence", "no recurrence on rechallenge",
                          "rechallenged without recurrence", "rechallenge negative",
                          "rechallenge with no recurrence"]
+  # An explicit statement that symptoms were looked for and not found. This is
+  # what lets "asymptomatic" be distinguished from "not documented".
+  symptoms_absent:
+    cues: ["no associated symptoms", "without associated symptoms",
+           "reported no symptoms", "denied any symptoms", "asymptomatic",
+           "no symptoms were reported", "symptom free"]
   rescue_treatment:
     cues: ["oral glucose", "glucose gel", "glucose tablets", "dextrose",
            "glucagon", "juice was given", "orange juice", "rescue carbohydrate",

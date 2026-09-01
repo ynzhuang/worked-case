@@ -1,11 +1,16 @@
-"""Extraction: free text and structured tables in, event objects out.
+"""The model path.
 
-This is a configurable rule and lexicon baseline.  It is deterministic, runs
-offline, and is not a trained clinical NLP model.  Nothing here assigns an
-evidence state or decides whether a subject is a case: the extractor reports
-what the text and the tables say, and the phenotype definition interprets it.
+Schema-constrained, span-grounded, and permitted to abstain.  It is asked only
+about fields the deterministic path left unresolved; ``aelayer.guards`` enforces
+that.
+
+Two backends.  ``rules`` is a local clinical NLP baseline of lexicons and
+ConText-style cue scoping — deterministic, offline, and not a trained model.
+``llm`` is optional and used only when an API key is present.  With the network
+disconnected the layer runs the rules backend and the run manifest says which
+one produced the values.
 """
 
-from .engine import ExtractionEngine, extract_corpus
+from .engine import ExtractionEngine, extract_records
 
-__all__ = ["ExtractionEngine", "extract_corpus"]
+__all__ = ["ExtractionEngine", "extract_records"]

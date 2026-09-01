@@ -142,6 +142,7 @@ class RecordNormalizer:
             dictionary=study.dictionary if coded.populated else None,
             dictionary_version=dictionary_version if coded.populated else None,
             standardized_concept=self.standardize(coded.value, dictionary_version),
+            concept_source="coded" if self.standardize(coded.value, dictionary_version) else None,
             onset_datetime=self._datetime_field("onset_datetime", row, study),
             end_datetime=self._datetime_field(
                 "end_datetime", row, study, forced_state=end_state

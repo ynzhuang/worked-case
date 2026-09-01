@@ -22,34 +22,9 @@ from typing import Any
 
 from ..anchors import parse_date
 from ..catalog import ConceptCatalog, ExtractionConfig
-from ..models import (
-    ACTION_TAKEN_VALUES,
-    OUTCOME_VALUES,
-    RECHALLENGE_VALUES,
-    RELATEDNESS_VALUES,
-    SERIOUSNESS_VALUES,
-    SEVERITY_VALUES,
-)
 from .assertion import _cue_pattern
 
-#: Fields read from cue lists in ``extraction.yaml`` under ``values``.
-_ENUM_FIELDS: dict[str, tuple[str, ...]] = {
-    "severity": SEVERITY_VALUES,
-    "seriousness": SERIOUSNESS_VALUES,
-    "relatedness": RELATEDNESS_VALUES,
-    "action_taken": ACTION_TAKEN_VALUES,
-    "outcome": OUTCOME_VALUES,
-    "rechallenge": RECHALLENGE_VALUES,
-}
 
-#: SDTM columns that carry the same information as the narrative cues, and the
-#: mapping from their coded values onto ours.
-_AE_COLUMN_FOR: dict[str, str] = {
-    "severity": "AESEV",
-    "relatedness": "AEREL",
-    "action_taken": "AEACN",
-    "outcome": "AEOUT",
-}
 
 
 @dataclass(frozen=True)
@@ -88,17 +63,25 @@ class ValueExtractor:
 
     # -- enumerated fields --------------------------------------------------
 
+    def allowed_values(self, field: str) -> tuple[str, ...]:
+        """The cue vocabulary configured for a field.
+
+        Taken from ``extraction.yaml`` rather than from the model enums: the
+        cue space is a property of the config, and the backend maps it onto the
+        canonical codelist afterwards.
+        """
+        return tuple(sorted((self.values.get(field) or {})))
+
     def find_cues(self, text: str, field: str) -> list[CueHit]:
         """All cue hits for one enumerated field, most specific first.
 
         Where several values' cues match, the longest cue wins: "not resolved"
         must beat the "resolved" it contains.
         """
-        allowed = _ENUM_FIELDS[field]
         cue_map = self.values.get(field) or {}
         hits: list[CueHit] = []
         for value in sorted(cue_map):
-            if value not in allowed:
+            if not isinstance(cue_map[value], list):
                 continue
             for cue in cue_map[value]:
                 for match in _cue_pattern(cue).finditer(text):
@@ -148,64 +131,18 @@ class ValueExtractor:
                 seen[hit.value] = hit
         return [seen[value] for value in sorted(seen)]
 
-    def rescue_treatment(self, text: str) -> CueHit | None:
-        """Rescue carbohydrate or glucagon: often the only trace of a mild event."""
-        cues = (self.values.get("rescue_treatment") or {}).get("cues") or []
+    def rescue_treatment(self, text: str, field: str = "rescue_treatment") -> CueHit | None:
+        """First hit from a named `cues:` list in extraction config."""
+        cues = (self.values.get(field) or {}).get("cues") or []
         for cue in cues:
             match = _cue_pattern(cue).search(text)
             if match:
                 return CueHit(
-                    "rescue_treatment", "true", match.group(0),
+                    field, "true", match.group(0),
                     match.start(), match.end(),
                     self.config.confidence_for("assertion_cue", 0.9),
                 )
         return None
-
-    # -- structured AE columns ---------------------------------------------
-
-    def from_ae_row(self, row: dict[str, Any], field: str) -> str | None:
-        """Read a field from the AE record where the study populated it.
-
-        Coded values are inputs, preserved and used.  Where the column is blank
-        — and in older studies it often is — the narrative is the only source.
-        """
-        column = _AE_COLUMN_FOR.get(field)
-        if column is None:
-            return None
-        raw = row.get(column)
-        if raw in (None, ""):
-            return None
-        folded = str(raw).strip().lower().replace(" ", "_").replace("-", "_")
-        allowed = _ENUM_FIELDS[field]
-        if folded in allowed:
-            return folded
-        # Tolerate the common SDTM spellings for these columns.
-        aliases = {
-            "severity": {"grade_1": "mild", "grade_2": "moderate", "grade_3": "severe"},
-            "outcome": {
-                "recovered": "resolved", "recovered/resolved": "resolved",
-                "recovering": "resolving", "not_recovered": "not_resolved",
-                "fatal": "fatal", "unknown": "unknown",
-            },
-            "relatedness": {"related": "possible", "not_related": "not_related"},
-            "action_taken": {
-                "drug_withdrawn": "drug_withdrawn", "dose_not_changed": "none",
-                "dose_reduced": "dose_reduced", "drug_interrupted": "dose_interrupted",
-            },
-        }
-        return aliases.get(field, {}).get(folded)
-
-    def seriousness_from_ae_row(self, row: dict[str, Any]) -> list[str]:
-        raw = row.get("AESCAT")
-        if not raw:
-            return []
-        return sorted(
-            {
-                part.strip()
-                for part in str(raw).split("|")
-                if part.strip() in SERIOUSNESS_VALUES
-            }
-        )
 
     # -- laboratory values --------------------------------------------------
 
@@ -292,7 +229,7 @@ class ValueExtractor:
             return rule.get("unit")
         return None
 
-    def labs_from_lb(
+    def _unused_labs_from_lb(
         self,
         rows: list[dict[str, Any]],
         onset_date: _dt.date | None,

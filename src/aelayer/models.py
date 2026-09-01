@@ -272,9 +272,11 @@ class CanonicalAERecord(BaseModel):
     dictionary_version: str | None = None
     standardized_concept: str | None = _PydanticField(
         default=None,
-        description="Catalogue concept the coded term maps to, by explicit "
-                    "membership. Null when no catalogue term matches.",
+        description="Catalogue concept for this record, by explicit membership. "
+                    "From the coded term where the study assigned one, from an "
+                    "asserted verbatim mention where it did not.",
     )
+    concept_source: Literal["coded", "text", None] = None
 
     onset_datetime: Field[_dt.datetime] = _PydanticField(default_factory=Field)
     end_datetime: Field[_dt.datetime] = _PydanticField(default_factory=Field)
@@ -290,6 +292,10 @@ class CanonicalAERecord(BaseModel):
 
     #: Clinical detail that lives on linked event forms or in narrative.
     symptoms: list[SymptomMention] = _PydanticField(default_factory=list)
+    #: Whether the source addressed symptoms at all. An empty symptom list
+    #: means two different things — none were present, or none were recorded —
+    #: and a rule that requires symptoms has to be able to tell them apart.
+    symptoms_assessed: Field[bool] = _PydanticField(default_factory=Field)
     labs: list[LabValue] = _PydanticField(default_factory=list)
     assertion: Field[str] = _PydanticField(default_factory=Field)
 
@@ -311,7 +317,7 @@ class CanonicalAERecord(BaseModel):
     CLINICAL_FIELDS: tuple[str, ...] = (
         "verbatim_term", "coded_term", "onset_datetime", "end_datetime",
         "severity", "seriousness", "relatedness", "action_taken", "outcome",
-        "assertion",
+        "assertion", "symptoms_assessed",
     )
 
     def fields(self) -> dict[str, Field[Any]]:
@@ -328,6 +334,10 @@ class CanonicalAERecord(BaseModel):
         missing = [
             name for name, field in self.fields().items() if not field.has_provenance()
         ]
+        if self.standardized_concept and not any(
+            s.field in ("standardized_concept", "coded_term") for s in self.evidence
+        ):
+            missing.append("standardized_concept")
         missing.extend(
             f"symptoms[{s.symptom}]" for s in self.symptoms if not s.span.doc_id
         )
