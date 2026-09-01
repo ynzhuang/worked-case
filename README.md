@@ -1,16 +1,20 @@
 # Adverse event evidence layer
 
 A working prototype of a clinical evidence layer over completed-trial adverse
-event data. It converts free-text AE evidence into validated,
-provenance-bearing **event objects**, evaluates **versioned phenotype
-definitions** over those objects, exposes the result through **retrieval**, and
-puts a **specification-first agent** on top.
+event data. It reads adverse event evidence in the forms studies actually
+record it — structured CRF fields, verbatim terms, narrative text, linked event
+forms — and turns it into **source-faithful canonical records** that say what
+each study collected and, just as carefully, what it did not. Above those
+records it derives **episodes**, evaluates **versioned phenotype definitions**
+over the episodes, exposes both a precise and a discovery retrieval path, and
+puts a specification-first agent on top whose every number can be followed back
+to the sentence a site wrote.
 
 ```bash
-make demo     # generate, extract, evaluate v1, print the case table — offline, ~15s
+make demo     # generate, normalize, extract, reconcile, evaluate — offline, ~35s
 make eval     # the full evaluation harness -> reports/eval.md
 make serve    # the API and the single-page UI on http://127.0.0.1:8000/
-make test     # 321 tests
+make test     # 368 tests, 88% statement coverage
 ```
 
 ---
@@ -22,11 +26,20 @@ patient data, and nothing derived from real patient data, is present anywhere
 here. Every table row carries a `SYNTHETIC` column and every narrative carries a
 synthetic header.
 
-**The extractor is a configurable rule and lexicon baseline.** It is a
-deterministic system of dictionaries, regular expressions and ConText-style cue
-scoping, driven entirely by `config/`. It is not a trained clinical NLP model
-and must not be described as one. Its recall depends on the surface forms
-written into `config/concepts.yaml`.
+**The extraction backend is a configurable rule and lexicon baseline.** By
+default it is a deterministic system of dictionaries, regular expressions and
+ConText-style cue scoping, driven entirely by `config/`. It is not a trained
+clinical NLP model and must not be described as one. An LLM backend can be
+configured in its place; the manifest records which one ran, and with the
+network disconnected the model path degrades to deterministic-only and says so
+in its notes.
+
+**Coded terms in the configuration are illustrative placeholders.** This
+repository holds no MedDRA licence and ships no MedDRA content. The terms in
+`config/concepts.yaml` are stand-ins with the right *shape* — preferred terms,
+lower-level terms, and different sets under different dictionary versions — so
+that dictionary-version bridging can be exercised. Replace them with a licensed
+extract before any real use.
 
 **The metrics measure signal recovery, not clinical performance.** Gold labels
 are the generator's own intent. A number in `reports/eval.md` says the pipeline
@@ -34,487 +47,442 @@ recovered a signal that was deliberately planted in a corpus it also wrote. That
 is a much weaker claim than performance on real clinical text, and no figure
 here transfers to a real study.
 
-**MedDRA terms in the config are illustrative placeholders.** This repository
-holds no MedDRA licence and ships no MedDRA content. Replace
-`config/concepts.yaml` with a licensed extract before any real use.
+**Nothing is trained.** There is no model in this repository to train, and no
+code path that fits parameters to data.
 
 ### What this is not
 
-- Not a replacement for MedDRA coding. Coded terms are inputs, preserved and used.
+- Not a replacement for coding. Coded terms are inputs: preserved, and used.
 - Not a pharmacovigilance system. It supports secondary research on locked data;
   it does not perform regulatory signal management.
 - Not a clinical decision support tool.
-- Not trained on anything. There is no model here to train.
+- Not a claim that consistency is validity. See *Representation invariance*.
 
 ---
 
-## The idea
+## The two levels, and why there are exactly two
 
-Two artifacts are deliberately separated, and the separation is the point of the
-whole system.
+**`CanonicalAERecord` — one per source record.** This is the grain the study
+actually collected. It is never merged with another record, never overwritten,
+and never edited in place. If a study split one clinical event across three CRF
+rows because the severity changed twice, that is three canonical records,
+because that is what the study wrote down.
 
-An **event object** answers *what happened to this patient*. It is per-record,
-extracted, evidence-bearing, and stamped with the extractor version that produced
-it. It reports what the text and the tables say. It assigns no evidence state and
-decides no cases.
+**`CanonicalAEEpisode` — derived, additive, above the records.** An episode is
+this system's view of the clinical event the records describe. It is computed
+from the records and can be recomputed at any time; deleting every episode loses
+nothing that cannot be rebuilt. Deleting a record loses the source.
 
-A **phenotype definition** answers *for this scientific question, which event
-objects make this patient a case*. It is a declarative, versioned rule over event
-objects. It is configuration, not code.
+The separation is the point. A system that merges records in place has thrown
+away the study's own account of the event and cannot get it back. A system that
+refuses to derive anything above the records makes every downstream question
+re-implement episode assembly, differently each time.
 
-Nobody edits Python to change a case definition. A clinical scientist edits YAML,
-the version increments, and prior runs remain reproducible against the definition
-that produced them.
+Phenotype definitions operate on **episodes**, and the loader rejects a
+definition that says otherwise.
 
+---
+
+## A blank is not a value
+
+Every clinical field on a canonical record is a `Field[T]`, and every `Field`
+carries a **collection state**. A missing value is not a fact about the patient
+until something says which kind of missing it is:
+
+| state | what it means |
+| --- | --- |
+| `collected` | the study asked, and this is the answer |
+| `not_collected_by_protocol` | the CRF has no column for this at all |
+| `not_applicable_gated` | a parent question was answered such that this one does not apply |
+| `pending_ongoing` | the event has not ended; the answer does not exist yet |
+| `intentionally_blank` | the column exists and the protocol instructs the site to leave it empty |
+| `not_representable` | the study's codelist cannot express the concept the evidence supports |
+| `unknown` | none of the above is established |
+
+Only `collected` is evidence. `Field.is_evidence_of_absence` is true for exactly
+one state, and a phenotype definition that tries to treat
+`not_collected_by_protocol` or `not_applicable_gated` as absence is **rejected by
+the loader**, not merely discouraged.
+
+What each blank means is not guessed at read time. It is declared per study in
+`config/collection_semantics.yaml` — which fields the CRF carries, which parent
+questions gate which children, which codelists are restricted and what they
+cannot express. A study with no declared semantics cannot be read at all: every
+blank in it would be guesswork, and the loader says so.
+
+### `not_representable` is the honest answer
+
+Study 5 collects treatment action with a codelist of `none`,
+`drug_withdrawn` and `drug_interrupted`. A narrative describing a dose reduction
+has no permissible code. Substituting `drug_interrupted` would assert something
+the evidence does not support. The field is left unresolved, marked
+`not_representable`, and the note says which concept could not be expressed. The
+weaker claim is the correct one.
+
+### Verbatim and coded, both
+
+Where a study coded a term, the record keeps **both** the verbatim term the site
+wrote and the coded term the dictionary assigned, along with the dictionary
+version that assigned it. Neither replaces the other. A definition can then ask
+whether a coded term is a catalogue term for its concept *under that episode's
+own dictionary version*, or opt into `bridge_dictionary_versions` to union across
+versions — which is how you measure what bridging is worth, rather than assuming
+it.
+
+---
+
+## Six renderings of one truth
+
+The generator samples a clinical truth — what happened to a patient — and then
+renders that same truth into six studies with different collection conventions:
+
+| study | representation | what makes it different |
+| --- | --- | --- |
+| STUDY-01 | V-A | everything structured, values in mg/dL |
+| STUDY-02 | V-B | one episode split across records on every severity change |
+| STUDY-03 | V-C | clinical detail on a linked event form, brief narratives |
+| STUDY-04 | V-D | minimal coding: no coded terms at all, narrative only |
+| STUDY-05 | V-E | a restricted action codelist that cannot express a dose reduction |
+| STUDY-06 | V-F | an earlier dictionary version with different coded terms |
+
+The corpus is fully determined by its seed: the same seed produces byte-identical
+files. Ground truth is written alongside as `truths.jsonl`, `gold_records.jsonl`
+and `gold_episodes.jsonl`, and the gold answer key distinguishes what *happened*
+from what a given rendering can *support* — a study that collects no coded terms
+cannot reach an `explicit` state on coding, and the answer key says so.
+
+---
+
+## The deterministic and model paths, enforced in code
+
+The deterministic path (`normalize/`) reads structured fields. The model path
+(`extract/`) reads text. The boundary between them is not a convention:
+
+```python
+from aelayer.guards import assert_model_path_permitted, unresolved_fields
 ```
-narrative + SDTM tables
-        │
-        ▼
-   extraction            EventObject: concept, assertion, symptoms, labs,
-   (rules + lexicon)     onset, severity, seriousness, action, outcome
-        │                — every value carries the span it came from
-        ▼
-   phenotype             CaseAssignment: verdict, evidence state, the rule
-   definition (YAML)     that fired, the spans behind it, the version that
-        │                produced it
-        ▼
-   retrieval  ·  run manifest  ·  agent
-```
+
+`guards.py` computes, for each record, the fields whose state is genuinely
+unresolved, and refuses any model request that names a settled field or carries
+anything but text. A test asserts that no already-controlled value is ever sent
+to a model, over every record in the corpus. The guard is the reason the boundary
+holds when someone adds a backend later.
+
+**Abstention is a valid answer.** A backend that cannot support a value from the
+text returns `value: null, collection_state: "unknown"` and says so. A guess is a
+defect, and the harness scores abstention as its own outcome: how often the model
+path correctly declined against how often it answered, and how often each was
+right.
+
+A value recovered from narrative does not retroactively make the CRF column
+collected. `Field.prior_state` keeps the structured state, and the harness
+compares against it.
 
 ---
 
-## Why the pieces are shaped this way
+## Episodes, and what happens when linkage is a judgement call
 
-### Severity and seriousness are separate fields, always
+`EpisodeReconciler` assembles records into episodes under an ordered set of
+rules, and records which rule decided each one:
 
-Severity is the *intensity* of the event: mild, moderate, severe. Seriousness is
-a *regulatory category defined by outcome*: death, life-threatening,
-hospitalisation, disability, congenital anomaly, other medically important.
+1. `explicit_continuation` — the CRF itself says this record continues that one
+2. `declared_convention` — the study declares that it splits on severity change
+3. `temporal_overlap` — the records' date ranges overlap
+4. `gap_within_tolerance` — a short gap, for a concept where recurrence is not expected
+5. `recurrence_split` — a gap, for a concept where recurrence *is* expected, so they stay separate
 
-A mild event can be serious. A severe event can be non-serious. They are stored
-separately, extracted from separate cue lists that never write to each other,
-queried separately, and reported separately. The synthetic corpus deliberately
-contains counterexamples to their conflation, and a test asserts both directions.
+`recurrence_expected` is declared per concept. Hypoglycemia recurs; anaemia,
+within a study window, generally does not. The default merge rule is wrong for
+exactly one of those, which is why the harness reports over-merge and over-split
+separately and again split by whether recurrence is expected.
 
-The agent refuses to answer a question that uses both words loosely, because
-picking one silently would produce a count that answers neither question.
-
-### Assertion is a first-class field, not a confidence discount
-
-"No evidence of hypoglycemia" is not a low-confidence hypoglycemia event. It is a
-documented absence. It is stored as `assertion: absent`, it is queryable as such,
-and it is filterable as a structured predicate.
-
-All six classes are extracted: `present`, `absent`, `hypothetical`, `historical`,
-`family_history`, `uncertain`. Not just present and absent — a family history of
-hypoglycemia and a hypothetical warning about it are different facts, and
-collapsing either into "negative" loses information a reviewer will ask for.
-
-### The anchor comes from structured data, the offset from text
-
-A narrative says "six days after dose escalation". The escalation date lives in
-the exposure domain, represented in SDTM as a new `EX` record with a higher dose
-rather than as a flag. `src/aelayer/anchors.py` is the single place that decides
-which `EX` record *is* the escalation, so the extractor and the evaluator can
-never disagree about it.
-
-Where no anchor resolves, `onset_offset_days` is populated and `onset_date` stays
-null. The phenotype definition then decides what to do with that, via
-`window.on_unresolved_onset: case | review | exclude`. The extractor never makes
-that call.
-
-### Units are converted once, at extraction
-
-Trials report glucose in mg/dL or mmol/L depending on region. A threshold rule
-applied to an unconverted value misclassifies an entire study silently. Every
-`LabValue` carries both the value as reported and its canonical equivalent, and
-the evaluator converts the *threshold* into canonical units before comparing. A
-study reporting 3.1 mmol/L and one reporting 56 mg/dL are describing the same
-result and are treated as such.
-
-### The evidence ladder exists because both alternatives are wrong
-
-Pooling only explicit coded events undercounts systematically — one study in the
-corpus never coded hypoglycemia at all, and every case in it survives only in
-narrative. Treating every symptom mention as a case manufactures signal.
-
-So the definition assigns a state, and the states have a defensible ordering:
-
-| state | meaning |
-|---|---|
-| `explicit` | a coded term for the concept, or an asserted verbatim mention |
-| `supported` | no explicit mention, but corroborating objective evidence plus compatible clinical features |
-| `possible` | clinical features and contextual evidence, without confirmation |
-| `absent` | the concept is mentioned and negated |
-| `none` | no qualifying evidence |
-
-The primary analysis uses a threshold the definition names. The remainder is
-routed to adjudication and **reported as a separate count rather than
-discarded** — in the CLI, in the API, in the UI, and in the evidence package the
-agent returns.
-
-### Every derived value traces to a span
-
-`Span(doc_id, start, end, field, extracted_value, text)`. Every non-null field on
-every event object is backed by at least one. Values read from a structured table
-point at a rendered form of that row rather than at nothing.
-
-This is enforced, not aspired to: `EventObject.missing_provenance()` names any
-populated field without a span, `make demo` and `aelayer extract` fail loudly if
-the list is non-empty, the harness reports violations as defects, and a test
-asserts the invariant over the whole corpus. The UI highlights the spans in the
-source text so you can see the claim rather than take it.
-
-### No hierarchy walking
-
-Concept expansion uses the catalogue's own synonyms and coded terms. Grouping
-above the term level is an explicit, named list in `concepts.yaml`
-(`concept_groups`), never inferred by walking a dictionary hierarchy as though it
-were a subsumption ontology.
+Where the rule that fired is a judgement call, the episode is **flagged, not
+resolved**: `linkage_review_required` travels with it into every verdict, and a
+definition decides what to do about it via `episode.on_review_required`. The
+evaluation harness counts a case missed because the system declined a flagged
+linkage separately from a case missed silently, because they are different
+failures.
 
 ---
 
-## The configuration
+## Phenotype definitions
 
-These are the core deliverable. All three are schema-validated on load; a
-definition that fails validation does not run, and the error says which path
-failed and why.
-
-### `config/concepts.yaml`
-
-Concepts with their coded terms, lexicons and abbreviations; symptom sets and
-their surface forms; lab tests with canonical units, conversion factors and
-plausible ranges; and explicit concept groups.
-
-Ambiguous abbreviations declare a context gate. `hypo` fires as hypoglycemia only
-when a glucose value or a qualifying symptom sits in the same sentence:
+A definition is a YAML file with a version, a status and a content hash. Frozen
+versions are never edited: a change to what qualifies as a case is a new version,
+and the loader refuses to overwrite a frozen file.
 
 ```yaml
-abbreviations: ["hypo", "hypos"]
-context_required: [abbreviations]
-context_gate:
-  lab_tests: [GLUCOSE]
-  symptom_sets: [neuroglycopenic, autonomic]
-  scope: sentence
+evidence_rules:                  # ordered; the first match assigns the state
+  - id: explicit
+    state: explicit
+    when: {coded_term_matches_concept: true}
+  - id: supported
+    state: supported
+    when:
+      all:
+        - lab: {test: GLUCOSE, op: "<", value: 70, unit: mg/dL}
+        - symptoms: {min_count: 1, from: [neuroglycopenic, autonomic]}
+
+missingness:
+  treat_as_absent: []            # nothing is assumed absent
+  route_to_review: [pending_ongoing, unknown, not_representable]
 ```
 
-A concept may also declare what raises it as a candidate with no mention at all —
-the mechanism behind the `supported` and `possible` states:
+Three things the evaluator does that a naive one would not:
 
-```yaml
-candidate_evidence:
-  symptom_sets: [neuroglycopenic, autonomic]
-  min_symptoms: 1
-  lab_tests:
-    - {test: GLUCOSE, below: 80, unit: mg/dL}
-```
+- **It distinguishes a failed test from an untestable one.** A glucose value of
+  90 mg/dL fails the `supported` rule on the evidence. A study that never
+  measured glucose fails it for want of evidence. The definition's `missingness`
+  policy decides what happens to each, and the evaluator never assumes the second
+  is the first.
+- **It refuses to read a blank as absence unless the definition says so** — and
+  the definition cannot say so for the two states where it would be a lie.
+- **It carries linkage uncertainty forward** rather than counting a flagged
+  episode as though the assembly were certain.
 
-The `below: 80` bound is deliberately wider than any case threshold a definition
-uses, so the extractor narrows the field without pre-empting the definition's
-decision.
+**Treatment action is deliberately absent from every rule.** Whether the site
+reduced the dose is an attribute of the episode, not a criterion for it. Gating a
+hypoglycemia case definition on it imports a field the clinical question never
+referenced — and one that some studies cannot even express.
 
-### `config/extraction.yaml`
-
-Assertion cues by class and direction, pseudo-cues, terminators and precedence;
-temporal patterns with anchor aliases; anchor derivation rules against `EX`; lab
-value patterns with conservative unit inference; cue lists for severity,
-seriousness, relatedness, action, outcome, rechallenge and rescue.
-
-### `config/phenotypes/<id>.v<n>.yaml`
-
-One file per definition version. See
-`config/phenotypes/te_symptomatic_hypoglycemia.v1.yaml` for the full shape.
-
-The rule language is small and closed. Predicates: `coded_term_matches_concept`,
-`has_coded_term`, `lexicon_match`, `lab`, `symptoms`, `rescue_treatment`,
-`onset_offset_days`, and membership tests on `assertion`, `severity`,
-`seriousness`, `relatedness`, `action_taken`, `outcome`, `rechallenge`.
-Combinators: `any`, `all`, `not`. An unknown predicate is a load error, not a
-silently-false rule.
+**Assertion matters where it exists.** A coded AE row asserts presence by
+construction, and filtering it on assertion is theatre. A narrative can name
+hypoglycemia precisely in order to record that it did *not* happen, and a
+discovery search that ignores that returns documented absences as hits. So
+assertion is a structured predicate on the discovery path and on narrative-
+sourced fields, and it is not applied to coded rows as though it added
+information there.
 
 ---
 
-## Versioning and provenance
+## Two ways in
 
-Three content-derived hashes, stamped on every output row and every run manifest:
+**Patient-level access** has two paths that cannot be confused for each other.
 
-| hash | covers |
-|---|---|
-| `extractor_version` | code version plus `extraction.yaml` and `concepts.yaml` |
-| `definition_hash` | the phenotype definition file's content |
-| `snapshot_id` | every input file in the data directory |
+`retrieve()` is the precise path: adjudicated episodes, filterable by verdict,
+evidence state, representation, window, provenance and linkage-review status.
+Its result answers `usable_as_cohort` with a real yes.
 
-The **run id is derived from all three plus the resolved spec**, so identical
-inputs always produce an identical run id, and `aelayer replay <run_id>`
-re-executes and compares. When a replay fails it says *which* input moved — the
-data, the config, or the definition — rather than just that it did.
+`discover()` is the discovery path: places in documents where a concept is
+named. Every result is marked `candidate`, and calling `as_cohort()` on a
+discovery result raises `CandidateInCohort` with an explanation. A mention is not
+an episode, and no parameter turns one into the other; a candidate enters a
+cohort through adjudication or a definition version that claims it.
 
-The `snapshot_id` deliberately excludes the gold answer key: gold is evaluation
-scaffolding, not input data, and a run id must not change when only the answer
-key changes.
+**The program knowledge layer** is built from execution manifests. It is
+forward-capture: it accrues from governed executions, it is empty on day one, and
+its status message says exactly that rather than implying that history was
+reconstructed. Historical work is added only by an explicit, one-at-a-time
+`aelayer knowledge backfill --manifest <file>`.
 
-### The definition lifecycle
-
-- `draft` — being written. Will not run in a reproducible run without an explicit
-  `--allow-draft`, because its content can still change under the same version
-  number.
-- `frozen` — published. The loader **refuses to overwrite it**. A change to what
-  qualifies as a case is a new version, not an edit.
-- `superseded` — replaced by a later version, still loadable and still replayable,
-  because a prior analysis was built on it.
-
-`v2` is a new file. This repository ships both versions; `v2` raises the glucose
-threshold from the ADA Level 1 alert value of 70 mg/dL to the Level 2 value of 54:
-
-```console
-$ aelayer definitions --diff te_symptomatic_hypoglycemia:1:2
-  evidence_rules[supported].when.all[0].lab.value: 70 -> 54
-  supersedes: None -> 'te_symptomatic_hypoglycemia.v1'
-  version: 1 -> 2
-
-$ aelayer evaluate --version 1
-  verdicts     {'case': 167, 'excluded': 113, 'review': 50}
-
-$ aelayer evaluate --version 2
-  verdicts     {'case': 144, 'excluded': 119, 'review': 67}
-```
-
-Twenty-three subjects leave the case set — seventeen to `review`, six to
-`excluded` — and the v1 run still replays byte for byte. That is the whole
-argument for the separation, in three commands.
+Comparing two definition versions is **executed, not textual**: both run against
+the same snapshot and the answer is the set of episodes each one claims, with the
+deciding rule attached to every one that moved. A scope is mandatory — the
+capability exists for evidence reuse within a stated question, and an unscoped
+program-wide sweep is refused, because that is auditing colleagues' past choices
+rather than reusing evidence.
 
 ---
 
-## Interfaces
+## Traceability replaces the approval gate
 
-### CLI
+There is no approval click anywhere in this system. Approving a specification you
+cannot independently evaluate is ceremony: the reviewer sees a plan, not a
+result, and clicking approve does not make the result checkable.
+
+What makes a number checkable is that it can be followed back to source, after
+the fact, by someone who was not in the room when it was compiled:
 
 ```
-aelayer generate --seed 7 --studies 4     # synthetic corpus with gold labels
-aelayer ingest data/synthetic             # what is in a corpus
-aelayer extract --out store.db            # event objects + retrieval index
-aelayer definitions                       # list; --show, --diff id:1:2
-aelayer evaluate --definition te_symptomatic_hypoglycemia --version 1
-aelayer retrieve HYPOGLYCEMIA --assertion present --window 0:14
-aelayer ask "symptomatic hypoglycemia within 14 days of escalation" --approve
-aelayer eval --report reports/eval.md
-aelayer replay <run_id>
-aelayer runs
-aelayer demo
-aelayer serve
+number -> analysis run -> cohort -> definition version -> episodes -> records -> spans
 ```
 
-### API
+`aelayer trace <manifest-id>` walks that chain and prints it. If any hop cannot
+be made, `complete` is false and `broken_at` names the level; the command exits
+non-zero. A number that cannot be traced end to end is a failing test, not a
+caveat.
 
-`GET /api/summary` · `POST /extract` · `POST /evaluate` · `GET /retrieve` ·
-`GET /definitions` · `GET /definitions/{id}/diff?left=&right=` ·
-`POST /definitions/candidate` · `POST /agent/compile` · `POST /agent/run` ·
-`GET /runs` · `GET /runs/{id}` · `POST /runs/{id}/replay` ·
-`GET /api/documents/{doc_id}`
-
-Interactive docs at `/docs` once `make serve` is running.
-
-### UI
-
-A single page over the API, no build step and no external assets, with four
-panels matching the pipeline:
-
-1. **Source and event object side by side**, with every span highlighted in the
-   narrative and colour-coded by field. Hover a highlight to see which field it
-   supports.
-2. **The phenotype definition as controls bound to the YAML**, with a version
-   badge, a status badge, and a live diff. Editing a control builds a candidate
-   next version that can be downloaded. The UI never mutates a frozen definition.
-3. **Retrieval with a visible assertion filter**, showing the negation false
-   positive rate change as you toggle it.
-4. **The agent**, showing the compiled spec with an approval checkbox that gates
-   the execute button, and the clarification when the question is
-   underdetermined.
+Every execution writes a `Manifest` recording what was asked, what was compiled,
+every version that produced the answer, and a **pointer** to where the result
+lives. It never stores a copy of the result: a second copy is a second thing that
+can drift. The manifest id is content-derived, so identical inputs produce an
+identical id, and `aelayer replay <manifest-id>` re-executes a recorded run and
+reports which input moved if it no longer reproduces — the data, the normalizer,
+the extractor, or the definition.
 
 ---
 
 ## The agent
 
-`compile.py` turns a question into a `PhenotypeQuerySpec`. Two backends:
+The agent compiles a question into an inspectable `PhenotypeQuerySpec` and runs
+it through code that was written before the question was asked. It computes
+nothing itself: every number comes from a registered service, and calling
+anything else raises.
 
-- **deterministic** (default, offline): template and slot matching against the
-  definition catalogue.
-- **LLM** (optional, only when `ANTHROPIC_API_KEY` is set): the model emits the
-  spec as JSON and nothing else. Its output is schema-validated and **rejected on
-  failure rather than repaired**, because a repaired spec is one nobody approved.
-  It never computes a statistic and never names a case.
+Where the question leaves a rule underdetermined, it stops and says which rule:
 
-Non-negotiable behaviours, each covered by a test:
+- **severity and seriousness together** — different fields; a severe event can be
+  non-serious and a mild one serious, so a single count answers neither question
+- **"severe hypoglycemia"** — an intensity grade, or the diabetes-trial term of
+  art for an episode requiring third-party assistance
+- **a window or threshold the definition does not use** — that is a change to the
+  case definition, so it needs a new version, not a query parameter
 
-- The compiled spec is returned and **execution blocks until it is approved**.
-- Execution calls only the four functions in `tools.py`: `cohort`, `retrieve`,
-  `evaluate`, `summarise`.
-- The result is an evidence package: counts by state, per-study breakdown,
-  contributing spans, definition version and hash, extractor version, snapshot id,
-  and stated limitations.
-- Where the question leaves a rule underdetermined, the agent returns a
-  clarification naming the specific ambiguity and its effect, rather than choosing
-  a default.
-
-```console
-$ aelayer ask "serious severe hypoglycemia cases"
-Clarification needed before anything can be run.
-
-  Ambiguity: The question uses both severity language and seriousness language,
-             and they are different fields.
-  Effect:    Severity is the intensity of the event; seriousness is a regulatory
-             category defined by outcome. A mild event can be serious and a
-             severe event can be non-serious, so the two filters select different
-             subjects. Collapsing them would produce a count that answers neither
-             question.
-  Options:
-    - Filter on severity (mild / moderate / severe)
-    - Filter on seriousness (death, life-threatening, hospitalisation, ...)
-    - Report both as separate counts
-
-  No specification was compiled and nothing was executed.
-```
-
-It also refuses to guess when the question names a window or a threshold that
-differs from the definition's — because that is a change to the case definition,
-which needs a new version, not a query parameter — when no definition matches at
-all, and when a named study is not in the snapshot.
-
----
-
-## The synthetic corpus
-
-`aelayer generate` writes 4–6 studies of 40–80 subjects each: SDTM-shaped `DM`,
-`AE`, `EX`, `LB` and `CM` tables plus one case narrative per AE record, and a
-gold answer key.
-
-Narratives are assembled from templates across **19 controlled patterns**:
-explicit coded mentions, British and US spelling, one-edit misspellings including
-transpositions, gated and ungated abbreviations, lab-plus-symptom cases,
-contextual-only cases with rescue or a dose action, symptoms alone, negated,
-hypothetical, historical and family-history mentions, uncertain mentions,
-evidence split across sentences, out-of-window onsets, unresolved onsets, and
-distractor concepts.
-
-Onset is phrased eight ways — relative to a named anchor, relative with no
-anchor, "within N days of", "the day after", "on the day of", study day, absolute
-date, and vague quantifiers — and sometimes appears only in the `AE` table, so
-the temporal extractor has to earn its place.
-
-Studies differ on purpose:
-
-| study | units | dictionary | notes |
-|---|---|---|---|
-| STUDY-01 | mg/dL | MedDRA 26.0 | conventional coding |
-| STUDY-02 | mmol/L | MedDRA 24.1 | SI units throughout |
-| STUDY-03 | mg/dL | MedDRA 25.0 | severe events only were collected |
-| STUDY-04 | mmol/L | MedDRA 21.1 | **never coded hypoglycemia at all**; AE table carries almost nothing |
-| STUDY-05 | mg/dL | MedDRA 27.0 | recent conventions |
-| STUDY-06 | mmol/L | MedDRA 23.0 | crossover; rechallenge language, partial AE columns |
-
-Every record carries a `gold` block: true concept, assertion, onset offset and
-phrasing, symptoms, labs, severity, seriousness, action, outcome, evidence state
-and case status under v1. Gold never asserts a value the record does not state —
-a test enforces that for onset.
+In each case nothing is executed and no number is produced.
 
 ---
 
 ## Evaluation
 
-`make eval` writes `reports/eval.md` with real numbers for every metric.
+`make eval` writes `reports/eval.md`. Three layers, a stress test, and a
+reproducibility check, reported separately because they answer different
+questions.
 
-**Extraction** — precision, recall and F1 per field, broken out by assertion class
-and by narrative pattern, with the counts behind every rate. A six-by-six
-assertion confusion matrix. Onset accuracy broken out by phrasing, which is where
-the cost of mapping "several days" to a fixed value stays visible instead of
-hiding in a pooled number.
+**Layer 1 — clinical validity.** Field-level precision, recall and F1 against
+gold, broken out by collection state, by source path and by representation; a
+collection-state confusion matrix; abstention quality; and provenance violations,
+of which any number above zero is a defect.
 
-**Phenotype** — PPV and sensitivity of the `case` verdict against the gold labels,
-pooled and per study, plus the full `case`/`review`/`excluded` confusion and the
-evidence-state confusion.
+**Layer 2 — episode reconciliation.** Boundary agreement against the true
+episodes, with over-merge and over-split reported separately, and separately
+again for concepts where recurrence is expected.
 
-**Retrieval** — recall@k, precision@k and MRR per study, and the **negation
-false positive rate measured with the assertion filter on and off**. That
-contrast is the headline number, because it quantifies what a structured
-assertion column buys over hoping an embedding encoded the negation. Recall@k is
-reported alongside its mathematical ceiling, since with 63 relevant documents
-recall@5 cannot exceed 0.079 however perfect the ranking; precision@k is the
-figure that is not capped.
+**Layer 3 — phenotype.** PPV and sensitivity against the gold case labels, with
+misses attributable to declined linkage counted apart; plus transportability
+across studies held out from rule development. Nothing here is fitted to data, so
+that gap measures how much harder the held-out studies' conventions are, not
+overfitting.
 
-A concept filter is structural, not lexical. An event raised from symptoms and a
-glucose value carries no surface form of the concept anywhere in its narrative,
-so requiring a text match would drop exactly the records the evidence ladder
-exists to catch. The lexical index orders results; it does not gate them.
+**Stress test — representation invariance.** For each sampled truth, does the
+final classification agree across the six renderings? This is layered on top of
+Layers 1–3, and the report states, in these words:
 
-**Stability** — extraction, run id and results hash across repeated invocations.
+> Consistency across representations does not establish clinical validity. A
+> pipeline can be perfectly consistent and consistently wrong.
 
-**Definition sensitivity** — case assignment re-run across a sweep of one rule
-parameter (glucose 70 → 63 → 54 → 45, window 28 → 14 → 7 → 3), reporting how the
-case count moves. This makes definitional drift a measurement rather than an
-argument.
+**Reproducibility.** Identical inputs produce an identical manifest id and an
+identical results hash, and a recorded run replays against a definition version
+that has since been superseded.
 
-The harness is not decoration. Building it surfaced a series of real defects
-that are fixed in this repository, among them: an unbounded glucose arm in
-candidate gating that raised hypoglycemia on hyperglycemia narratives; lab and
-concomitant-medication records from a neighbouring event attributed to the wrong
-record; a `same_day` onset phrasing with no matching extraction pattern; an
-outcome cue that never matched the phrase the corpus actually used; and two
-places where the gold key asserted something the record never stated.
+### What it currently reports
+
+On the shipped corpus (seed 7, six studies, 252 subjects, 337 source records,
+306 episodes), `te_symptomatic_hypoglycemia` v1:
+
+| | |
+| --- | --- |
+| collection-state accuracy | **1.000** over 4 718 field readings |
+| abstention precision / answer precision | 1.000 / 1.000 over 563 model-path decisions |
+| provenance violations | **0** |
+| episode boundary agreement | 0.990 (1 over-merge, 1 over-split) |
+| PPV / sensitivity | 1.000 / 0.890 |
+| of 16 missed cases | 16 are episodes the system declined on flagged linkage, 0 are silent |
+| sensitivity excluding declined linkage | 1.000 |
+| transportability (development → held-out) | 0.889 → 0.890 sensitivity |
+| representation invariance, verdict | 0.909 across six renderings |
+| representation invariance, evidence state | 0.636 |
+| discovery negation FP rate, filter on / off | 0.0000 / 0.1034 |
+| reproducibility | manifest id, results hash and normalization all stable |
+
+Three of these are worth reading carefully rather than admiring.
+
+**The Layer 1 figures are bounded by the lexicon, not by the method.** The
+extraction config covers the surface forms this generator writes, so the model
+path answers 217 times without error and declines 346 times without error. That
+says the baseline is not guessing where it lacks evidence — which is the property
+being tested. It says nothing about recall on phrasings nobody wrote into
+`config/extraction.yaml`, and on real narratives that is the number that would
+move.
+
+**Sensitivity is 0.890 because the system declined, not because it missed.**
+Every one of the 16 misses is an episode whose linkage the reconciler flagged and
+whose definition routes flagged linkage to review. Excluding those, sensitivity is
+1.000. Whether declining is the right behaviour is a question about the
+definition; the harness's job is to keep the two failures distinguishable.
+
+**Invariance on evidence state is 0.636, and that is the finding.** Every
+departure is STUDY-04 (V-D), which collects no coded terms at all: the same
+clinical truth that reaches `explicit` in five renderings can only reach
+`supported`, `insufficient` or nothing where nobody coded it. The pipeline is not
+inconsistent — the renderings genuinely carry different evidence, and a system
+that reported identical states across them would be inventing coding that does
+not exist.
+
+---
+
+## Interfaces
+
+```bash
+aelayer generate --seed 7            # six renderings of one sampled truth
+aelayer normalize                    # the deterministic path, by collection state
+aelayer extract                      # normalize, enrich, reconcile, index
+aelayer definitions --compare te_symptomatic_hypoglycemia:1:2 \
+                    --scope "hypoglycemia incidence after escalation"
+aelayer evaluate --version 1         # the case table, with the rule behind each row
+aelayer retrieve HYPOGLYCEMIA --window 0:14          # precise path
+aelayer retrieve HYPOGLYCEMIA --mode lexical         # discovery path
+aelayer ask "how many subjects had symptomatic hypoglycemia?"
+aelayer trace <manifest-id>          # the number, back to the text
+aelayer replay <manifest-id>         # hash for hash
+aelayer eval --report reports/eval.md
+aelayer knowledge status
+```
+
+The HTTP API mirrors the CLI through the same pipeline object, so the two cannot
+disagree about which version produced a number. `make serve` also serves a
+single-page UI with five panels: source text beside the canonical record and its
+collection states; episodes beside the records they were derived from; the
+definition, a candidate builder that never mutates a frozen file, and the scoped
+executed comparison; the two retrieval paths side by side with the assertion
+filter on and off; and the agent, with the trace it produces.
+
+The UI is API-driven, so opening `ui/index.html` from the filesystem shows an
+empty shell. Run `make demo` once, then `make serve`, and open the address it
+prints.
 
 ---
 
 ## Layout
 
 ```
-config/                 concepts, extraction rules, phenotype definitions
-  └── phenotypes/       one file per definition version
-data/synthetic/         generated tables, narratives and gold labels
+config/
+  concepts.yaml               concepts, lexicons, coded terms by dictionary version
+  collection_semantics.yaml   what a blank means, per study, per field
+  extraction.yaml             cues, patterns, anchors, confidences
+  phenotypes/                 one file per definition version
+data/synthetic/               generated tables, narratives, and the answer key
 src/aelayer/
-  models.py             EventObject, Span, LabValue, PhenotypeDefinition, ...
-  catalog.py            config loading and validation
-  anchors.py            anchor resolution against the exposure record
-  ingest.py             SDTM tables, narratives and gold into a store
-  generate.py           the synthetic corpus generator
-  hashing.py            the three content hashes
-  extract/
-    text.py             sentence splitting, tokenising, edit distance
-    concepts.py         lexicon and coded-term matching, abbreviation gating
-    assertion.py        ConText/NegEx-style cue-and-scope classifier
-    temporal.py         offset patterns and anchor resolution
-    values.py           labs and units, severity, seriousness, action, outcome
-    engine.py           orchestration; produces EventObject list
-  phenotype/
-    loader.py           YAML load, schema validation, version hashing, diffing
-    evaluator.py        rule evaluation over EventObjects -> CaseAssignment
-  retrieval/
-    index.py            SQLite FTS5 plus structured attribute columns
-    query.py            compositional query
-    dense.py            optional; degrades to lexical with no local model
-  agent/
-    compile.py          question -> PhenotypeQuerySpec, or a clarification
-    tools.py            the only callable surface
-    run.py              approval gate, then execution
-  eval/
-    metrics.py          P/R/F1, confusion matrices, ranking metrics
-    harness.py          the five metric families
-    report.py           markdown rendering
-  pipeline.py           one assembled path shared by CLI, API and agent
-  runs.py               run manifests and replay
-  api.py                FastAPI
-  cli.py                Typer
-ui/                     static single-page client
-tests/                  321 tests
+  models.py                   Field[T], CanonicalAERecord, CanonicalAEEpisode, ...
+  semantics.py                the collection-semantics config, and gates/codelists
+  guards.py                   the deterministic/model boundary, in code
+  generate.py                 one truth, six renderings
+  normalize/                  the deterministic path
+  extract/                    the model path: text, concepts, assertion, temporal, values
+  episode.py                  record -> episode reconciliation, with rules and flags
+  phenotype/                  definition loading, validation, evaluation
+  retrieval/                  precise and discovery paths over SQLite FTS5
+  knowledge/                  the program knowledge layer and executed comparison
+  agent/                      compile, the registered services, run, trace
+  eval/                       the three layers, invariance, reproducibility, report
+  runs.py                     manifests, the result store, replay
+  pipeline.py                 one assembled path shared by CLI, API and agent
+  api.py                      FastAPI
+  cli.py                      Typer
+ui/                           static single-page client
+tests/
 ```
 
 **Stack.** Python 3.11+, Pydantic v2, FastAPI, Typer, SQLite with FTS5, PyYAML,
-pytest. No cloud services. No PHI. Everything runs on a laptop with the network
-cable pulled.
+pytest. No cloud services. Everything runs on a laptop with the network cable
+pulled; the model path degrades to deterministic-only and says so.
 
 ---
 
 ## Out of scope
 
 Regulatory signal detection and disproportionality analysis; genetics and omics
-analysis, though `CaseAssignment` is shaped so a case-control export could be
-handed to an existing pipeline; multi-user auth and RBAC; real terminology
-licences; and model training of any kind.
+analysis, though `CaseAssignment` is shaped so a case-control export can be handed
+to an existing pipeline — and subjects in the review set are exported with a null
+status rather than coded either way; multi-user auth and RBAC; real terminology
+licences, since coded terms in the config are illustrative placeholders; and model
+training of any kind.

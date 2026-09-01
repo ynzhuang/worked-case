@@ -249,6 +249,10 @@ class ExtractionConfig:
         self.assertion = raw["assertion"]
         self.temporality = raw["temporality"]
         self.anchors = raw.get("anchors") or {}
+        #: Where a relative expression names no anchor of its own, and where an
+        #: episode is stamped with an offset for retrieval, this is the event
+        #: measured from.
+        self.default_anchor = (self.temporality or {}).get("default_anchor")
         self.labs = raw["labs"]
         self.values = raw["values"]
         self.normalisation = raw.get("normalisation") or {}

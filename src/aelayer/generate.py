@@ -671,16 +671,22 @@ class CorpusGenerator:
         # legitimately recover. Compared against `values`, which is only what
         # the structured cell holds, this is the difference between "the CRF
         # did not record it" and "the record does not say".
+        # These are the values the narrative sentences literally state, which
+        # is not always the value in this record's own cell: the narrative
+        # describes the episode, so it gives the peak severity and the final
+        # outcome even where a record in the middle of a chain carries an
+        # interim one. Scoring narrative recovery against the cell would mark a
+        # correct reading of the text as wrong.
         narrated: dict[str, Any] = {}
         detail = study.narrative_detail
         if detail == "rich":
-            narrated["severity"] = severity
+            narrated["severity"] = truth.peak_severity
             narrated["relatedness"] = truth.relatedness
-            narrated["outcome"] = outcome
+            narrated["outcome"] = truth.outcome
             if truth.action_taken:
                 narrated["action_taken"] = self._narrated_action(truth.action_taken)
         elif detail == "standard":
-            narrated["outcome"] = outcome
+            narrated["outcome"] = truth.outcome
 
         recoverable = {
             name: (values.get(name) if values.get(name) is not None

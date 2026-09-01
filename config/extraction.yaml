@@ -192,17 +192,24 @@ values:
     definite: ["definitely related", "certainly related", "definite relationship"]
     unknown: ["relationship not assessable", "causality not assessed"]
   action_taken:
-    dose_reduced: ["dose was reduced", "dose reduced", "dose reduction",
-                   "reduced the dose", "down-titrated", "dose decreased"]
-    dose_interrupted: ["dose was interrupted", "dose interrupted", "drug held",
-                       "study drug was held", "temporarily discontinued",
-                       "dosing was paused", "interruption of study drug"]
-    drug_withdrawn: ["study drug was withdrawn", "drug withdrawn",
-                     "permanently discontinued", "discontinued from study drug",
-                     "withdrawn from treatment"]
-    none: ["no change to study drug", "study drug continued unchanged",
-           "dose unchanged", "no dose change"]
-    unknown: ["action taken not recorded", "action unknown"]
+    dose_reduced: ["study drug dose was reduced", "dose was reduced",
+                   "dose reduced", "dose reduction", "reduced the dose",
+                   "down-titrated", "dose decreased"]
+    dose_interrupted: ["study drug was interrupted", "drug was interrupted",
+                       "study drug interrupted", "dose was interrupted",
+                       "dose interrupted", "drug held", "study drug was held",
+                       "temporarily discontinued", "dosing was paused",
+                       "interruption of study drug"]
+    drug_withdrawn: ["permanently withdrawn from study drug",
+                     "withdrawn from study drug", "study drug was withdrawn",
+                     "drug withdrawn", "permanently discontinued",
+                     "discontinued from study drug", "withdrawn from treatment"]
+    none: ["no change was made to study drug", "no change to study drug",
+           "study drug continued unchanged", "dose unchanged", "no dose change"]
+    not_applicable: ["no study drug action was applicable",
+                     "study drug action was not applicable"]
+    unknown: ["action taken with study drug was not recorded",
+              "action taken not recorded", "action unknown"]
   outcome:
     resolved: ["resolved", "resolution", "recovered", "settled", "symptoms abated"]
     resolving: ["resolving", "recovering", "improving"]

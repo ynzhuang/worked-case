@@ -276,6 +276,7 @@ class RulesBackend:
                 "dose_interrupted": "drug_interrupted",
                 "drug_withdrawn": "drug_withdrawn",
                 "none": "dose_not_changed",
+                "not_applicable": "not_applicable",
                 "unknown": "unknown",
             },
             "outcome": {

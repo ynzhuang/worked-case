@@ -1,17 +1,19 @@
 # Adverse event evidence layer.
 #
-# Everything here runs offline. No target requires a network call.
+# Everything here runs offline. No target requires a network call; the model
+# path degrades to deterministic-only and says so.
 
 PYTHON  ?= python3
 VENV    ?= .venv
 BIN     := $(VENV)/bin
 SEED    ?= 7
-STUDIES ?= 4
+STUDIES ?= 6
 PORT    ?= 8000
 
 .DEFAULT_GOAL := help
-.PHONY: help venv install demo generate extract evaluate eval retrieve ask \
-        replay serve test coverage lint clean distclean
+.PHONY: help venv install demo generate ingest normalize extract definitions \
+        compare evaluate retrieve discover ask trace eval replay knowledge \
+        serve test coverage clean distclean
 
 help:  ## Show the available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -26,37 +28,54 @@ venv: $(BIN)/python  ## Create the virtual environment
 install: venv  ## Install the package and its development dependencies
 	$(BIN)/pip install --quiet -e ".[dev]"
 
-demo: install  ## Generate, extract, evaluate v1, print the case table with reasons
+demo: install  ## Generate, normalize, extract, reconcile, evaluate — end to end
 	$(BIN)/aelayer demo --seed $(SEED) --studies $(STUDIES)
 
-generate: install  ## Generate the synthetic corpus
+generate: install  ## Generate the synthetic corpus (six renderings of one truth)
 	$(BIN)/aelayer generate --seed $(SEED) --studies $(STUDIES)
 
-extract: install  ## Extract event objects and build the retrieval index
+ingest: install  ## Load the corpus and report what is in it
+	$(BIN)/aelayer ingest
+
+normalize: install  ## Run the deterministic path and report collection states
+	$(BIN)/aelayer normalize
+
+extract: install  ## Normalize, enrich from narrative, reconcile episodes, index
 	$(BIN)/aelayer extract
 
-evaluate: install  ## Evaluate the v1 definition
+definitions: install  ## List the phenotype definitions and their content hashes
+	$(BIN)/aelayer definitions
+
+compare: install  ## Compare v1 and v2 by the episodes each one claims (scope required)
+	$(BIN)/aelayer definitions --compare te_symptomatic_hypoglycemia:1:2 \
+	  --scope "hypoglycemia incidence after dose escalation"
+
+evaluate: install  ## Evaluate the v1 definition over episodes
 	$(BIN)/aelayer evaluate --definition te_symptomatic_hypoglycemia --version 1
 
-retrieve: install  ## Example retrieval, assertion filter on
-	$(BIN)/aelayer retrieve HYPOGLYCEMIA --assertion present --window 0:14
+retrieve: install  ## Precise path: adjudicated episodes, usable as a cohort
+	$(BIN)/aelayer retrieve HYPOGLYCEMIA --window 0:14
 
-ask: install  ## Compile a question into a spec, without executing it
-	$(BIN)/aelayer ask "symptomatic hypoglycemia within 14 days of escalation"
+discover: install  ## Discovery path: narrative mentions, every one a candidate
+	$(BIN)/aelayer retrieve HYPOGLYCEMIA --mode lexical --assertion present
+
+ask: install  ## Compile a question, execute it, and trace the number to source
+	$(BIN)/aelayer ask "how many subjects had symptomatic hypoglycemia?"
 
 eval: install  ## Run the full evaluation harness and write reports/eval.md
 	$(BIN)/aelayer eval --report reports/eval.md --json reports/eval.json
+
+knowledge: install  ## What the program knowledge layer actually holds
+	$(BIN)/aelayer knowledge status
 
 serve: install  ## Serve the API and the UI on http://127.0.0.1:$(PORT)/
 	$(BIN)/aelayer serve --port $(PORT)
 
 test: install  ## Run the test suite
-	$(BIN)/pytest
+	$(BIN)/pytest -q
 
-coverage: install  ## Run the tests with coverage on extract/, phenotype/, retrieval/
-	$(BIN)/pytest --cov=aelayer.extract --cov=aelayer.phenotype \
-	              --cov=aelayer.retrieval --cov-report=term-missing \
-	              --cov-fail-under=80
+coverage: install  ## Run the tests with coverage over the whole package
+	$(BIN)/pytest --cov=aelayer --cov-report=term-missing --cov-fail-under=85
 
 clean:  ## Remove generated data, the store, runs and reports
 	rm -rf store.db runs reports/eval.md reports/eval.json

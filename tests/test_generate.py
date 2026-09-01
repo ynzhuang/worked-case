@@ -1,174 +1,166 @@
-"""The synthetic corpus and its gold answer key."""
+"""The corpus: synthetic, deterministic, and rendered six ways."""
 
 from __future__ import annotations
 
+import csv
 import json
+from collections import Counter, defaultdict
+from pathlib import Path
 
 import pytest
 
-from aelayer.generate import CorpusGenerator, generate_corpus
-
-SYNTHETIC_TABLES = ("dm", "ae", "ex", "lb", "cm")
+from aelayer.generate import generate_corpus
 
 
-def test_generation_is_deterministic(tmp_path):
-    first = tmp_path / "a"
-    second = tmp_path / "b"
-    generate_corpus(seed=3, n_studies=2, out_dir=first, subjects_per_study=6)
-    generate_corpus(seed=3, n_studies=2, out_dir=second, subjects_per_study=6)
-    for name in ("ae.csv", "narratives.jsonl", "gold.jsonl", "ex.csv", "lb.csv"):
-        assert (first / name).read_text() == (second / name).read_text(), name
+def rows(root: Path, table: str) -> list[dict]:
+    with (root / f"{table}.csv").open(encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
 
 
-def test_a_different_seed_gives_a_different_corpus(tmp_path):
-    generate_corpus(seed=1, n_studies=2, out_dir=tmp_path / "a", subjects_per_study=6)
-    generate_corpus(seed=2, n_studies=2, out_dir=tmp_path / "b", subjects_per_study=6)
-    assert (tmp_path / "a" / "narratives.jsonl").read_text() != (
-        tmp_path / "b" / "narratives.jsonl"
-    ).read_text()
+def jsonl(root: Path, name: str) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in (root / name).read_text(encoding="utf-8").splitlines() if line
+    ]
 
 
-def test_every_table_row_is_marked_synthetic(store):
-    for name in SYNTHETIC_TABLES:
-        rows = store.rows(name)
-        assert rows, name
-        assert all(row.get("SYNTHETIC") == "Y" for row in rows), name
+@pytest.fixture(scope="module")
+def small(tmp_path_factory) -> Path:
+    root = tmp_path_factory.mktemp("gen")
+    generate_corpus(seed=3, n_studies=6, out_dir=root,
+                    invariance_truths=4, background_per_study=2)
+    return root
 
 
-def test_every_narrative_header_says_synthetic(store):
-    for narrative in store.narratives.values():
-        assert "SYNTHETIC" in narrative.header
-        assert "NOT REAL PATIENT DATA" in narrative.header
+# -- determinism ------------------------------------------------------------
 
 
-def test_the_corpus_covers_every_narrative_pattern(tmp_path):
-    """Checked against a full-size corpus; the shared fixture is deliberately
-    small and cannot be expected to sample every low-weight pattern."""
-    import json as _json
+def test_the_same_seed_produces_byte_identical_files(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    generate_corpus(seed=5, n_studies=6, out_dir=a,
+                    invariance_truths=3, background_per_study=2)
+    generate_corpus(seed=5, n_studies=6, out_dir=b,
+                    invariance_truths=3, background_per_study=2)
+    for name in ("ae.csv", "lb.csv", "ex.csv", "dm.csv", "narratives.jsonl",
+                 "truths.jsonl", "gold_records.jsonl", "gold_episodes.jsonl",
+                 "manifest.json"):
+        assert (a / name).read_bytes() == (b / name).read_bytes(), name
 
-    root, _manifest = generate_corpus(
-        seed=5, n_studies=4, out_dir=tmp_path / "full", subjects_per_study=40
+
+def test_a_different_seed_produces_a_different_corpus(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    generate_corpus(seed=5, n_studies=6, out_dir=a,
+                    invariance_truths=3, background_per_study=2)
+    generate_corpus(seed=6, n_studies=6, out_dir=b,
+                    invariance_truths=3, background_per_study=2)
+    assert (a / "ae.csv").read_bytes() != (b / "ae.csv").read_bytes()
+
+
+# -- it says what it is -----------------------------------------------------
+
+
+def test_every_row_is_marked_synthetic(small):
+    for table in ("dm", "ae", "ex", "lb"):
+        table_rows = rows(small, table)
+        assert table_rows
+        assert {r["SYNTHETIC"] for r in table_rows} == {"Y"}
+
+
+def test_the_corpus_carries_a_notice_that_it_is_not_patient_data(small):
+    manifest = json.loads((small / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["synthetic"] is True
+    assert "No real patient data" in manifest["notice"]
+    assert "SYNTHETIC DATA ONLY" in (small / "README.txt").read_text(encoding="utf-8")
+
+
+# -- the six renderings -----------------------------------------------------
+
+
+def test_each_truth_in_the_invariance_cohort_is_rendered_under_every_study(small):
+    episodes = jsonl(small, "gold_episodes.jsonl")
+    by_truth = defaultdict(set)
+    for episode in episodes:
+        if episode["base_truth_id"].startswith("T"):
+            by_truth[episode["base_truth_id"]].add(episode["study_id"])
+    assert by_truth
+    for truth_id, studies in by_truth.items():
+        assert len(studies) == 6, f"{truth_id} rendered in {sorted(studies)}"
+
+
+def test_the_representation_independent_verdict_is_the_same_across_renderings(small):
+    """The invariance reference: what happened does not depend on the CRF."""
+    by_truth = defaultdict(set)
+    for episode in jsonl(small, "gold_episodes.jsonl"):
+        if episode["base_truth_id"].startswith("T"):
+            by_truth[episode["base_truth_id"]].add(
+                episode["representation_independent_verdict"]
+            )
+    for truth_id, verdicts in by_truth.items():
+        assert len(verdicts) == 1, f"{truth_id} has {verdicts}"
+
+
+def test_what_a_rendering_can_support_may_be_weaker_than_the_truth(small):
+    """V-D collects no coded terms, so it cannot reach `explicit` on coding."""
+    weaker = [
+        e for e in jsonl(small, "gold_episodes.jsonl")
+        if e["state_as_recorded"] != e["true_evidence_state"]
+    ]
+    assert weaker, "no rendering loses anything, so invariance is untested"
+    assert all(not e["coded_by_study"] for e in weaker)
+
+
+def test_one_study_splits_a_single_episode_across_records(small):
+    counts = Counter(
+        (e["study_id"], e["n_records"] > 1)
+        for e in jsonl(small, "gold_episodes.jsonl")
     )
-    patterns = {
-        _json.loads(line)["pattern"]
-        for line in (root / "gold.jsonl").read_text().splitlines()
-        if line.strip()
-    }
-    expected = {
-        "explicit_coded", "explicit_verbatim_only", "explicit_british",
-        "explicit_misspelled", "abbrev_gated", "abbrev_ungated", "lab_symptom",
-        "split_sentence", "context_rescue", "context_action", "symptom_only",
-        "negated", "hypothetical", "historical", "family_history", "uncertain",
-        "out_of_window", "unresolved_onset", "distractor",
-    }
-    assert expected <= patterns
+    splitting = {study for (study, split) in counts if split}
+    assert splitting, "no study exercises multi-record episodes"
 
 
-def test_the_corpus_covers_every_assertion_class(store):
-    assertions = {row["assertion"] for row in store.gold() if row["assertion"]}
-    assert assertions == {
-        "present", "absent", "hypothetical", "historical", "family_history",
-        "uncertain",
-    }
+def test_the_linked_form_study_puts_its_glucose_outside_the_ae_row(small):
+    linked = rows(small, "linked_hypo_event")
+    assert linked
+    assert {r["SYNTHETIC"] for r in linked} == {"Y"}
+    linked_ids = {r["LNKID"] for r in linked}
+    ae_links = {r["AELNKID"] for r in rows(small, "ae") if r["AELNKID"]}
+    assert linked_ids & ae_links
 
 
-def test_the_corpus_covers_every_evidence_state(store):
-    states = {row["evidence_state"] for row in store.gold()}
-    assert states == {"explicit", "supported", "possible", "absent", "none"}
+def test_studies_use_different_dictionary_versions(small):
+    manifest = json.loads((small / "manifest.json").read_text(encoding="utf-8"))
+    versions = {b["dictionary_version"] for b in manifest["studies"].values()}
+    assert len(versions) > 1
 
 
-def test_studies_differ_on_purpose(corpus_dir):
-    manifest = json.loads((corpus_dir / "manifest.json").read_text())
-    studies = manifest["studies"]
-    assert len({s["glucose_unit"] for s in studies.values()}) > 1
-    assert len({s["dictionary_version"] for s in studies.values()}) > 1
+def test_studies_use_different_glucose_units(small):
+    units = {r["LBORRESU"] for r in rows(small, "lb") if r["LBORRESU"]}
+    assert {"mg/dL", "mmol/L"} <= units
 
 
-def test_a_study_reports_glucose_in_si_units(store):
-    units = {row["LBORRESU"] for row in store.rows("lb")}
-    assert "mmol/L" in units or "mg/dL" in units
-    assert len(units) >= 1
+# -- the answer key ---------------------------------------------------------
 
 
-def test_gold_onset_is_always_recoverable_from_the_record(store):
-    """Gold must never assert a value nothing in the record states."""
-    ae_by_doc = {row.get("DOCID"): row for row in store.rows("ae")}
-    for row in store.gold():
-        if row["onset_offset_days"] is None:
-            continue
-        in_table = bool(ae_by_doc.get(row["doc_id"], {}).get("AESTDTC"))
-        in_text = row["onset_phrasing"] not in (None, "none", "structured")
-        assert in_table or in_text, row["doc_id"]
+def test_gold_records_record_what_each_field_state_should_be(small):
+    gold = jsonl(small, "gold_records.jsonl")
+    assert gold
+    states = {s for row in gold for s in row["collection_states"].values()}
+    # More than one kind of blank has to appear, or the harness measures nothing.
+    assert len({s for s in states if s != "collected"}) >= 3
 
 
-def test_gold_case_status_rolls_up_to_subjects(corpus_dir):
-    records = [json.loads(line) for line in
-               (corpus_dir / "gold.jsonl").read_text().splitlines() if line.strip()]
-    subjects = {
-        json.loads(line)["subject_id"]: json.loads(line)
-        for line in (corpus_dir / "gold_cases.jsonl").read_text().splitlines()
-        if line.strip()
-    }
-    rank = {"excluded": 0, "review": 1, "case": 2}
-    by_subject = {}
-    for row in records:
-        best = by_subject.get(row["subject_id"])
-        if best is None or rank[row["verdict"]] > rank[best]:
-            by_subject[row["subject_id"]] = row["verdict"]
-    for subject, verdict in by_subject.items():
-        assert subjects[subject]["verdict"] == verdict
-
-
-def test_severity_and_seriousness_are_not_correlated_by_construction(store):
-    """The corpus must contain counterexamples to their conflation."""
-    gold = store.gold()
-    mild_and_serious = [
-        r for r in gold if r["severity"] in ("mild", "moderate") and r["seriousness"]
+def test_a_value_only_the_narrative_carries_is_marked_recoverable(small):
+    gold = jsonl(small, "gold_records.jsonl")
+    recoverable = [
+        row for row in gold
+        if any(k not in row["values"] or row["values"][k] in (None, "")
+               for k in row["narrated_values"])
     ]
-    severe_and_not_serious = [
-        r for r in gold if r["severity"] == "severe" and not r["seriousness"]
-    ]
-    assert mild_and_serious, "a mild event can be serious"
-    assert severe_and_not_serious, "a severe event can be non-serious"
+    assert recoverable, "nothing is recoverable only from text"
 
 
-def test_a_study_never_codes_the_concept_at_all(corpus_dir):
-    manifest = json.loads((corpus_dir / "manifest.json").read_text())
-    if len(manifest["studies"]) >= 4:
-        assert any(
-            not s["codes_hypoglycemia"] for s in manifest["studies"].values()
-        )
-
-
-def test_gold_state_mirrors_v1_semantics():
-    """Spot-check the answer key's own logic, independent of the evaluator."""
-    base = {
-        "concept": "HYPOGLYCEMIA", "assertion": "present", "symptoms": [],
-        "labs": [], "coded_term_matches_concept": False, "explicit_mention": False,
-        "rescue_treatment": False, "action_taken": None, "onset_offset_days": 5,
-    }
-    assert CorpusGenerator.gold_state(dict(base, explicit_mention=True)) == "explicit"
-    assert CorpusGenerator.gold_state(
-        dict(base, symptoms=["tremor"],
-             labs=[{"test": "GLUCOSE", "canonical_mgdl": 50}])
-    ) == "supported"
-    assert CorpusGenerator.gold_state(
-        dict(base, symptoms=["tremor"], rescue_treatment=True)
-    ) == "possible"
-    assert CorpusGenerator.gold_state(dict(base, symptoms=["tremor"])) == "none"
-    assert CorpusGenerator.gold_state(dict(base, assertion="absent")) == "absent"
-    assert CorpusGenerator.gold_state(dict(base, concept="NAUSEA")) == "none"
-
-
-def test_gold_verdict_honours_the_window_and_the_assertion_policy():
-    base = {"concept": "HYPOGLYCEMIA", "assertion": "present", "onset_offset_days": 5}
-    assert CorpusGenerator.gold_verdict(base, "explicit") == "case"
-    assert CorpusGenerator.gold_verdict(dict(base, onset_offset_days=40), "explicit") == "excluded"
-    assert CorpusGenerator.gold_verdict(dict(base, onset_offset_days=None), "explicit") == "review"
-    assert CorpusGenerator.gold_verdict(dict(base, assertion="uncertain"), "none") == "review"
-    assert CorpusGenerator.gold_verdict(dict(base, assertion="historical"), "none") == "excluded"
-
-
-def test_generation_rejects_an_impossible_study_count():
-    with pytest.raises(ValueError):
-        CorpusGenerator(n_studies=99)
+def test_narratives_are_linked_to_the_records_they_describe(small):
+    doc_ids = {n["doc_id"] for n in jsonl(small, "narratives.jsonl")}
+    ae_docs = {r["DOCID"] for r in rows(small, "ae") if r["DOCID"]}
+    assert ae_docs
+    assert ae_docs <= doc_ids

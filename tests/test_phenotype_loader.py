@@ -1,4 +1,4 @@
-"""Definition loading, validation, versioning and lifecycle."""
+"""Loading a definition: what it must say, and what it may not say."""
 
 from __future__ import annotations
 
@@ -8,190 +8,207 @@ import yaml
 from aelayer.phenotype.loader import (
     DefinitionCatalog,
     DefinitionError,
-    diff_definitions,
+    definition_content_hash,
     load_definition,
     validate_condition,
 )
 
 
-def write(tmp_path, body, name=None):
-    name = name or f"{body['id']}.v{body['version']}.yaml"
+@pytest.fixture
+def body(definition_v1):
+    return definition_v1.model_dump(
+        mode="json", exclude={"definition_hash", "source_path"}
+    )
+
+
+def write(tmp_path, body, name="te_symptomatic_hypoglycemia.v1.yaml"):
     path = tmp_path / name
-    path.write_text(yaml.safe_dump(body, sort_keys=False), encoding="utf-8")
+    path.write_text(yaml.safe_dump(body), encoding="utf-8")
     return path
 
 
-@pytest.fixture
-def minimal():
-    return {
-        "id": "demo",
-        "version": 1,
-        "status": "frozen",
-        "label": "Demo",
-        "concept": {"primary": "HYPOGLYCEMIA"},
-        "evidence_rules": [
-            {"id": "explicit", "state": "explicit",
-             "when": {"coded_term_matches_concept": True}}
-        ],
-    }
+def load(tmp_path, body, catalog, **kwargs):
+    return load_definition(write(tmp_path, body, **kwargs), catalog)
 
 
-def test_a_valid_definition_loads_and_is_hashed(tmp_path, minimal, catalog):
-    definition = load_definition(write(tmp_path, minimal), catalog)
-    assert definition.key == "demo.v1"
+# -- the happy path ---------------------------------------------------------
+
+
+def test_a_valid_definition_loads_and_is_stamped(tmp_path, body, catalog):
+    definition = load(tmp_path, body, catalog)
     assert definition.definition_hash
-    assert definition.source_path
+    assert definition.source_path.endswith("te_symptomatic_hypoglycemia.v1.yaml")
+    assert definition.key == "te_symptomatic_hypoglycemia.v1"
 
 
-def test_the_hash_changes_with_the_content(tmp_path, minimal, catalog):
-    first = load_definition(write(tmp_path, minimal), catalog).definition_hash
-    minimal["evidence_rules"][0]["when"] = {"has_coded_term": True}
-    second = load_definition(write(tmp_path, minimal), catalog).definition_hash
-    assert first != second
+def test_the_hash_follows_the_content_not_the_filename(tmp_path, body, catalog):
+    first = load(tmp_path, body, catalog)
+    body["description"] = body["description"] + " Edited."
+    second = load(tmp_path, body, catalog)
+    assert first.definition_hash != second.definition_hash
+    assert definition_content_hash(first) != definition_content_hash(second)
 
 
-def test_a_definition_that_fails_validation_does_not_load(tmp_path, minimal, catalog):
-    minimal["evidence_rules"][0]["when"] = {"nonsense_predicate": True}
-    with pytest.raises(DefinitionError, match="unknown predicate"):
-        load_definition(write(tmp_path, minimal), catalog)
+# -- what it must say -------------------------------------------------------
 
 
-def test_an_unknown_concept_is_rejected(tmp_path, minimal, catalog):
-    minimal["concept"]["primary"] = "NOT_A_CONCEPT"
-    with pytest.raises(DefinitionError, match="unknown primary concept"):
-        load_definition(write(tmp_path, minimal), catalog)
+def test_a_missing_file_says_so(tmp_path, catalog):
+    with pytest.raises(DefinitionError, match="no definition file at"):
+        load_definition(tmp_path / "nothing.yaml", catalog)
 
 
-def test_an_unknown_lab_test_is_rejected(tmp_path, minimal, catalog):
-    minimal["evidence_rules"][0]["when"] = {
-        "lab": {"test": "UNOBTAINIUM", "op": "<", "value": 1}
-    }
-    with pytest.raises(DefinitionError, match="unknown lab test"):
-        load_definition(write(tmp_path, minimal), catalog)
-
-
-def test_an_unconvertible_threshold_unit_is_rejected(tmp_path, minimal, catalog):
-    minimal["evidence_rules"][0]["when"] = {
-        "lab": {"test": "GLUCOSE", "op": "<", "value": 70, "unit": "furlongs"}
-    }
-    with pytest.raises(DefinitionError, match="no conversion"):
-        load_definition(write(tmp_path, minimal), catalog)
-
-
-def test_an_unknown_symptom_set_is_rejected(tmp_path, minimal, catalog):
-    minimal["evidence_rules"][0]["when"] = {
-        "symptoms": {"min_count": 1, "from": ["imaginary_set"]}
-    }
-    with pytest.raises(DefinitionError, match="unknown symptom sets"):
-        load_definition(write(tmp_path, minimal), catalog)
-
-
-def test_a_state_no_case_definition_mentions_is_rejected(tmp_path, minimal, catalog):
-    minimal["evidence_rules"].append(
-        {"id": "extra", "state": "supported", "when": {"has_coded_term": True}}
-    )
-    minimal["case_definition"] = {
-        "primary_set": ["explicit"], "review_set": [], "excluded": ["absent", "none"]
-    }
-    with pytest.raises(DefinitionError, match="never places"):
-        load_definition(write(tmp_path, minimal), catalog)
-
-
-def test_a_window_without_an_anchor_is_rejected(tmp_path, minimal, catalog):
-    minimal["window"] = {"unit": "days", "min": 0, "max": 14}
-    with pytest.raises(DefinitionError, match="no anchor"):
-        load_definition(write(tmp_path, minimal), catalog)
-
-
-def test_duplicate_rule_ids_are_rejected(tmp_path, minimal, catalog):
-    minimal["evidence_rules"].append(dict(minimal["evidence_rules"][0]))
-    with pytest.raises(DefinitionError, match="duplicate"):
-        load_definition(write(tmp_path, minimal), catalog)
-
-
-def test_the_filename_must_agree_with_the_declared_version(tmp_path, minimal, catalog):
-    path = write(tmp_path, minimal, name="demo.v9.yaml")
+def test_a_filename_that_disagrees_with_the_content_is_rejected(
+    tmp_path, body, catalog
+):
     with pytest.raises(DefinitionError, match="does not match declared version"):
-        load_definition(path, catalog)
+        load(tmp_path, body, catalog, name="te_symptomatic_hypoglycemia.v9.yaml")
 
 
-def test_the_loader_refuses_to_overwrite_a_frozen_definition(tmp_path, minimal, catalog):
-    write(tmp_path, minimal)
-    catalogue = DefinitionCatalog(tmp_path, catalog)
-    minimal["label"] = "Quietly changed"
-    with pytest.raises(DefinitionError, match="frozen and will not be overwritten"):
-        catalogue.write_candidate(minimal)
+def test_an_unknown_concept_is_rejected(tmp_path, body, catalog):
+    body["concept"]["primary"] = "NOT_A_CONCEPT"
+    with pytest.raises(DefinitionError, match="unknown primary concept"):
+        load(tmp_path, body, catalog)
 
 
-def test_a_draft_may_be_replaced_only_deliberately(tmp_path, minimal, catalog):
-    minimal["status"] = "draft"
-    write(tmp_path, minimal)
-    catalogue = DefinitionCatalog(tmp_path, catalog)
-    with pytest.raises(DefinitionError, match="already exists"):
-        catalogue.write_candidate(minimal)
-    minimal["label"] = "Revised draft"
-    path = catalogue.write_candidate(minimal, overwrite=True)
-    assert load_definition(path, catalog).label == "Revised draft"
+def test_a_window_without_an_anchor_is_rejected(tmp_path, body, catalog):
+    body["anchor"] = None
+    with pytest.raises(DefinitionError, match="no anchor"):
+        load(tmp_path, body, catalog)
 
 
-def test_a_new_version_is_a_new_file(tmp_path, minimal, catalog):
-    write(tmp_path, minimal)
-    catalogue = DefinitionCatalog(tmp_path, catalog)
-    assert catalogue.next_version("demo") == 2
-    v2 = dict(minimal, version=2, status="draft", supersedes="demo.v1")
-    path = catalogue.write_candidate(v2)
-    assert path.name == "demo.v2.yaml"
-    assert (tmp_path / "demo.v1.yaml").exists(), "v1 must still be there"
+def test_a_state_no_verdict_covers_is_rejected(tmp_path, body, catalog):
+    """A rule that assigns a state nothing maps is a silent dropped cohort."""
+    body["case_definition"]["review"] = []
+    with pytest.raises(DefinitionError, match="case_definition never places"):
+        load(tmp_path, body, catalog)
 
 
-def test_a_draft_will_not_run_in_a_reproducible_run_without_opt_in(
-    tmp_path, minimal, catalog
+def test_a_definition_over_records_rather_than_episodes_is_rejected(
+    tmp_path, body, catalog
 ):
-    minimal["status"] = "draft"
-    write(tmp_path, minimal)
-    catalogue = DefinitionCatalog(tmp_path, catalog)
-    with pytest.raises(DefinitionError, match="not reproducible|draft"):
-        catalogue.get("demo")
-    assert catalogue.get("demo", allow_draft=True).version == 1
+    body["operates_on"] = "record"
+    with pytest.raises(DefinitionError, match="Input should be 'episode'"):
+        load(tmp_path, body, catalog)
 
 
-def test_version_none_selects_the_highest_published_version(pipeline):
-    latest = pipeline.definition("te_symptomatic_hypoglycemia")
-    assert latest.version == max(
-        pipeline.definitions.versions("te_symptomatic_hypoglycemia")
-    )
-    assert latest.status != "draft"
+# -- the rule language ------------------------------------------------------
 
 
-def test_a_missing_version_reports_what_is_available(pipeline):
-    with pytest.raises(DefinitionError, match="available"):
-        pipeline.definition("te_symptomatic_hypoglycemia", 99)
+def test_an_unknown_predicate_is_rejected(catalog):
+    with pytest.raises(DefinitionError, match="unknown"):
+        validate_condition({"vibes": True}, catalog, where="r")
 
 
-def test_the_shipped_v1_and_v2_both_load_and_differ_by_one_threshold(
-    definition_v1, definition_v2
-):
-    changes = {c["path"]: c for c in diff_definitions(definition_v1, definition_v2)}
-    threshold = changes["evidence_rules[supported].when.all[0].lab.value"]
-    assert threshold["from"] == 70 and threshold["to"] == 54
-    assert definition_v1.definition_hash != definition_v2.definition_hash
-    assert definition_v2.supersedes == "te_symptomatic_hypoglycemia.v1"
+def test_a_lab_predicate_naming_an_unknown_test_is_rejected(catalog):
+    with pytest.raises(DefinitionError):
+        validate_condition(
+            {"lab": {"test": "NOPE", "op": "<", "value": 70, "unit": "mg/dL"}},
+            catalog, where="r",
+        )
 
 
-def test_diffing_matches_rules_by_id_not_position(definition_v1):
-    reordered = definition_v1.model_copy(deep=True)
-    reordered.evidence_rules = list(reversed(reordered.evidence_rules))
-    assert diff_definitions(definition_v1, reordered) == []
+def test_a_lab_predicate_with_an_unconvertible_unit_is_rejected(catalog):
+    with pytest.raises(DefinitionError):
+        validate_condition(
+            {"lab": {"test": "GLUCOSE", "op": "<", "value": 70, "unit": "furlongs"}},
+            catalog, where="r",
+        )
 
 
-def test_nested_combinators_validate(catalog):
-    validate_condition(
-        {"all": [{"any": [{"has_coded_term": True},
-                          {"not": {"rescue_treatment": True}}]}]},
-        catalog, where="test",
-    )
+def test_a_symptom_predicate_naming_an_unknown_set_is_rejected(catalog):
+    with pytest.raises(DefinitionError):
+        validate_condition(
+            {"symptoms": {"min_count": 1, "from": ["not_a_set"]}}, catalog, where="r"
+        )
 
 
 def test_an_empty_condition_is_rejected(catalog):
     with pytest.raises(DefinitionError, match="empty condition"):
-        validate_condition({}, catalog, where="test")
+        validate_condition({}, catalog, where="r")
+
+
+def test_the_shipped_rules_all_validate(definition_v1, definition_v2, catalog):
+    for definition in (definition_v1, definition_v2):
+        for rule in definition.evidence_rules:
+            validate_condition(rule.when, catalog, where=rule.id)
+
+
+# -- versions ---------------------------------------------------------------
+
+
+def test_a_draft_does_not_run_without_an_explicit_opt_in(tmp_path, body, catalog):
+    body["status"] = "draft"
+    body["version"] = 3
+    write(tmp_path, body, name="te_symptomatic_hypoglycemia.v3.yaml")
+    catalogue = DefinitionCatalog(tmp_path, catalog)
+    with pytest.raises(DefinitionError, match="not reproducible|will not run"):
+        catalogue.get("te_symptomatic_hypoglycemia")
+    assert catalogue.get("te_symptomatic_hypoglycemia", allow_draft=True).version == 3
+
+
+def test_asking_for_a_version_that_does_not_exist_says_what_does(
+    tmp_path, body, catalog
+):
+    write(tmp_path, body)
+    catalogue = DefinitionCatalog(tmp_path, catalog)
+    with pytest.raises(DefinitionError, match=r"available: \[1\]"):
+        catalogue.get("te_symptomatic_hypoglycemia", 7)
+
+
+def test_asking_for_an_unknown_definition_lists_the_known_ones(tmp_path, body, catalog):
+    write(tmp_path, body)
+    catalogue = DefinitionCatalog(tmp_path, catalog)
+    with pytest.raises(DefinitionError, match="known:"):
+        catalogue.get("something_else")
+
+
+def test_the_highest_published_version_wins_over_a_later_draft(
+    tmp_path, body, catalog
+):
+    write(tmp_path, body)
+    draft = dict(body, version=2, status="draft")
+    write(tmp_path, draft, name="te_symptomatic_hypoglycemia.v2.yaml")
+    catalogue = DefinitionCatalog(tmp_path, catalog)
+    assert catalogue.get("te_symptomatic_hypoglycemia").version == 1
+
+
+# -- writing a new version --------------------------------------------------
+
+
+def test_a_new_version_is_written_and_validated(tmp_path, body, catalog):
+    write(tmp_path, body)
+    catalogue = DefinitionCatalog(tmp_path, catalog)
+    assert catalogue.next_version("te_symptomatic_hypoglycemia") == 2
+    target = catalogue.write_candidate(dict(body, version=2, status="draft"))
+    assert target.exists()
+    written = catalogue.get("te_symptomatic_hypoglycemia", 2, allow_draft=True)
+    assert (written.version, written.status) == (2, "draft")
+
+
+def test_a_candidate_that_would_not_load_is_not_written(tmp_path, body, catalog):
+    write(tmp_path, body)
+    catalogue = DefinitionCatalog(tmp_path, catalog)
+    broken = dict(body, version=2, status="candidate")
+    broken["concept"] = dict(broken["concept"], primary="NOT_A_CONCEPT")
+    with pytest.raises(DefinitionError):
+        catalogue.write_candidate(broken)
+
+
+def test_a_draft_is_only_replaced_when_asked(tmp_path, body, catalog):
+    write(tmp_path, body)
+    catalogue = DefinitionCatalog(tmp_path, catalog)
+    draft = dict(body, version=2, status="draft")
+    catalogue.write_candidate(draft)
+    with pytest.raises(DefinitionError, match="Pass overwrite=True"):
+        catalogue.write_candidate(draft)
+    catalogue.write_candidate(dict(draft, label="Revised"), overwrite=True)
+    revised = catalogue.get("te_symptomatic_hypoglycemia", 2, allow_draft=True)
+    assert revised.label == "Revised"
+
+
+def test_a_frozen_definition_is_never_overwritten(tmp_path, body, catalog):
+    """A published definition is the record a prior cohort rests on."""
+    write(tmp_path, body)
+    catalogue = DefinitionCatalog(tmp_path, catalog)
+    with pytest.raises(DefinitionError, match="frozen and will not be overwritten"):
+        catalogue.write_candidate(dict(body, label="Quietly different"))

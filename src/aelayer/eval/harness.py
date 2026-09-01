@@ -75,10 +75,31 @@ INVARIANCE_CAVEAT = (
 )
 
 
+#: Fields whose gold value is recorded to the day. The corpus records event
+#: dates, not timestamps, so comparing a parsed midnight datetime against a gold
+#: date string has to happen at day resolution — otherwise every correctly
+#: recovered date scores as a miss, and the report says the pipeline recovers no
+#: dates at all when in fact it recovers them exactly.
+_DAY_RESOLUTION_FIELDS = frozenset({"onset_datetime", "end_datetime"})
+
+
 def _iso(value: Any) -> Any:
     if isinstance(value, (_dt.datetime, _dt.date)):
         return value.isoformat()
     return value
+
+
+def _comparable(field_name: str, value: Any) -> Any:
+    """One side of a gold comparison, rendered so both sides can be equal."""
+    if field_name in _DAY_RESOLUTION_FIELDS:
+        if isinstance(value, _dt.datetime):
+            return value.date().isoformat()
+        if isinstance(value, _dt.date):
+            return value.isoformat()
+        if isinstance(value, str) and value:
+            return value.split("T", 1)[0]
+        return value
+    return _iso(value)
 
 
 @dataclass
@@ -147,10 +168,10 @@ class EvaluationHarness:
                 # structured cell where there is one, the narrative where the
                 # study left the column out. Comparing against the cell alone
                 # would score a correct narrative recovery as a wrong answer.
-                want_value = (
-                    truth.get("recoverable_values", truth["values"]).get(name)
+                want_value = _comparable(
+                    name, truth.get("recoverable_values", truth["values"]).get(name)
                 )
-                got_value = _iso(field.value)
+                got_value = _comparable(name, field.value)
                 counts = scalar_prf(want_value, got_value)
                 overall[name].add(*counts)
                 if want_state:

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aelayer"
 version = "0.1.0"
-description = "Adverse event evidence layer: provenance-bearing event objects and versioned phenotype definitions over completed-trial AE data (synthetic)."
+description = "Adverse event evidence layer: source-faithful canonical AE records, derived episodes, and versioned phenotype definitions over completed-trial AE data (synthetic)."
 requires-python = ">=3.11"
 dependencies = [
   "pydantic>=2.5",
@@ -29,4 +29,5 @@ testpaths = ["tests"]
 addopts = "-q"
 
 [tool.coverage.run]
-source = ["aelayer.extract", "aelayer.phenotype", "aelayer.retrieval"]
+source = ["aelayer"]
+omit = ["*/__main__.py"]

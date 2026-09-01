@@ -1,11 +1,18 @@
-"""The evaluation harness itself."""
+"""The harness: three layers, a stress test, and what it refuses to claim."""
 
 from __future__ import annotations
 
+import datetime as _dt
+
 import pytest
 
-from aelayer.eval.harness import EvaluationHarness
-from aelayer.eval.metrics import ConfusionMatrix, PRF, recall_at_k, reciprocal_rank, scalar_prf
+from aelayer.eval.harness import (
+    DISCLAIMER,
+    INVARIANCE_CAVEAT,
+    EvaluationHarness,
+    run_evaluation,
+)
+from aelayer.eval.report import render_markdown
 
 
 @pytest.fixture(scope="module")
@@ -13,217 +20,192 @@ def harness(pipeline, definition_v1):
     return EvaluationHarness.build(pipeline, definition_v1)
 
 
-def test_extraction_metrics_report_counts_behind_every_rate(harness):
-    metrics = harness.extraction_metrics()
-    for name, body in metrics["overall"].items():
-        assert body["tp"] + body["fn"] == body["support"], name
-        assert 0.0 <= body["f1"] <= 1.0, name
+@pytest.fixture(scope="module")
+def results(harness):
+    return harness.run_all()
 
 
-def test_extraction_metrics_break_out_by_assertion_and_pattern(harness):
-    metrics = harness.extraction_metrics()
-    assert len(metrics["by_assertion"]) >= 5
-    assert len(metrics["by_pattern"]) >= 10
-    assert "vague" in metrics["onset_by_phrasing"] or metrics["onset_by_phrasing"]
+# -- Layer 1 ----------------------------------------------------------------
 
 
-def test_the_assertion_confusion_matrix_is_produced(harness):
-    metrics = harness.extraction_metrics()
-    matrix = metrics["assertion_confusion_matrix"]
-    assert matrix.total > 0
-    assert 0.0 <= matrix.accuracy <= 1.0
-    assert "gold \\ predicted" in matrix.to_markdown()
+def test_layer1_reports_a_collection_state_confusion_matrix(results):
+    confusion = results["layer1"]["collection_state_confusion"]
+    assert confusion["total"] > 0
+    assert 0.0 <= confusion["accuracy"] <= 1.0
+    assert len({r for r in confusion["labels"]}) >= 5
 
 
-def test_the_harness_reports_provenance_violations_as_defects(harness):
-    assert harness.extraction_metrics()["provenance_violations"] == []
+def test_layer1_separates_the_deterministic_path_from_the_model_path(results):
+    paths = results["layer1"]["by_source_path"]
+    assert "structured" in paths
+    assert "text" in paths, "the model path recovered nothing, so it is unmeasured"
 
 
-def test_phenotype_metrics_give_ppv_and_sensitivity_pooled_and_per_study(harness):
-    metrics = harness.phenotype_metrics()
-    assert 0.0 <= metrics["pooled"]["ppv"] <= 1.0
-    assert 0.0 <= metrics["pooled"]["sensitivity"] <= 1.0
-    assert metrics["per_study"]
-    for body in metrics["per_study"].values():
-        assert body["tp"] + body["fn"] == body["gold_cases"]
+def test_layer1_scores_abstention_as_its_own_outcome(results):
+    """Declining is a behaviour to be measured, not a gap in the numbers."""
+    abstention = results["layer1"]["abstention"]
+    asked = sum(
+        abstention[k] for k in
+        ("correct_abstention", "wrong_abstention", "correct_answer", "wrong_answer")
+    )
+    assert asked > 0
+    assert 0.0 <= abstention["abstention_precision"] <= 1.0
+    assert 0.0 <= abstention["answer_precision"] <= 1.0
 
 
-def test_phenotype_metrics_include_the_full_three_way_confusion(harness):
-    matrix = harness.phenotype_metrics()["verdict_confusion_matrix"]
-    assert set(matrix.labels) >= {"case", "review", "excluded"}
-    assert matrix.total > 0
+def test_dates_are_compared_at_the_resolution_the_corpus_records_them(results):
+    """A parsed midnight datetime and a gold date are the same answer."""
+    from aelayer.eval.harness import _comparable
+
+    assert _comparable("onset_datetime", _dt.datetime(2024, 2, 6, 0, 0)) == "2024-02-06"
+    assert _comparable("onset_datetime", "2024-02-06T00:00:00") == "2024-02-06"
+    assert _comparable("severity", "severe") == "severe"
+    for name in ("onset_datetime", "end_datetime"):
+        assert results["layer1"]["overall"][name]["recall"] == 1.0
 
 
-def test_the_review_set_is_counted_separately(harness):
-    metrics = harness.phenotype_metrics()
-    assert metrics["review_set_size"] == metrics["counts_by_verdict"].get("review", 0)
+def test_a_populated_field_without_a_span_is_reported_as_a_defect(results):
+    assert results["layer1"]["provenance_violations"] == []
 
 
-def test_retrieval_metrics_contrast_the_assertion_filter(harness):
-    metrics = harness.retrieval_metrics()
-    on = metrics["assertion_filter_on"]
-    off = metrics["assertion_filter_off"]
-    assert on["negation_false_positive_rate"] == 0.0
-    assert off["negation_false_positive_rate"] > 0.0
-    assert off["records_with_assertion_absent"] > 0
-    assert on["gold_negated_documents_returned"] == 0
+# -- Layer 2 ----------------------------------------------------------------
 
 
-def test_retrieval_metrics_report_recall_at_k_and_mrr(harness):
-    metrics = harness.retrieval_metrics()
-    for key in ("recall@5", "recall@10", "recall@20", "recall@50", "mrr"):
-        assert 0.0 <= metrics["assertion_filter_on"][key] <= 1.0
-    assert metrics["per_study"]
-    assert 0.0 <= metrics["mean_mrr_per_study"] <= 1.0
+def test_layer2_reports_over_merge_and_over_split_separately(results):
+    layer2 = results["layer2"]
+    assert "over_merge" in layer2 and "over_split" in layer2
+    assert layer2["gold_episodes"] > 0
+    assert 0.0 <= layer2["boundary_agreement"] <= 1.0
 
 
-def test_stability_is_measured_not_asserted(harness):
-    stability = harness.stability_check(repeats=2)
-    assert stability["extraction_stable"]
-    assert stability["run_id_stable"]
-    assert stability["results_stable"]
-    assert len(set(stability["result_hashes"])) == 1
+def test_layer2_breaks_recurrence_out_from_everything_else(results):
+    """The default merge rule is wrong exactly where recurrence is expected."""
+    layer2 = results["layer2"]
+    assert "recurrence_expected" in layer2
+    assert "recurrence_not_expected" in layer2
+    assert layer2["recurrence_expected"]["episodes"] > 0
 
 
-def test_the_sensitivity_sweep_moves_the_case_count(harness):
-    """Definitional drift as a measurement rather than an argument."""
-    sweeps = harness.sensitivity_sweep()["sweeps"]
-    assert len(sweeps) >= 2
-    for sweep in sweeps:
-        low, high = sweep["case_count_range"]
-        assert low <= high
-        assert sweep["rows"]
-    assert any(s["case_count_range"][0] != s["case_count_range"][1] for s in sweeps)
+def test_layer2_reports_which_linkage_rules_did_the_work(results):
+    rules = results["layer2"]["linkage_rules"]
+    assert rules
+    assert set(rules) <= {
+        "single_record", "explicit_continuation", "declared_convention",
+        "temporal_overlap", "gap_within_tolerance", "recurrence_split",
+    }, rules
 
 
-def test_the_glucose_sweep_is_monotone(harness):
-    """A stricter threshold cannot produce more cases."""
-    sweep = next(s for s in harness.sensitivity_sweep()["sweeps"]
-                 if "glucose" in s["parameter"])
-    rows = sorted(sweep["rows"], key=lambda r: -r["value"])
-    counts = [r["case"] for r in rows]
-    assert counts == sorted(counts, reverse=True)
+# -- Layer 3 ----------------------------------------------------------------
 
 
-def test_the_window_sweep_is_monotone(harness):
-    sweep = next(s for s in harness.sensitivity_sweep()["sweeps"]
-                 if "window" in s["parameter"])
-    rows = sorted(sweep["rows"], key=lambda r: -r["value"])
-    counts = [r["case"] for r in rows]
-    assert counts == sorted(counts, reverse=True)
+def test_layer3_reports_ppv_and_sensitivity_against_gold(results):
+    pooled = results["layer3"]["pooled"]
+    assert 0.0 <= pooled["ppv"] <= 1.0
+    assert 0.0 <= pooled["sensitivity"] <= 1.0
+    assert pooled["gold_cases"] > 0
 
 
-def test_the_markdown_report_carries_real_numbers(harness):
-    from aelayer.eval.report import render_markdown
-
-    results = {
-        "generated_at": "now",
-        "snapshot_id": "snap",
-        "extractor_version": "ex",
-        "definition": {"id": "d", "version": 1, "status": "frozen",
-                       "hash": "h", "label": "L"},
-        "corpus": harness.pipeline.store.summary(),
-        "extraction": harness.extraction_metrics(),
-        "phenotype": harness.phenotype_metrics(),
-        "retrieval": harness.retrieval_metrics(),
-        "stability": harness.stability_check(repeats=2),
-        "sensitivity": harness.sensitivity_sweep(),
-    }
-    markdown = render_markdown(results)
-    for heading in ("## 1. Extraction", "## 2. Phenotype", "## 3. Retrieval",
-                    "## 4. Stability", "## 5. Definition sensitivity"):
-        assert heading in markdown
-    assert "synthetic corpus" in markdown
-    assert "negation false positive rate" in markdown
+def test_a_miss_the_system_declined_to_call_is_counted_apart(results):
+    """Routing to review is a different failure from silently missing a case."""
+    pooled = results["layer3"]["pooled"]
+    assert "false_negatives_from_linkage_review" in pooled
+    assert pooled["false_negatives_from_linkage_review"] <= pooled["fn"]
+    assert pooled["sensitivity_excluding_declined"] >= pooled["sensitivity"]
 
 
-def test_the_primary_event_is_chosen_without_consulting_gold(harness):
-    """Otherwise the assertion metric would be measuring itself."""
-    by_doc = harness.events_by_doc()
-    doc_id = next(iter(by_doc))
-    first = EvaluationHarness.primary_event(by_doc[doc_id], "HYPOGLYCEMIA")
-    second = EvaluationHarness.primary_event(list(reversed(by_doc[doc_id])),
-                                             "HYPOGLYCEMIA")
-    assert (first is None and second is None) or first.event_id == second.event_id
+def test_layer3_reports_the_review_set_rather_than_folding_it_in(results):
+    layer3 = results["layer3"]
+    assert layer3["review_set_size"] == layer3["counts_by_verdict"].get("review", 0)
 
 
-# -- metric primitives -----------------------------------------------------
+def test_transportability_is_reported_with_what_the_gap_means(results):
+    transport = results["layer3"]["transportability"]
+    assert transport["held_out_studies"]
+    assert "not overfitting" in transport["note"]
 
 
-def test_prf_arithmetic():
-    prf = PRF(tp=8, fp=2, fn=2)
-    assert prf.precision == 0.8 and prf.recall == 0.8 and prf.f1 == pytest.approx(0.8)
-    assert PRF().precision == 0.0 and PRF().f1 == 0.0
+# -- invariance -------------------------------------------------------------
 
 
-def test_a_wrong_slot_costs_both_precision_and_recall():
-    assert scalar_prf("mild", "severe") == (0, 1, 1)
-    assert scalar_prf("mild", "mild") == (1, 0, 0)
-    assert scalar_prf(None, "mild") == (0, 1, 0)
-    assert scalar_prf("mild", None) == (0, 0, 1)
-    assert scalar_prf(None, None) == (0, 0, 0)
+def test_invariance_compares_one_truth_across_its_renderings(results):
+    invariance = results["invariance"]
+    assert invariance["truths_compared"] > 0
+    assert len(invariance["representations"]) > 1
+    assert 0.0 <= invariance["verdict_agreement"] <= 1.0
 
 
-def test_confusion_matrix_per_label():
-    matrix = ConfusionMatrix(labels=["a", "b"])
-    matrix.add("a", "a")
-    matrix.add("a", "b")
-    matrix.add("b", "b")
-    per_label = matrix.per_label()
-    assert per_label["a"].tp == 1 and per_label["a"].fn == 1
-    assert per_label["b"].tp == 1 and per_label["b"].fp == 1
-    assert matrix.accuracy == pytest.approx(2 / 3)
+def test_invariance_says_in_so_many_words_what_it_does_not_establish(results):
+    caveat = results["invariance"]["caveat"]
+    assert (
+        "Consistency across representations does not establish clinical validity"
+        in caveat
+    )
+    assert caveat == INVARIANCE_CAVEAT
 
 
-def test_ranking_metrics():
-    ranked = ["a", "b", "c", "d"]
-    assert reciprocal_rank(ranked, {"c"}) == pytest.approx(1 / 3)
-    assert reciprocal_rank(ranked, {"z"}) == 0.0
-    assert recall_at_k(ranked, {"a", "d"}, 2) == 0.5
-    assert recall_at_k(ranked, set(), 2) == 0.0
+def test_a_discordant_truth_names_the_renderings_that_disagreed(results):
+    for entry in results["invariance"]["discordant"]:
+        assert entry["truth_id"]
+        assert len(set(entry["verdicts"].values())) > 1
+        assert entry["majority"] in entry["verdicts"].values()
+        assert entry["example_reason"]
 
 
-def test_scoring_against_a_different_version_is_flagged_not_silent(
-    pipeline, definition_v2
-):
-    """A gold key written for v1 does not score v2. Say so rather than
-    reporting a sensitivity drop as if it were an extraction failure."""
-    harness = EvaluationHarness.build(pipeline, definition_v2)
-    metrics = harness.phenotype_metrics()
-    assert metrics["evaluated_definition"] == "te_symptomatic_hypoglycemia.v2"
-    assert metrics["gold_definition"] == "te_symptomatic_hypoglycemia.v1"
-    assert not metrics["matches_gold_definition"]
-    assert "not of extraction quality" in metrics["comparability_note"]
+# -- reproducibility --------------------------------------------------------
 
 
-def test_scoring_against_the_matching_version_carries_no_caveat(harness):
-    metrics = harness.phenotype_metrics()
-    assert metrics["matches_gold_definition"]
-    assert metrics["comparability_note"] == ""
+def test_the_same_inputs_produce_the_same_run_twice(results):
+    repro = results["reproducibility"]
+    assert repro["manifest_id_stable"]
+    assert repro["results_stable"]
+    assert repro["normalization_stable"]
 
 
-def test_run_evaluation_defaults_to_the_gold_keys_version(pipeline, tmp_path):
-    from aelayer.eval.harness import run_evaluation
-
-    results, _path = run_evaluation(pipeline, "te_symptomatic_hypoglycemia", None)
-    assert results["definition"]["version"] == 1
-    assert results["phenotype"]["matches_gold_definition"]
+# -- retrieval --------------------------------------------------------------
 
 
-def test_recall_at_k_is_reported_with_its_ceiling(harness):
-    """A ranking that is exactly right must not read as one that is mostly wrong."""
-    metrics = harness.retrieval_metrics()
-    for query in metrics["per_study"]:
-        assert query["recall@50"] <= query["ceiling@50"] + 1e-9
-        assert 0.0 <= query["precision@10"] <= 1.0
+def test_the_assertion_filter_is_measured_on_and_off(results):
+    retrieval = results["retrieval"]
+    assert retrieval["available"]
+    on = retrieval["assertion_filter_on"]["negation_false_positive_rate"]
+    off = retrieval["assertion_filter_off"]["negation_false_positive_rate"]
+    assert on <= off, "the assertion filter is not earning its place"
 
 
-def test_precision_at_k_is_not_capped_by_the_relevant_count():
-    from aelayer.eval.metrics import precision_at_k, recall_ceiling_at_k
+# -- the report -------------------------------------------------------------
 
-    ranked = ["a", "b", "c"]
-    assert precision_at_k(ranked, {"a", "b", "c"}, 2) == 1.0
-    assert precision_at_k(ranked, {"z"}, 2) == 0.0
-    assert precision_at_k([], {"a"}, 2) == 0.0
-    assert recall_ceiling_at_k({"a", "b", "c", "d"}, 2) == 0.5
-    assert recall_ceiling_at_k(set(), 2) == 0.0
+
+def test_the_report_says_the_numbers_are_synthetic_before_any_number(results):
+    body = render_markdown(results)
+    assert DISCLAIMER in body
+    assert body.index(DISCLAIMER) < body.index("## Layer 1")
+
+
+def test_the_report_carries_the_invariance_caveat_verbatim(results):
+    assert INVARIANCE_CAVEAT in render_markdown(results)
+
+
+def test_the_report_names_every_version_that_produced_the_numbers(results):
+    body = render_markdown(results)
+    for value in (
+        results["versions"]["normalizer_version"],
+        results["versions"]["extractor_version"],
+        results["versions"]["snapshot_id"],
+        results["definition"]["hash"],
+    ):
+        assert value in body
+
+
+def test_run_evaluation_writes_the_report_where_it_is_told(pipeline, tmp_path):
+    target = tmp_path / "nested" / "eval.md"
+    written_results, written = run_evaluation(
+        pipeline, "te_symptomatic_hypoglycemia", 1, target
+    )
+    assert written == target
+    assert target.read_text(encoding="utf-8").startswith("# Adverse event")
+    assert written_results["definition"]["version"] == 1
+
+
+def test_run_evaluation_can_be_asked_for_no_report(pipeline):
+    _results, written = run_evaluation(pipeline, "te_symptomatic_hypoglycemia", 1, None)
+    assert written is None

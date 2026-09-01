@@ -1,124 +1,219 @@
-"""Provenance, run manifests and replay."""
+"""Governed execution: a manifest points at a result, and a run replays."""
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from aelayer.runs import ReplayError, RunStore, compute_run_id, execute, replay
+from aelayer.models import Manifest
+from aelayer.runs import (
+    ManifestStore,
+    ReplayError,
+    ResultStore,
+    compute_manifest_id,
+    execute,
+    replay,
+)
 
 
-def test_a_run_stamps_all_three_hashes(pipeline, definition_v1):
-    manifest = execute(pipeline, definition_v1)
-    assert manifest.extractor_version == pipeline.extractor_version
-    assert manifest.definition_hash == definition_v1.definition_hash
-    assert manifest.snapshot_id == pipeline.snapshot_id
-    assert manifest.definition_version == 1
-    assert manifest.definition_status == "frozen"
+@pytest.fixture
+def stores(tmp_path):
+    return ManifestStore(tmp_path / "runs"), ResultStore(tmp_path / "runs" / "results")
 
 
-def test_every_assignment_carries_the_definition_that_produced_it(pipeline, definition_v1):
-    manifest = execute(pipeline, definition_v1)
-    for assignment in manifest.assignments:
-        assert assignment.definition_hash == definition_v1.definition_hash
-        assert assignment.definition_version == 1
+@pytest.fixture
+def run(pipeline, definition_v1, stores):
+    manifests, results = stores
+    manifest, assignments = execute(
+        pipeline, definition_v1, manifest_store=manifests, result_store=results,
+    )
+    return manifest, assignments
 
 
-def test_the_run_id_is_content_derived(pipeline, definition_v1):
-    first = execute(pipeline, definition_v1)
-    second = execute(pipeline, definition_v1)
-    assert first.run_id == second.run_id
-    assert first.results_hash == second.results_hash
-    assert first.created_at is not None  # only the timestamp may differ
+# -- what a manifest is -----------------------------------------------------
 
 
-def test_a_different_definition_version_is_a_different_run(pipeline, definition_v1,
-                                                           definition_v2):
-    assert execute(pipeline, definition_v1).run_id != execute(
-        pipeline, definition_v2
-    ).run_id
+def test_a_manifest_points_at_the_result_and_does_not_copy_it(run, stores):
+    """A second copy of the result is a second thing that can drift."""
+    manifest, _assignments = run
+    _manifests, results = stores
+    body = manifest.model_dump(mode="json")
+    assert manifest.output_pointer
+    assert manifest.output_pointer.endswith(f"{manifest.manifest_id}.results.json")
+    assert results.path_for(manifest.manifest_id).exists()
+    for value in body.values():
+        assert not isinstance(value, list) or not any(
+            isinstance(v, dict) and "episode_id" in v for v in value
+        )
 
 
-def test_the_run_id_moves_when_any_input_moves():
-    spec = {"definition_id": "d", "definition_version": 1, "studies": []}
-    base = compute_run_id(spec, "ex-1", "def-1", "snap-1")
-    assert compute_run_id(spec, "ex-2", "def-1", "snap-1") != base
-    assert compute_run_id(spec, "ex-1", "def-2", "snap-1") != base
-    assert compute_run_id(spec, "ex-1", "def-1", "snap-2") != base
-    assert compute_run_id(dict(spec, studies=["S"]), "ex-1", "def-1", "snap-1") != base
+def test_a_manifest_records_every_version_that_produced_the_number(run):
+    manifest, _ = run
+    assert manifest.normalizer_version
+    assert manifest.extractor_version
+    assert manifest.data_snapshot_id
+    assert manifest.definition_hash
+    assert manifest.terminology_versions
+    assert manifest.results_hash
 
 
-def test_a_run_is_reproduced_byte_for_byte(pipeline, definition_v1, tmp_path, corpus_dir):
-    store = RunStore(tmp_path / "runs")
-    manifest = execute(pipeline, definition_v1)
-    store.save(manifest)
-    report, replayed = replay(manifest.run_id, run_store=store, data_dir=corpus_dir)
-    assert report.reproduced, report.differences
-    assert replayed.results_hash == manifest.results_hash
-    assert [a.model_dump_json() for a in replayed.assignments] == [
-        a.model_dump_json() for a in manifest.assignments
-    ]
+def test_a_manifest_carries_its_standing_limitations(run):
+    manifest, _ = run
+    body = " ".join(manifest.limitations)
+    assert "synthetic" in body
+    assert "illustrative placeholders" in body
 
 
-def test_a_superseded_definition_is_still_replayable(pipeline, definition_v1,
-                                                     definition_v2, tmp_path, corpus_dir):
-    """A later version must never rewrite the cohort a prior analysis rests on."""
-    store = RunStore(tmp_path / "runs")
-    old = execute(pipeline, definition_v1)
-    store.save(old)
-    store.save(execute(pipeline, definition_v2))     # the newer version also runs
-    report, replayed = replay(old.run_id, run_store=store, data_dir=corpus_dir)
-    assert report.reproduced
-    assert replayed.definition_version == 1
-
-
-def test_replay_says_which_input_moved(pipeline, definition_v1, tmp_path, corpus_dir):
-    store = RunStore(tmp_path / "runs")
-    manifest = execute(pipeline, definition_v1)
-    tampered = manifest.model_copy(update={"snapshot_id": "not-the-real-snapshot"})
-    store.save(tampered)
-    report, _replayed = replay(tampered.run_id, run_store=store, data_dir=corpus_dir)
-    assert not report.reproduced
-    assert any("data snapshot differs" in d for d in report.differences)
-
-
-def test_replay_of_an_unknown_run_is_an_explicit_error(tmp_path):
-    with pytest.raises(ReplayError, match="no run"):
-        RunStore(tmp_path / "runs").load("deadbeef")
-
-
-def test_a_manifest_round_trips_through_disk(pipeline, definition_v1, tmp_path):
-    store = RunStore(tmp_path / "runs")
-    manifest = execute(pipeline, definition_v1)
-    path = store.save(manifest)
-    assert path.exists()
-    # Compared as data, not as a JSON string: the saved file sorts its keys,
-    # so byte equality of the serialisation is not the claim being made.
-    assert store.load(manifest.run_id).model_dump(mode="json") == manifest.model_dump(
-        mode="json"
+def test_counts_in_the_manifest_match_the_assignments(run):
+    manifest, assignments = run
+    assert sum(manifest.counts_by_verdict.values()) == len(assignments)
+    assert manifest.counts_by_verdict["case"] == sum(
+        1 for a in assignments if a.verdict == "case"
     )
 
 
-def test_runs_are_deterministic_by_default(pipeline, definition_v1):
-    manifest = execute(pipeline, definition_v1)
-    assert manifest.deterministic
-    assert manifest.nondeterministic_paths == []
+# -- the id is content-derived ---------------------------------------------
 
 
-def test_an_llm_compiled_spec_is_marked_nondeterministic(pipeline, definition_v1):
-    manifest = execute(pipeline, definition_v1, spec_extra={"backend": "llm"})
-    assert not manifest.deterministic
-    assert manifest.nondeterministic_paths
+def test_the_manifest_id_is_derived_from_content_not_from_the_clock(run, pipeline,
+                                                                   definition_v1,
+                                                                   stores):
+    first, _ = run
+    manifests, results = stores
+    second, _ = execute(
+        pipeline, definition_v1, manifest_store=manifests, result_store=results,
+    )
+    assert first.manifest_id == second.manifest_id
+    assert first.results_hash == second.results_hash
 
 
-def test_limitations_are_stated_on_every_run(pipeline, definition_v1):
-    manifest = execute(pipeline, definition_v1)
-    joined = " ".join(manifest.limitations).lower()
-    assert "synthetic" in joined
-    assert "not a trained clinical nlp model" in joined
-    assert "meddra" in joined
+def test_a_different_definition_yields_a_different_manifest_id(
+    pipeline, definition_v1, definition_v2, stores
+):
+    manifests, results = stores
+    a, _ = execute(pipeline, definition_v1, manifest_store=manifests,
+                   result_store=results)
+    b, _ = execute(pipeline, definition_v2, manifest_store=manifests,
+                   result_store=results)
+    assert a.manifest_id != b.manifest_id
 
 
-def test_counts_are_recorded_by_state_and_by_verdict(pipeline, definition_v1):
-    manifest = execute(pipeline, definition_v1)
-    assert sum(manifest.counts_by_verdict.values()) == len(manifest.assignments)
-    assert sum(manifest.counts_by_state.values()) == len(manifest.assignments)
+def test_a_narrower_study_scope_yields_a_different_manifest_id(
+    pipeline, definition_v1, stores
+):
+    manifests, results = stores
+    everything, _ = execute(pipeline, definition_v1, manifest_store=manifests,
+                            result_store=results)
+    one, _ = execute(pipeline, definition_v1, studies=["STUDY-01"],
+                     manifest_store=manifests, result_store=results)
+    assert everything.manifest_id != one.manifest_id
+
+
+def test_the_manifest_id_ignores_fields_that_do_not_affect_the_answer():
+    versions = {"normalizer_version": "n1", "extractor_version": "e1",
+                "extraction_backend": "rules", "model_version": None}
+    base = compute_manifest_id({"a": 1}, "dh", "snap", versions)
+    assert base == compute_manifest_id(
+        {"a": 1}, "dh", "snap", {**versions, "terminology_versions": {"x": "1"}}
+    )
+    assert base != compute_manifest_id({"a": 2}, "dh", "snap", versions)
+    assert base != compute_manifest_id({"a": 1}, "dh", "other", versions)
+
+
+# -- saving and not saving --------------------------------------------------
+
+
+def test_a_run_that_is_not_saved_writes_nothing(pipeline, definition_v1, stores):
+    manifests, results = stores
+    manifest, _ = execute(pipeline, definition_v1, manifest_store=manifests,
+                          result_store=results, save=False)
+    assert manifest.output_pointer == ""
+    assert not manifests.path_for(manifest.manifest_id).exists()
+    assert not results.path_for(manifest.manifest_id).exists()
+
+
+# -- replay -----------------------------------------------------------------
+
+
+def test_a_recorded_run_replays_exactly(run, stores, corpus_dir):
+    manifest, _ = run
+    manifests, _results = stores
+    report, _replayed = replay(
+        manifest.manifest_id, manifest_store=manifests, data_dir=corpus_dir
+    )
+    assert report.reproduced, report.differences
+    assert report.original_hash == report.replayed_hash
+    assert "reproduced exactly" in report.summary()
+
+
+def test_a_run_recorded_against_a_superseded_definition_still_replays(
+    pipeline, definition_v1, definition_v2, stores, corpus_dir
+):
+    """v1 is superseded by v2 and remains a file on disk, so it still runs."""
+    assert definition_v2.supersedes
+    manifests, results = stores
+    manifest, _ = execute(pipeline, definition_v1, manifest_store=manifests,
+                          result_store=results)
+    report, _ = replay(manifest.manifest_id, manifest_store=manifests,
+                       data_dir=corpus_dir)
+    assert report.reproduced, report.differences
+
+
+def test_replaying_an_unknown_run_says_what_it_knows(stores):
+    manifests, _ = stores
+    with pytest.raises(ReplayError, match="Nothing has been executed yet"):
+        replay("deadbeef", manifest_store=manifests)
+
+
+def test_a_changed_definition_is_reported_as_a_named_difference(
+    run, stores, corpus_dir, tmp_path, definition_v1
+):
+    """Replay says which input moved, not merely that the run failed."""
+    import yaml
+
+    manifest, _ = run
+    manifests, _results = stores
+    altered = tmp_path / "phenotypes"
+    altered.mkdir()
+    body = definition_v1.model_dump(
+        mode="json", exclude={"definition_hash", "source_path"}
+    )
+    body["window"]["max"] = 30
+    (altered / "te_symptomatic_hypoglycemia.v1.yaml").write_text(
+        yaml.safe_dump(body), encoding="utf-8"
+    )
+    report, _ = replay(manifest.manifest_id, manifest_store=manifests,
+                       data_dir=corpus_dir, phenotype_dir=altered)
+    assert not report.reproduced
+    assert any("has changed on disk" in d for d in report.differences)
+
+
+def test_a_missing_result_file_is_a_real_gap_and_says_so(run, stores):
+    manifest, _ = run
+    _manifests, results = stores
+    results.path_for(manifest.manifest_id).unlink()
+    with pytest.raises(ReplayError, match="pointer, not a copy"):
+        results.read(manifest.manifest_id)
+
+
+# -- the store tolerates a messy directory ---------------------------------
+
+
+def test_listing_skips_files_that_are_not_manifests(run, stores, tmp_path):
+    manifests, _ = stores
+    (manifests.directory / "notes.json").write_text("{}", encoding="utf-8")
+    (manifests.directory / "broken.json").write_text("{not json", encoding="utf-8")
+    listed = manifests.list()
+    assert [m.manifest_id for m in listed] == [run[0].manifest_id]
+
+
+def test_listing_an_empty_registry_is_not_an_error(tmp_path):
+    assert ManifestStore(tmp_path / "nothing").list() == []
+
+
+def test_a_saved_manifest_round_trips_through_json(run, stores):
+    manifest, _ = run
+    manifests, _ = stores
+    raw = json.loads(manifests.path_for(manifest.manifest_id).read_text())
+    assert Manifest.model_validate(raw) == manifest

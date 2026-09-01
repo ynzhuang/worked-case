@@ -22,6 +22,7 @@ import datetime as _dt
 from dataclasses import dataclass, field as _dc_field
 from typing import Any, Iterable, Sequence
 
+from .anchors import AnchorResolver
 from .catalog import ConceptCatalog
 from .models import (
     SERIOUSNESS_CRITERIA,
@@ -70,10 +71,17 @@ class EpisodeReconciler:
         catalog: ConceptCatalog,
         semantics: CollectionSemantics,
         config: ReconciliationConfig | None = None,
+        anchor_resolver: AnchorResolver | None = None,
+        default_anchor: str | None = None,
     ):
         self.catalog = catalog
         self.semantics = semantics
         self.config = config or ReconciliationConfig.from_catalog(catalog)
+        # Used only to stamp an offset on the episode so it can be filtered on
+        # without re-running a phenotype definition. A definition still resolves
+        # its own anchor: this is a retrieval convenience, not a case criterion.
+        self.resolver = anchor_resolver
+        self.default_anchor = default_anchor
 
     # -- the decision -------------------------------------------------------
 
@@ -175,12 +183,31 @@ class EpisodeReconciler:
         self, records: Iterable[CanonicalAERecord]
     ) -> list[CanonicalAEEpisode]:
         """Derive episodes over records, leaving the records untouched."""
+        records = list(records)
+        # An explicit continuation declared by the CRF is the strongest evidence
+        # available and outranks everything else, including whether the concept
+        # could be standardized at all. Resolving those chains before grouping
+        # is what stops two records the study itself linked from landing in
+        # different episodes because neither coded to a catalogue term.
+        component = _continuation_components(records)
+
+        # A continuation record often carries no narrative of its own, so it
+        # standardizes to nothing. It inherits the concept of the chain the CRF
+        # put it in rather than being stranded as unmapped.
+        component_concept: dict[str, str | None] = {}
+        for record in records:
+            root = component[record.source_record_id]
+            if component_concept.get(root) is None:
+                component_concept[root] = record.standardized_concept
+
         grouped: dict[tuple[str, str, str], list[CanonicalAERecord]] = {}
         for record in records:
+            root = component[record.source_record_id]
+            concept = record.standardized_concept or component_concept.get(root)
             key = (
                 record.study_id,
                 record.subject_id,
-                record.standardized_concept or f"__unmapped__:{record.record_id}",
+                concept or f"__unmapped__:{root}",
             )
             grouped.setdefault(key, []).append(record)
 
@@ -285,12 +312,19 @@ class EpisodeReconciler:
         for lab in (l for r in chain for l in r.labs):
             spans.append(lab.span)
 
+        offset, anchor_event, anchor_date = self._anchor(
+            subject_id, first.onset_datetime.value
+        )
+
         episode = CanonicalAEEpisode(
             episode_id=episode_id,
             study_id=study_id,
             subject_id=subject_id,
             standardized_concept=concept,
             episode_start=_carry(first.onset_datetime, "derived"),
+            onset_offset_days=offset,
+            anchor_event=anchor_event,
+            anchor_datetime=anchor_date,
             episode_end=_episode_end(chain),
             source_record_ids=[r.source_record_id for r in chain],
             severity_trajectory=severity_trajectory,
@@ -331,10 +365,75 @@ class EpisodeReconciler:
         )
         return episode
 
+    def _anchor(
+        self, subject_id: str, start: _dt.datetime | None
+    ) -> tuple[Field[int], str | None, _dt.datetime | None]:
+        """The episode's offset from the study's default anchor, if resolvable.
+
+        Unresolvable is a state, not a zero: with no exposure record to measure
+        from, the offset stays ``unknown`` and says why, rather than defaulting
+        to a number a filter would silently trust.
+        """
+        if self.resolver is None or self.default_anchor is None:
+            return Field[int](
+                collection_state="unknown", source="derived",
+                note="no anchor configuration available to resolve an offset",
+            ), None, None
+        if start is None:
+            return Field[int](
+                collection_state="unknown", source="derived",
+                note="the episode has no resolvable start, so no offset exists",
+            ), None, None
+        hit = self.resolver.resolve(
+            subject_id, self.default_anchor, onset_date=start.date()
+        )
+        if hit is None:
+            return Field[int](
+                collection_state="unknown", source="derived",
+                note=(
+                    f"no {self.default_anchor} occurrence in this subject's "
+                    f"exposure record"
+                ),
+            ), None, None
+        anchor_date = _dt.datetime.combine(hit.date, _dt.time.min)
+        return (
+            Field[int](
+                value=(start.date() - hit.date).days,
+                collection_state="collected",
+                source="derived",
+                note=f"{self.default_anchor} on {hit.date.isoformat()} ({hit.detail})",
+            ),
+            self.default_anchor,
+            anchor_date,
+        )
+
 
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+
+def _continuation_components(
+    records: Sequence[CanonicalAERecord],
+) -> dict[str, str]:
+    """Group records the CRF explicitly links, by union-find over the chain."""
+    parent: dict[str, str] = {r.source_record_id: r.source_record_id for r in records}
+
+    def find(node: str) -> str:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(a: str, b: str) -> None:
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parent[max(root_a, root_b)] = min(root_a, root_b)
+
+    for record in records:
+        if record.continuation_of and record.continuation_of in parent:
+            union(record.source_record_id, record.continuation_of)
+    return {rid: find(rid) for rid in parent}
 
 
 def _ordering_key(record: CanonicalAERecord) -> tuple:

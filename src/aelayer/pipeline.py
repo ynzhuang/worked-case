@@ -106,9 +106,12 @@ class Pipeline:
     def episodes(self, *, refresh: bool = False) -> list[CanonicalAEEpisode]:
         if self._episodes is not None and not refresh:
             return self._episodes
+        extraction = self.configs.extraction
         reconciler = EpisodeReconciler(
             self.configs.catalog, self.configs.semantics,
             ReconciliationConfig.from_catalog(self.configs.catalog),
+            anchor_resolver=self.store.anchor_resolver(extraction.anchors),
+            default_anchor=extraction.default_anchor,
         )
         self._episodes = reconciler.reconcile(self.records(refresh=refresh))
         return self._episodes
