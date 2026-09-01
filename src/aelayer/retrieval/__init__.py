@@ -1,6 +1,9 @@
-"""Retrieval over narratives and event objects."""
+"""Retrieval: a precise cohort path and a discovery path, kept apart."""
 
-from .index import EventIndex, IndexMeta
-from .query import RetrievalResult, RetrievedRecord, retrieve
+from .index import EpisodeIndex, IndexMeta, build_index
+from .query import CandidateInCohort, RetrievalResult, RetrievedEpisode, retrieve
 
-__all__ = ["EventIndex", "IndexMeta", "RetrievalResult", "RetrievedRecord", "retrieve"]
+__all__ = [
+    "CandidateInCohort", "EpisodeIndex", "IndexMeta", "RetrievalResult",
+    "RetrievedEpisode", "build_index", "retrieve",
+]

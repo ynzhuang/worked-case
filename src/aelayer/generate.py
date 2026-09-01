@@ -385,6 +385,20 @@ class CorpusGenerator:
         elif kind == "no_symptoms":
             glucose = float(self.rng.choice([48, 58, 66]))
             symptoms = []
+        elif kind == "chronic":
+            # A condition that evolves rather than recurs. Successive records
+            # are the same episode changing grade, and the catalogue says so
+            # via recurrence_expected: false.
+            return EpisodeTruth(
+                truth_id=truth_id, concept="ANAEMIA",
+                onset_offset_days=onset, duration_days=self.rng.randint(6, 20),
+                severity_steps=[(0, "mild"), (self.rng.randint(1, 3), "moderate")],
+                seriousness=False, seriousness_criteria=[],
+                relatedness=self._pick(["possible", "probable"]),
+                action_taken=action, outcome=outcome, glucose_mgdl=None,
+                symptoms=[], rescue_given=False, third_party_assistance=False,
+                coded_specifically=True, note="chronic evolving condition",
+            )
         else:  # distractor concept
             return EpisodeTruth(
                 truth_id=truth_id,
@@ -438,7 +452,14 @@ class CorpusGenerator:
 
         # V-B splits a worsening event across records; every other variant is
         # one record per episode.
-        if variant == "V-B" and len(truth.severity_steps) > 1:
+        recurs = True
+        try:
+            recurs = self.catalog.concept(truth.concept).recurrence_expected
+        except Exception:
+            pass
+        if len(truth.severity_steps) > 1 and (variant == "V-B" or not recurs):
+            # V-B splits a worsening event by convention; a chronic condition
+            # is recorded as successive grade changes everywhere.
             steps = truth.severity_steps
         else:
             steps = [(0, truth.peak_severity)]
@@ -646,6 +667,26 @@ class CorpusGenerator:
                 states[name] = "collected"
                 values[name] = criterion in truth.seriousness_criteria
 
+        # What the narrative states, and therefore what the model path can
+        # legitimately recover. Compared against `values`, which is only what
+        # the structured cell holds, this is the difference between "the CRF
+        # did not record it" and "the record does not say".
+        narrated: dict[str, Any] = {}
+        detail = study.narrative_detail
+        if detail == "rich":
+            narrated["severity"] = severity
+            narrated["relatedness"] = truth.relatedness
+            narrated["outcome"] = outcome
+            if truth.action_taken:
+                narrated["action_taken"] = self._narrated_action(truth.action_taken)
+        elif detail == "standard":
+            narrated["outcome"] = outcome
+
+        recoverable = {
+            name: (values.get(name) if values.get(name) is not None
+                   else narrated.get(name))
+            for name in set(values) | set(narrated)
+        }
         return {
             "source_record_id": row["AESPID"],
             "study_id": study.study_id,
@@ -653,8 +694,19 @@ class CorpusGenerator:
             "truth_id": truth.truth_id,
             "representation": study.representation,
             "values": values,
+            "narrated_values": narrated,
+            "recoverable_values": recoverable,
             "collection_states": states,
         }
+
+    @staticmethod
+    def _narrated_action(action: str) -> str:
+        """The action a narrative sentence conveys.
+
+        The prose for a dose reduction reads as a dose reduction wherever it
+        appears, including in a study whose codelist cannot express one.
+        """
+        return action
 
     def _narrative(
         self, truth: EpisodeTruth, study: StudySemantics, subject_id: str,
@@ -706,8 +758,6 @@ class CorpusGenerator:
             builder.sentence(RELATEDNESS_PHRASES[truth.relatedness])
             builder.sentence(OUTCOME_PHRASES[truth.outcome])
         elif detail == "standard":
-            if truth.action_taken and self.rng.random() < 0.5:
-                builder.sentence(ACTION_PHRASES[truth.action_taken])
             builder.sentence(OUTCOME_PHRASES[truth.outcome])
         for criterion in truth.seriousness_criteria:
             builder.sentence(CRITERION_PHRASES[criterion])
@@ -850,7 +900,7 @@ class CorpusGenerator:
                 counter += 1
                 kind = self._pick(
                     ["case", "case", "review", "out_of_window", "no_symptoms",
-                     "distractor", "distractor"]
+                     "distractor", "distractor", "chronic"]
                 )
                 truth = self.sample_truth(f"B{counter:04d}", kind=kind)
                 truth.coded_by_study = study.collects("coded_term")

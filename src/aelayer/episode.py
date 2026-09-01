@@ -250,7 +250,13 @@ class EpisodeReconciler:
     ) -> CanonicalAEEpisode:
         """Assemble one episode from its chain, carrying every reason forward."""
         first, last = chain[0], chain[-1]
-        episode_id = f"{subject_id}::{concept or 'UNMAPPED'}::{index + 1:02d}"
+        # An episode whose concept could not be standardized is grouped by its
+        # own record, so its id carries that record rather than colliding with
+        # every other unmapped episode for the same subject.
+        episode_id = (
+            f"{subject_id}::{concept}::{index + 1:02d}" if concept
+            else f"{subject_id}::UNMAPPED::{first.source_record_id}"
+        )
 
         severity_trajectory = [
             (r.onset_datetime.value, r.severity.value)

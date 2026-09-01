@@ -174,6 +174,16 @@ class Field(BaseModel, Generic[T]):
     spans: list[Span] = _PydanticField(default_factory=list)
     confidence: float | None = None
     note: str = ""
+    #: The state before the model path filled this field, where it did. A value
+    #: recovered from narrative is a value; that the CRF column it would have
+    #: come from was never collected is a separate fact, and both are worth
+    #: keeping.
+    prior_state: CollectionState | None = None
+
+    @property
+    def structured_state(self) -> CollectionState:
+        """How the deterministic path left this field."""
+        return self.prior_state or self.collection_state
 
     @property
     def populated(self) -> bool:

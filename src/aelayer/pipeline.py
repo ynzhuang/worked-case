@@ -155,8 +155,53 @@ class Pipeline:
             self.store_path if persist else None,
             self.store, self.episodes(refresh=refresh),
             self.configs.extractor_version, self.configs.normalizer_version,
+            self.mentions(),
         )
         return self._index
+
+    def mentions(self) -> list[dict[str, Any]]:
+        """Concept mentions in narrative text, each with its assertion.
+
+        Computed for the discovery path only. Episodes are built from records,
+        not from mentions; a mention is a place in a document where a concept
+        is named, which is a different thing from an event having occurred.
+        """
+        from .extract.text import sentence_for, split_sentences
+
+        engine = self.engine()
+        backend = engine.backend
+        matcher = getattr(backend, "matcher", None)
+        classifier = getattr(backend, "assertions", None)
+        if matcher is None or classifier is None:
+            return []
+        found: list[dict[str, Any]] = []
+        for narrative in sorted(self.store.narratives.values(), key=lambda n: n.doc_id):
+            text = narrative.full_text
+            sentences = split_sentences(text)
+            for mention in matcher.find_concepts(text, sentences):
+                verdict = classifier.classify(
+                    text, mention.start, mention.end, sentences
+                )
+                sentence = sentence_for(sentences, mention.start)
+                found.append(
+                    {
+                        "mention_id": (
+                            f"{narrative.doc_id}:{mention.start}:{mention.concept_id}"
+                        ),
+                        "doc_id": narrative.doc_id,
+                        "study_id": narrative.study_id,
+                        "subject_id": narrative.subject_id,
+                        "concept_id": mention.concept_id,
+                        "assertion": verdict.assertion,
+                        "match_kind": mention.kind,
+                        "start": mention.start,
+                        "end": mention.end,
+                        "surface": mention.surface,
+                        "sentence": sentence.text if sentence else "",
+                        "cue": verdict.cue,
+                    }
+                )
+        return found
 
     def retrieve(self, **kwargs: Any):
         from .retrieval.query import retrieve

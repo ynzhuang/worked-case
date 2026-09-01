@@ -1,12 +1,8 @@
-"""SQLite store: FTS5 over narrative text plus structured event columns.
+"""SQLite store: FTS5 over narrative text plus structured episode columns.
 
-The structured columns are the point.  Assertion is a column, not a hope about
-what an embedding encodes, so "hypoglycemia" and "no evidence of hypoglycemia"
-are separable by a predicate rather than by similarity.
-
-Evidence state lives in its own table keyed by definition id and version,
-because a state is assigned by a definition and a different version can assign a
-different one to the same event.
+The structured columns are the point.  Assertion, temporality and provenance are
+predicates on columns, not hopes about what an embedding encoded, so
+"hypoglycemia" and "no evidence of hypoglycemia" are separable by a WHERE clause.
 """
 
 from __future__ import annotations
@@ -19,17 +15,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from ..hashing import canonical_json
 from ..ingest import TrialStore
-from ..models import CaseAssignment, EventObject
+from ..models import CanonicalAEEpisode, CaseAssignment
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
-CREATE TABLE meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 CREATE TABLE documents (
     doc_id     TEXT PRIMARY KEY,
@@ -38,70 +30,90 @@ CREATE TABLE documents (
     header     TEXT NOT NULL DEFAULT '',
     text       TEXT NOT NULL
 );
-
--- Lexical index over narrative text. `content=` keeps a single copy of the
--- text in `documents` and lets FTS index it in place.
 CREATE VIRTUAL TABLE documents_fts USING fts5(
-    text,
-    content='documents',
-    content_rowid='rowid',
-    tokenize='unicode61'
+    text, content='documents', content_rowid='rowid', tokenize='unicode61'
 );
 
-CREATE TABLE events (
-    event_id          TEXT PRIMARY KEY,
-    subject_id        TEXT NOT NULL,
-    study_id          TEXT NOT NULL,
-    doc_id            TEXT NOT NULL,
-    concept_id        TEXT NOT NULL,
-    coded_term        TEXT,
-    coded_term_version TEXT,
-    assertion         TEXT NOT NULL,
-    onset_date        TEXT,
-    onset_offset_days INTEGER,
-    anchor_event      TEXT,
-    severity          TEXT,
-    seriousness       TEXT NOT NULL DEFAULT '',
-    relatedness       TEXT,
-    action_taken      TEXT,
-    rechallenge       TEXT,
-    rescue_treatment  INTEGER NOT NULL DEFAULT 0,
-    outcome           TEXT,
-    symptoms          TEXT NOT NULL DEFAULT '',
-    min_glucose_mgdl  REAL,
-    extractor_version TEXT NOT NULL,
-    payload           TEXT NOT NULL
+CREATE TABLE episodes (
+    episode_id            TEXT PRIMARY KEY,
+    subject_id            TEXT NOT NULL,
+    study_id              TEXT NOT NULL,
+    representation        TEXT NOT NULL DEFAULT '',
+    standardized_concept  TEXT,
+    coded_terms           TEXT NOT NULL DEFAULT '',
+    verbatim_terms        TEXT NOT NULL DEFAULT '',
+    dictionary_versions   TEXT NOT NULL DEFAULT '',
+    assertions            TEXT NOT NULL DEFAULT '',
+    episode_start         TEXT,
+    episode_end           TEXT,
+    onset_offset_days     INTEGER,
+    anchor_event          TEXT,
+    peak_severity         TEXT,
+    seriousness           INTEGER,
+    relatedness           TEXT,
+    outcome               TEXT,
+    symptoms              TEXT NOT NULL DEFAULT '',
+    min_glucose_mgdl      REAL,
+    record_count          INTEGER NOT NULL DEFAULT 1,
+    source_record_ids     TEXT NOT NULL DEFAULT '',
+    doc_ids               TEXT NOT NULL DEFAULT '',
+    linkage_rule          TEXT NOT NULL DEFAULT '',
+    linkage_confidence    REAL NOT NULL DEFAULT 1.0,
+    linkage_review        INTEGER NOT NULL DEFAULT 0,
+    provenance_paths      TEXT NOT NULL DEFAULT '',
+    candidate             INTEGER NOT NULL DEFAULT 0,
+    payload               TEXT NOT NULL
 );
+CREATE INDEX episodes_concept ON episodes(standardized_concept);
+CREATE INDEX episodes_study   ON episodes(study_id);
+CREATE INDEX episodes_subject ON episodes(subject_id);
 
-CREATE INDEX events_concept   ON events(concept_id);
-CREATE INDEX events_assertion ON events(assertion);
-CREATE INDEX events_study     ON events(study_id);
-CREATE INDEX events_subject   ON events(subject_id);
-CREATE INDEX events_doc       ON events(doc_id);
+-- Concept mentions in narrative text, each with its assertion.
+--
+-- This is where assertion actually matters. A coded AE row asserts presence by
+-- construction; a narrative can name a concept in order to rule it out, and a
+-- discovery search that cannot tell the two apart returns documented absences
+-- as though they were events.
+CREATE TABLE mentions (
+    mention_id  TEXT PRIMARY KEY,
+    doc_id      TEXT NOT NULL,
+    study_id    TEXT NOT NULL,
+    subject_id  TEXT NOT NULL,
+    concept_id  TEXT NOT NULL,
+    assertion   TEXT NOT NULL,
+    match_kind  TEXT NOT NULL DEFAULT '',
+    start       INTEGER NOT NULL,
+    end         INTEGER NOT NULL,
+    surface     TEXT NOT NULL DEFAULT '',
+    sentence    TEXT NOT NULL DEFAULT '',
+    cue         TEXT
+);
+CREATE INDEX mentions_concept   ON mentions(concept_id);
+CREATE INDEX mentions_assertion ON mentions(assertion);
+CREATE INDEX mentions_doc       ON mentions(doc_id);
 
-CREATE TABLE event_states (
-    event_id           TEXT NOT NULL,
+CREATE TABLE episode_states (
+    episode_id         TEXT NOT NULL,
     definition_id      TEXT NOT NULL,
     definition_version INTEGER NOT NULL,
     definition_hash    TEXT NOT NULL,
     evidence_state     TEXT NOT NULL,
     verdict            TEXT NOT NULL,
     matched_rule_id    TEXT,
-    PRIMARY KEY (event_id, definition_id, definition_version)
+    PRIMARY KEY (episode_id, definition_id, definition_version)
 );
 
 CREATE TABLE assignments (
+    episode_id         TEXT NOT NULL,
     subject_id         TEXT NOT NULL,
     study_id           TEXT NOT NULL,
     definition_id      TEXT NOT NULL,
     definition_version INTEGER NOT NULL,
-    definition_hash    TEXT NOT NULL,
     verdict            TEXT NOT NULL,
     evidence_state     TEXT NOT NULL,
-    matched_rule_id    TEXT,
     reason             TEXT NOT NULL,
     payload            TEXT NOT NULL,
-    PRIMARY KEY (subject_id, definition_id, definition_version)
+    PRIMARY KEY (episode_id, definition_id, definition_version)
 );
 """
 
@@ -111,34 +123,33 @@ class IndexMeta:
     schema_version: int
     snapshot_id: str
     extractor_version: str
+    normalizer_version: str
     document_count: int
-    event_count: int
+    episode_count: int
+    mention_count: int = 0
 
-    def matches(self, snapshot_id: str, extractor_version: str) -> bool:
-        """Is this index still valid for the given data and extractor?"""
+    def matches(
+        self, snapshot_id: str, extractor_version: str, normalizer_version: str
+    ) -> bool:
         return (
             self.schema_version == SCHEMA_VERSION
             and self.snapshot_id == snapshot_id
             and self.extractor_version == extractor_version
+            and self.normalizer_version == normalizer_version
         )
 
 
-class EventIndex:
-    """Read/write access to the store."""
-
+class EpisodeIndex:
     def __init__(self, connection: sqlite3.Connection, path: Path | None = None):
         self.connection = connection
         self.connection.row_factory = sqlite3.Row
         # The API serves sync endpoints from a threadpool, so connections are
-        # opened with check_same_thread=False and every statement runs under
-        # this lock. SQLite serialises internally; the lock is what keeps our
-        # own multi-statement writes atomic with respect to each other.
+        # opened cross-thread and every statement runs under this lock.
         self._lock = threading.RLock()
         self.path = path
 
     @contextlib.contextmanager
     def transaction(self):
-        """Hold the connection lock for a group of statements."""
         with self._lock:
             cursor = self.connection.cursor()
             try:
@@ -148,14 +159,11 @@ class EventIndex:
                 cursor.close()
 
     def query(self, sql: str, parameters: Sequence[Any] = ()) -> list[sqlite3.Row]:
-        """Run one read statement under the lock and materialise its rows."""
         with self._lock:
             return list(self.connection.execute(sql, parameters))
 
-    # -- lifecycle ----------------------------------------------------------
-
     @classmethod
-    def create(cls, path: str | Path | None) -> "EventIndex":
+    def create(cls, path: str | Path | None) -> "EpisodeIndex":
         target = Path(path) if path else None
         if target is not None:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -168,7 +176,7 @@ class EventIndex:
         return cls(connection, target)
 
     @classmethod
-    def open(cls, path: str | Path) -> "EventIndex":
+    def open(cls, path: str | Path) -> "EpisodeIndex":
         target = Path(path)
         if not target.exists():
             raise FileNotFoundError(
@@ -180,54 +188,96 @@ class EventIndex:
         with self._lock:
             self.connection.close()
 
-    def __enter__(self) -> "EventIndex":
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
-
     # -- population ---------------------------------------------------------
 
     def populate(
-        self, store: TrialStore, events: Iterable[EventObject], extractor_version: str
+        self,
+        store: TrialStore,
+        episodes: Iterable[CanonicalAEEpisode],
+        extractor_version: str,
+        normalizer_version: str,
+        mentions: Iterable[dict[str, Any]] = (),
     ) -> None:
+        episode_list = list(episodes)
+        mention_list = list(mentions)
         with self.transaction() as cursor:
             for narrative in sorted(store.narratives.values(), key=lambda n: n.doc_id):
                 cursor.execute(
-                    "INSERT INTO documents(doc_id, study_id, subject_id, header, text) "
-                    "VALUES (?,?,?,?,?)",
-                    (
-                        narrative.doc_id, narrative.study_id, narrative.subject_id,
-                        narrative.header, narrative.full_text,
-                    ),
+                    "INSERT INTO documents(doc_id, study_id, subject_id, header, text)"
+                    " VALUES (?,?,?,?,?)",
+                    (narrative.doc_id, narrative.study_id, narrative.subject_id,
+                     narrative.header, narrative.full_text),
                 )
             cursor.execute(
-                "INSERT INTO documents_fts(rowid, text) SELECT rowid, text FROM documents"
+                "INSERT INTO documents_fts(rowid, text) "
+                "SELECT rowid, text FROM documents"
             )
-
-            event_list = list(events)
-            for event in event_list:
+            doc_by_record = {
+                str(row.get("AESPID")): str(row.get("DOCID") or "")
+                for row in store.rows("ae")
+            }
+            for episode in episode_list:
+                glucose = [
+                    l.canonical_value for l in episode.labs
+                    if l.test == "GLUCOSE" and l.canonical_value is not None
+                ]
+                docs = sorted(
+                    {doc_by_record.get(r, "") for r in episode.source_record_ids} - {""}
+                )
                 cursor.execute(
-                    """INSERT INTO events(
-                        event_id, subject_id, study_id, doc_id, concept_id, coded_term,
-                        coded_term_version, assertion, onset_date, onset_offset_days,
-                        anchor_event, severity, seriousness, relatedness, action_taken,
-                        rechallenge, rescue_treatment, outcome, symptoms,
-                        min_glucose_mgdl, extractor_version, payload
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO episodes(
+                        episode_id, subject_id, study_id, representation,
+                        standardized_concept, coded_terms, verbatim_terms,
+                        dictionary_versions, assertions, episode_start,
+                        episode_end, onset_offset_days, anchor_event,
+                        peak_severity, seriousness, relatedness, outcome,
+                        symptoms, min_glucose_mgdl, record_count,
+                        source_record_ids, doc_ids, linkage_rule,
+                        linkage_confidence, linkage_review, provenance_paths,
+                        candidate, payload
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
-                        event.event_id, event.subject_id, event.study_id, event.doc_id,
-                        event.concept_id, event.coded_term, event.coded_term_version,
-                        event.assertion,
-                        event.onset_date.isoformat() if event.onset_date else None,
-                        event.onset_offset_days, event.anchor_event, event.severity,
-                        "|".join(event.seriousness), event.relatedness,
-                        event.action_taken, event.rechallenge,
-                        1 if event.rescue_treatment else 0, event.outcome,
-                        "|".join(sorted({s.symptom for s in event.symptoms})),
-                        _min_glucose(event),
-                        event.extractor_version,
-                        event.model_dump_json(),
+                        episode.episode_id, episode.subject_id, episode.study_id,
+                        str(episode.episode_provenance.get("representation_hint") or ""),
+                        episode.standardized_concept,
+                        "|".join(episode.coded_terms),
+                        "|".join(episode.verbatim_terms),
+                        "|".join(episode.dictionary_versions),
+                        "|".join(episode.assertions),
+                        episode.episode_start.value.isoformat()
+                        if episode.episode_start.value else None,
+                        episode.episode_end.value.isoformat()
+                        if episode.episode_end.value else None,
+                        episode.onset_offset_days.value,
+                        episode.anchor_event,
+                        episode.peak_severity,
+                        1 if episode.seriousness.value else 0,
+                        episode.relatedness.value, episode.outcome.value,
+                        "|".join(sorted({s.symptom for s in episode.symptoms})),
+                        min(glucose) if glucose else None,
+                        len(episode.source_record_ids),
+                        "|".join(episode.source_record_ids),
+                        "|".join(docs),
+                        episode.linkage_rule, episode.linkage_confidence,
+                        1 if episode.linkage_review_required else 0,
+                        "|".join(sorted({s.kind for s in episode.linked_evidence})),
+                        1 if episode.candidate else 0,
+                        episode.model_dump_json(),
+                    ),
+                )
+            for mention in mention_list:
+                cursor.execute(
+                    """INSERT OR REPLACE INTO mentions(
+                        mention_id, doc_id, study_id, subject_id, concept_id,
+                        assertion, match_kind, start, end, surface, sentence, cue
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        mention["mention_id"], mention["doc_id"],
+                        mention["study_id"], mention["subject_id"],
+                        mention["concept_id"], mention["assertion"],
+                        mention.get("match_kind", ""), mention["start"],
+                        mention["end"], mention.get("surface", ""),
+                        mention.get("sentence", ""), mention.get("cue"),
                     ),
                 )
             cursor.executemany(
@@ -236,77 +286,70 @@ class EventIndex:
                     ("schema_version", str(SCHEMA_VERSION)),
                     ("snapshot_id", store.snapshot_id),
                     ("extractor_version", extractor_version),
+                    ("normalizer_version", normalizer_version),
                     ("document_count", str(len(store.narratives))),
-                    ("event_count", str(len(event_list))),
+                    ("episode_count", str(len(episode_list))),
+                    ("mention_count", str(len(mention_list))),
                 ],
             )
 
-    def record_assignments(
-        self,
-        assignments: Iterable[CaseAssignment],
-        event_states: Iterable[tuple[str, str, str]] | None = None,
-    ) -> None:
-        """Store one definition's verdicts, replacing any previous run of it."""
+    def record_assignments(self, assignments: Iterable[CaseAssignment]) -> None:
+        rows = list(assignments)
+        if not rows:
+            return
+        first = rows[0]
         with self.transaction() as cursor:
-            rows = list(assignments)
-            if rows:
-                first = rows[0]
+            for table in ("assignments", "episode_states"):
                 cursor.execute(
-                    "DELETE FROM assignments WHERE definition_id=? AND definition_version=?",
-                    (first.definition_id, first.definition_version),
-                )
-                cursor.execute(
-                    "DELETE FROM event_states WHERE definition_id=? AND definition_version=?",
+                    f"DELETE FROM {table} WHERE definition_id=? AND "
+                    f"definition_version=?",
                     (first.definition_id, first.definition_version),
                 )
             for assignment in rows:
                 cursor.execute(
                     """INSERT INTO assignments(
-                        subject_id, study_id, definition_id, definition_version,
-                        definition_hash, verdict, evidence_state, matched_rule_id,
-                        reason, payload
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        episode_id, subject_id, study_id, definition_id,
+                        definition_version, verdict, evidence_state, reason, payload
+                    ) VALUES (?,?,?,?,?,?,?,?,?)""",
                     (
-                        assignment.subject_id, assignment.study_id,
-                        assignment.definition_id, assignment.definition_version,
-                        assignment.definition_hash, assignment.verdict,
-                        assignment.evidence_state, assignment.matched_rule_id,
-                        assignment.reason, assignment.model_dump_json(),
+                        assignment.episode_id, assignment.subject_id,
+                        assignment.study_id, assignment.definition_id,
+                        assignment.definition_version, assignment.verdict,
+                        assignment.evidence_state, assignment.reason,
+                        assignment.model_dump_json(),
                     ),
                 )
-                for event_id in assignment.contributing_event_ids:
-                    cursor.execute(
-                        """INSERT OR REPLACE INTO event_states(
-                            event_id, definition_id, definition_version, definition_hash,
-                            evidence_state, verdict, matched_rule_id
-                        ) VALUES (?,?,?,?,?,?,?)""",
-                        (
-                            event_id, assignment.definition_id,
-                            assignment.definition_version, assignment.definition_hash,
-                            assignment.evidence_state, assignment.verdict,
-                            assignment.matched_rule_id,
-                        ),
-                    )
+                cursor.execute(
+                    """INSERT OR REPLACE INTO episode_states(
+                        episode_id, definition_id, definition_version,
+                        definition_hash, evidence_state, verdict, matched_rule_id
+                    ) VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        assignment.episode_id, assignment.definition_id,
+                        assignment.definition_version, assignment.definition_hash,
+                        assignment.evidence_state, assignment.verdict,
+                        assignment.matched_rule_id,
+                    ),
+                )
 
     # -- reading ------------------------------------------------------------
 
     def meta(self) -> IndexMeta:
-        rows = {
-            row["key"]: row["value"]
-            for row in self.query("SELECT key, value FROM meta")
-        }
+        rows = {r["key"]: r["value"] for r in self.query("SELECT key, value FROM meta")}
         return IndexMeta(
             schema_version=int(rows.get("schema_version", 0)),
             snapshot_id=rows.get("snapshot_id", ""),
             extractor_version=rows.get("extractor_version", ""),
+            normalizer_version=rows.get("normalizer_version", ""),
             document_count=int(rows.get("document_count", 0)),
-            event_count=int(rows.get("event_count", 0)),
+            episode_count=int(rows.get("episode_count", 0)),
+            mention_count=int(rows.get("mention_count", 0)),
         )
 
-    def events(self) -> list[EventObject]:
+    def episodes(self) -> list[CanonicalAEEpisode]:
         return [
-            EventObject.model_validate_json(row["payload"])
-            for row in self.query("SELECT payload FROM events ORDER BY event_id")
+            CanonicalAEEpisode.model_validate_json(row["payload"])
+            for row in self.query("SELECT payload FROM episodes ORDER BY episode_id")
         ]
 
     def assignments(
@@ -316,8 +359,15 @@ class EventIndex:
             CaseAssignment.model_validate_json(row["payload"])
             for row in self.query(
                 "SELECT payload FROM assignments WHERE definition_id=? AND "
-                "definition_version=? ORDER BY subject_id",
+                "definition_version=? ORDER BY episode_id",
                 (definition_id, definition_version),
+            )
+        ]
+
+    def studies(self) -> list[str]:
+        return [
+            r[0] for r in self.query(
+                "SELECT DISTINCT study_id FROM episodes ORDER BY study_id"
             )
         ]
 
@@ -325,31 +375,17 @@ class EventIndex:
         rows = self.query("SELECT * FROM documents WHERE doc_id=?", (doc_id,))
         return dict(rows[0]) if rows else None
 
-    def studies(self) -> list[str]:
-        return [
-            row[0]
-            for row in self.query(
-                "SELECT DISTINCT study_id FROM documents ORDER BY study_id"
-            )
-        ]
-
-
-def _min_glucose(event: EventObject) -> float | None:
-    """Lowest canonical glucose on the event, for cheap threshold filtering."""
-    values = [
-        lab.canonical_value
-        for lab in event.labs
-        if lab.test == "GLUCOSE" and lab.canonical_value is not None
-    ]
-    return min(values) if values else None
-
 
 def build_index(
     path: str | Path | None,
     store: TrialStore,
-    events: Iterable[EventObject],
+    episodes: Iterable[CanonicalAEEpisode],
     extractor_version: str,
-) -> EventIndex:
-    index = EventIndex.create(path)
-    index.populate(store, events, extractor_version)
+    normalizer_version: str,
+    mentions: Iterable[dict[str, Any]] = (),
+) -> EpisodeIndex:
+    index = EpisodeIndex.create(path)
+    index.populate(
+        store, episodes, extractor_version, normalizer_version, mentions
+    )
     return index

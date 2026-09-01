@@ -186,6 +186,7 @@ class ExtractionEngine:
                 Field[str](
                     value=value.value, collection_state="collected", source="text",
                     spans=list(value.spans), confidence=value.confidence,
+                    prior_state=current.collection_state,
                     note=(
                         f"recovered from narrative; the structured field was "
                         f"{current.collection_state}"
