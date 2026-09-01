@@ -149,13 +149,19 @@ anchors:
 labs:
   # Value phrases such as "glucose 54 mg/dL", "BG of 3.1 mmol/L",
   # "capillary glucose was 48".
-  value_pattern: '(?P<test>{test_names})\s*(?:level\s*)?(?:was|of|=|:|at|measured|reading)?\s*(?P<value>\d{1,3}(?:\.\d{1,2})?)\s*(?P<unit>mg/dL|mg/dl|mmol/L|mmol/l|%)?'
+  # The negative lookahead matters: "low blood glucose 1 days after the dose
+  # escalation" contains a number next to a test name, and without it the
+  # temporal quantity is read as a result.
+  value_pattern: '(?P<test>{test_names})\s*(?:level\s*)?(?:was|of|=|:|at|measured|reading)?\s*(?P<value>\d{1,3}(?:\.\d{1,2})?)\s*(?P<unit>mg/dL|mg/dl|mmol/L|mmol/l|%)?(?!\s*(?:day|days|week|weeks|hour|hours|month|months|year|years)\b)'
   default_units:
     # When a narrative gives a bare number, infer the unit from magnitude.
     # Deliberately conservative: ambiguous magnitudes yield no lab value.
     GLUCOSE:
-      - {max: 30, unit: "mmol/L"}
-      - {min: 35, unit: "mg/dL"}
+      # Bounded at both ends. A bare "1" is not a glucose result in any unit,
+      # and inferring one from magnitude alone is how a duration becomes a
+      # laboratory value.
+      - {min: 1.5, max: 30, unit: "mmol/L"}
+      - {min: 35, max: 900, unit: "mg/dL"}
   require_unit_or_inference: true
 
 values:

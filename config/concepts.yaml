@@ -164,7 +164,7 @@ lab_tests:
     conversions:
       mmol/L: 18.0182
       mg/dL: 1.0
-    plausible_range: [10, 900]
+    plausible_range: [20, 900]
   HBA1C:
     label: Haemoglobin A1c
     names: ["hba1c", "haemoglobin a1c", "hemoglobin a1c", "a1c"]

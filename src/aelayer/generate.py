@@ -725,10 +725,12 @@ class CorpusGenerator:
             f"Subject {subject_id} in study {study.study_id} was receiving study "
             f"drug per protocol."
         )
-        builder.marked(
-            "The subject experienced ", surface,
-            f" {truth.onset_offset_days} days after the dose escalation.", "concept",
+        days = truth.onset_offset_days
+        when = (
+            "on the day of the dose escalation" if days == 0
+            else f"{days} day{'' if days == 1 else 's'} after the dose escalation"
         )
+        builder.marked("The subject experienced ", surface, f" {when}.", "concept")
 
         if truth.symptoms:
             builder.sentence(

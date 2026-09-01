@@ -1,14 +1,13 @@
 """Command line interface.
 
-Every command prints what it did, which versions produced it, and where the
-result went.  A number without its definition version and extractor version is
-not a result.
+Every command prints what it did and which versions produced it.  A number
+without its definition version, normalizer version and extraction backend is not
+a result.
 """
 
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -18,15 +17,18 @@ from . import paths
 from .catalog import ConfigError
 from .ingest import IngestError
 from .phenotype.loader import DefinitionError
+from .semantics import SemanticsError
 
 app = typer.Typer(
     add_completion=False,
     help=(
-        "Adverse event evidence layer. Converts free-text AE evidence into "
-        "provenance-bearing event objects and evaluates versioned phenotype "
-        "definitions over them. All data is synthetic."
+        "Adverse event evidence layer. Normalizes mixed-format AE evidence into "
+        "source-faithful canonical records, derives episodes above them, and "
+        "evaluates versioned phenotype definitions. All data is synthetic."
     ),
 )
+knowledge_app = typer.Typer(help="Program knowledge layer.")
+app.add_typer(knowledge_app, name="knowledge")
 
 
 def _echo(message: str = "") -> None:
@@ -38,12 +40,15 @@ def _fail(message: str) -> None:
     raise typer.Exit(code=1)
 
 
-def _pipeline(data_dir: Optional[str] = None, store: Optional[str] = None):
+def _pipeline(data_dir: Optional[str] = None, store: Optional[str] = None,
+              backend: str = "auto"):
     from .pipeline import Pipeline
 
     try:
-        return Pipeline.load(data_dir, store_path=store or paths.STORE_DB)
-    except (IngestError, ConfigError) as exc:
+        return Pipeline.load(
+            data_dir, store_path=store or paths.STORE_DB, backend=backend
+        )
+    except (IngestError, ConfigError, SemanticsError) as exc:
         _fail(str(exc))
 
 
@@ -53,37 +58,37 @@ def _pipeline(data_dir: Optional[str] = None, store: Optional[str] = None):
 @app.command()
 def generate(
     seed: int = typer.Option(7, help="Seed. The corpus is fully determined by it."),
-    studies: int = typer.Option(4, min=1, max=6, help="Number of studies to generate."),
-    subjects: Optional[int] = typer.Option(
-        None, help="Override subjects per study (default varies by study)."
-    ),
-    out: Optional[str] = typer.Option(None, help="Output directory."),
+    studies: int = typer.Option(6, min=1, max=6),
+    truths: int = typer.Option(24, help="Truths rendered under every variant."),
+    background: int = typer.Option(18, help="Extra subjects per study."),
+    out: Optional[str] = typer.Option(None),
 ) -> None:
-    """Generate the synthetic corpus with its gold answer key."""
+    """Generate the synthetic corpus: ground truth, then six renderings of it."""
     from .generate import generate_corpus
 
     root, manifest = generate_corpus(
-        seed=seed, n_studies=studies, out_dir=out, subjects_per_study=subjects
+        seed=seed, n_studies=studies, out_dir=out,
+        invariance_truths=truths, background_per_study=background,
     )
     counts = manifest["counts"]
     _echo(f"Generated synthetic corpus in {root}")
     _echo(
         f"  {counts['studies']} studies, {counts['subjects']} subjects, "
-        f"{counts['ae_records']} AE records with narratives"
+        f"{counts['ae_records']} source records, "
+        f"{counts['episodes_expected']} true episodes"
     )
+    _echo(f"  {manifest['invariance_truths']} truths rendered under every variant")
     for study_id, body in sorted(manifest["studies"].items()):
         _echo(
-            f"  {study_id}: {body['glucose_unit']:>7} | {body['dictionary_version']:<12} "
-            f"| coded={'yes' if body['codes_hypoglycemia'] else 'NO':<3} "
-            f"| AE detail={body['structured_ae_detail']}"
+            f"  {study_id} {body['representation']:<4} {body['glucose_unit']:>7} "
+            f"| {body['dictionary_version']:<12} | split={body['record_splitting']:<19}"
+            f"| forms={len(body['linked_forms'])}"
         )
     _echo("  All records are computer generated. No real patient data.")
 
 
 @app.command()
-def ingest(
-    data_dir: str = typer.Argument(str(paths.DATA_DIR), help="Corpus directory."),
-) -> None:
+def ingest(data_dir: str = typer.Argument(str(paths.DATA_DIR))) -> None:
     """Load a corpus and report what is in it."""
     from .ingest import load_store
 
@@ -91,94 +96,146 @@ def ingest(
         store = load_store(data_dir)
     except IngestError as exc:
         _fail(str(exc))
-    summary = store.summary()
     _echo(f"Ingested {data_dir}")
-    for key, value in summary.items():
-        _echo(f"  {key:<16} {value}")
+    for key, value in store.summary().items():
+        _echo(f"  {key:<22} {value}")
+
+
+@app.command()
+def normalize(
+    data_dir: Optional[str] = typer.Option(None),
+    limit: int = typer.Option(0, help="Print this many records' collection states."),
+) -> None:
+    """Run the deterministic path and report collection states."""
+    import collections
+
+    pipeline = _pipeline(data_dir)
+    from .normalize import normalize_store
+
+    records = normalize_store(pipeline.store, pipeline.configs)
+    states = collections.Counter(
+        state for r in records for state in r.collection_states().values()
+    )
+    _echo(f"Normalized {len(records)} source records")
+    _echo(f"  normalizer {pipeline.normalizer_version}")
+    _echo("  collection states:")
+    for state, count in sorted(states.items()):
+        _echo(f"    {state:<28} {count}")
+    violations = [r.source_record_id for r in records if not r.has_full_provenance()]
+    if violations:
+        _fail(f"  {len(violations)} record(s) have a populated field with no span")
+    _echo("  every populated field traces to a span")
+    for record in records[:limit]:
+        _echo(f"\n  {record.source_record_id} ({record.study_id})")
+        for name, state in record.collection_states().items():
+            field = record.fields()[name]
+            _echo(f"    {name:<28} {str(field.value)[:24]:<26} {state}")
 
 
 @app.command()
 def extract(
-    out: str = typer.Option(str(paths.STORE_DB), "--out", help="Store path."),
-    data_dir: Optional[str] = typer.Option(None, help="Corpus directory."),
+    out: str = typer.Option(str(paths.STORE_DB), "--out"),
+    data_dir: Optional[str] = typer.Option(None),
+    backend: str = typer.Option("auto", help="auto | rules | llm"),
 ) -> None:
-    """Extract event objects and build the retrieval index."""
-    pipeline = _pipeline(data_dir, out)
-    events = pipeline.events(refresh=True)
+    """Normalize, enrich from narrative, reconcile episodes, build the index."""
+    pipeline = _pipeline(data_dir, out, backend)
+    records = pipeline.records(refresh=True)
+    episodes = pipeline.episodes(refresh=True)
     index = pipeline.index(refresh=True)
-    violations = [e.event_id for e in events if not e.has_full_provenance()]
+    versions = pipeline.versions()
 
-    _echo(f"Extracted {len(events)} event objects -> {out}")
-    _echo(f"  extractor version {pipeline.extractor_version}")
-    _echo(f"  data snapshot     {pipeline.snapshot_id}")
-    _echo(f"  indexed documents {index.meta().document_count}")
+    _echo(f"{len(records)} canonical records -> {len(episodes)} episodes -> {out}")
+    _echo(f"  normalizer  {versions['normalizer_version']}")
+    _echo(f"  extractor   {versions['extractor_version']} "
+          f"(backend: {versions['extraction_backend']})")
+    _echo(f"  snapshot    {versions['snapshot_id']}")
+    _echo(f"  indexed     {index.meta().document_count} documents, "
+          f"{index.meta().mention_count} narrative mentions")
+    for note in pipeline.engine().notes:
+        _echo(f"  note: {note}")
+    violations = [r.source_record_id for r in records if not r.has_full_provenance()]
     if violations:
-        _fail(
-            f"  {len(violations)} event(s) have a populated field with no span. "
-            f"Every derived value must trace to a span: {violations[:5]}"
-        )
-    _echo("  every populated field on every event traces to a span")
+        _fail(f"  {len(violations)} record(s) have a populated field with no span: "
+              f"{violations[:5]}")
+    _echo("  every populated field on every record traces to a span")
+    flagged = sum(1 for e in episodes if e.linkage_review_required)
+    _echo(f"  {flagged} episode(s) flagged for linkage review, reported not resolved")
 
 
 @app.command()
 def definitions(
-    show: Optional[str] = typer.Option(None, help="Show one definition in full."),
-    diff: Optional[str] = typer.Option(
-        None, help="Diff two versions, e.g. te_symptomatic_hypoglycemia:1:2"
+    show: Optional[str] = typer.Option(None),
+    compare: Optional[str] = typer.Option(
+        None, help="Compare two versions, e.g. te_symptomatic_hypoglycemia:1:2"
     ),
+    scope: Optional[str] = typer.Option(
+        None, help="Required with --compare: the scientific question it applies to."
+    ),
+    data_dir: Optional[str] = typer.Option(None),
 ) -> None:
-    """List phenotype definitions, or show or diff one."""
-    from .catalog import load_configs
-    from .phenotype.loader import DefinitionCatalog, diff_definitions
+    """List phenotype definitions, show one, or compare two by what they claim."""
+    from .knowledge import ScopeRequired, diff_definitions
 
-    catalog, _config, _version = load_configs()
-    definition_catalog = DefinitionCatalog(catalog=catalog)
+    pipeline = _pipeline(data_dir)
 
-    if diff:
+    if compare:
         try:
-            definition_id, left_version, right_version = diff.split(":")
-            left = definition_catalog.get(definition_id, int(left_version), allow_draft=True)
-            right = definition_catalog.get(definition_id, int(right_version), allow_draft=True)
+            definition_id, left, right = compare.split(":")
+            a = pipeline.definition(definition_id, int(left), allow_draft=True)
+            b = pipeline.definition(definition_id, int(right), allow_draft=True)
         except (ValueError, DefinitionError) as exc:
-            _fail(f"cannot diff {diff!r}: {exc}")
-        changes = diff_definitions(left, right)
-        _echo(f"{left.key} ({left.status}) -> {right.key} ({right.status})")
-        if not changes:
-            _echo("  no differences")
-        for change in changes:
-            _echo(f"  {change['path']}: {change['from']!r} -> {change['to']!r}")
+            _fail(f"cannot compare {compare!r}: {exc}")
+        try:
+            comparison = diff_definitions(
+                a, b, pipeline.snapshot_id, scope,
+                pipeline.evaluate(a), pipeline.evaluate(b),
+            )
+        except ScopeRequired as exc:
+            _fail(str(exc))
+        _echo(comparison.summary_line)
+        _echo("")
+        _echo(f"  {'episode':<40} {'v' + str(a.version):<10} {'v' + str(b.version)}")
+        for entry in comparison.discordant[:12]:
+            _echo(f"  {entry.episode_id:<40} {entry.verdict_a:<10} {entry.verdict_b}")
+        if len(comparison.discordant) > 12:
+            _echo(f"  ... {len(comparison.discordant) - 12} more")
+        if comparison.discordant:
+            first = comparison.discordant[0]
+            _echo("")
+            _echo(f"  why {first.episode_id} moved:")
+            _echo(f"    v{a.version}: {first.reason_a[:150]}")
+            _echo(f"    v{b.version}: {first.reason_b[:150]}")
         return
 
     if show:
         try:
-            definition = definition_catalog.get(show, allow_draft=True)
+            definition = pipeline.definition(show, allow_draft=True)
         except DefinitionError as exc:
             _fail(str(exc))
         _echo(json.dumps(definition.model_dump(mode="json"), indent=2, default=str))
         return
 
-    for definition in definition_catalog.all():
+    for definition in pipeline.definitions.all():
         _echo(
-            f"{definition.key:<38} {definition.status:<11} "
+            f"{definition.key:<40} {definition.status:<11} "
             f"{definition.definition_hash}  {definition.label}"
         )
 
 
 @app.command()
 def evaluate(
-    definition: str = typer.Option(
-        "te_symptomatic_hypoglycemia", "--definition", help="Definition id."
-    ),
-    version: Optional[int] = typer.Option(None, help="Version. Default: latest frozen."),
-    study: list[str] = typer.Option([], "--study", help="Restrict to a study. Repeatable."),
-    allow_draft: bool = typer.Option(False, help="Permit a draft definition to run."),
-    limit: int = typer.Option(15, help="Case table rows to print."),
-    save: bool = typer.Option(True, help="Write a run manifest."),
+    definition: str = typer.Option("te_symptomatic_hypoglycemia", "--definition"),
+    version: Optional[int] = typer.Option(None),
+    study: list[str] = typer.Option([], "--study"),
+    allow_draft: bool = typer.Option(False),
+    limit: int = typer.Option(12),
+    save: bool = typer.Option(True),
     data_dir: Optional[str] = typer.Option(None),
     store: Optional[str] = typer.Option(None),
 ) -> None:
-    """Evaluate a phenotype definition and print the case table with reasons."""
-    from .runs import RunStore, execute
+    """Evaluate a definition over episodes and print the case table with reasons."""
+    from .runs import execute
 
     pipeline = _pipeline(data_dir, store)
     try:
@@ -186,132 +243,144 @@ def evaluate(
     except DefinitionError as exc:
         _fail(str(exc))
 
-    manifest = execute(pipeline, resolved, studies=list(study) or None)
+    manifest, assignments = execute(
+        pipeline, resolved, studies=list(study) or None, save=save
+    )
     if save:
-        path = RunStore().save(manifest)
-        pipeline.index().record_assignments(manifest.assignments)
-    else:
-        path = None
+        pipeline.index().record_assignments(assignments)
 
-    _echo(f"{resolved.label}")
-    _echo(f"  definition   {resolved.key}  status={resolved.status}  hash={resolved.definition_hash}")
-    _echo(f"  extractor    {manifest.extractor_version}")
-    _echo(f"  snapshot     {manifest.snapshot_id}")
-    _echo(f"  run          {manifest.run_id}  results={manifest.results_hash}")
+    _echo(resolved.label)
+    _echo(f"  definition  {resolved.key}  status={resolved.status}  "
+          f"hash={resolved.definition_hash}")
+    _echo(f"  normalizer  {manifest.normalizer_version}")
+    _echo(f"  extractor   {manifest.extractor_version} "
+          f"({manifest.parameters.get('backend')})")
+    _echo(f"  snapshot    {manifest.data_snapshot_id}")
+    _echo(f"  manifest    {manifest.manifest_id}  results={manifest.results_hash}")
     _echo("")
-    _echo(f"  verdicts     {manifest.counts_by_verdict}")
-    _echo(f"  states       {manifest.counts_by_state}")
+    _echo(f"  verdicts    {manifest.counts_by_verdict}")
+    _echo(f"  states      {manifest.counts_by_state}")
     _echo("")
-
-    cases = [a for a in manifest.assignments if a.verdict in ("case", "review")]
-    _echo(f"  {'subject':<16} {'verdict':<9} {'state':<10} {'rule':<10} reason")
-    _echo(f"  {'-'*16} {'-'*9} {'-'*10} {'-'*10} {'-'*58}")
-    for assignment in cases[:limit]:
+    _echo(f"  {'episode':<40} {'verdict':<9} {'state':<13} {'rule':<13} reason")
+    _echo(f"  {'-'*40} {'-'*9} {'-'*13} {'-'*13} {'-'*40}")
+    shown = [a for a in assignments if a.verdict in ("case", "review")]
+    for assignment in shown[:limit]:
         reason = assignment.reason
-        if len(reason) > 88:
-            reason = reason[:85] + "..."
+        if len(reason) > 76:
+            reason = reason[:73] + "..."
         _echo(
-            f"  {assignment.subject_id:<16} {assignment.verdict:<9} "
-            f"{assignment.evidence_state:<10} "
-            f"{(assignment.matched_rule_id or '-'):<10} {reason}"
+            f"  {assignment.episode_id:<40} {assignment.verdict:<9} "
+            f"{assignment.evidence_state:<13} "
+            f"{(assignment.matched_rule_id or '-'):<13} {reason}"
         )
-    if len(cases) > limit:
-        _echo(f"  ... {len(cases) - limit} more (raise --limit to see them)")
+    if len(shown) > limit:
+        _echo(f"  ... {len(shown) - limit} more (raise --limit)")
     _echo("")
     review = manifest.counts_by_verdict.get("review", 0)
+    flagged = sum(1 for a in assignments if a.linkage_review_required)
     _echo(
-        f"  The review set holds {review} subject(s). It is reported separately "
-        f"and is not folded into the case count."
+        f"  {review} episode(s) in the review set, reported separately; "
+        f"{flagged} carry a flagged episode linkage."
     )
-    if path:
-        _echo(f"  manifest -> {path}")
+    if save:
+        _echo(f"  results -> {manifest.output_pointer}")
+        _echo(f"  replay with:  aelayer replay {manifest.manifest_id}")
 
 
 @app.command()
 def retrieve(
     query: str = typer.Argument(..., help="Concept id, group id, or free text."),
-    assertion: list[str] = typer.Option([], "--assertion", help="Repeatable."),
-    evidence_state: list[str] = typer.Option([], "--evidence-state", help="Repeatable."),
+    mode: str = typer.Option("precise", help="precise | lexical | dense | hybrid"),
+    assertion: list[str] = typer.Option([], "--assertion"),
+    verdict: list[str] = typer.Option([], "--verdict"),
+    study: list[str] = typer.Option([], "--study"),
+    representation: list[str] = typer.Option([], "--representation"),
     window: Optional[str] = typer.Option(None, help="Offset window, e.g. 0:14"),
-    anchor: Optional[str] = typer.Option(None, help="Anchor event."),
-    study: list[str] = typer.Option([], "--study", help="Repeatable."),
     definition: str = typer.Option("te_symptomatic_hypoglycemia"),
     version: Optional[int] = typer.Option(None),
-    mode: str = typer.Option("lexical", help="lexical | dense | hybrid"),
     top_k: int = typer.Option(10, "--top-k"),
     as_json: bool = typer.Option(False, "--json"),
     data_dir: Optional[str] = typer.Option(None),
     store: Optional[str] = typer.Option(None),
 ) -> None:
-    """Retrieve records. Assertion is a structured filter, not a hope."""
+    """Retrieve episodes (precise) or narrative mentions (discovery)."""
+    from .retrieval.query import discover, retrieve as retrieve_episodes
+
     pipeline = _pipeline(data_dir, store)
+    index = pipeline.index()
     catalog = pipeline.catalog
-
-    bounds = None
-    if window:
-        try:
-            low, high = window.split(":")
-            bounds = (int(low), int(high))
-        except ValueError:
-            _fail(f"--window must look like 0:14, got {window!r}")
-
     is_concept = query in catalog.concepts or query in catalog.concept_groups
-    resolved_version = version
-    if evidence_state and resolved_version is None:
-        try:
-            resolved_version = pipeline.definition(definition).version
-        except DefinitionError:
-            resolved_version = None
 
-    result = pipeline.retrieve(
+    if mode == "precise":
+        bounds = None
+        if window:
+            try:
+                low, high = window.split(":")
+                bounds = (int(low), int(high))
+            except ValueError:
+                _fail(f"--window must look like 0:14, got {window!r}")
+        result = retrieve_episodes(
+            index, catalog,
+            concept=query if is_concept else None,
+            text=None if is_concept else query,
+            assertion=list(assertion) or None,
+            verdict=list(verdict) or None,
+            studies=list(study) or None,
+            representation=list(representation) or None,
+            window=bounds, definition_id=definition,
+            definition_version=version, mode="precise", top_k=top_k,
+        )
+        if as_json:
+            _echo(json.dumps(result.to_dict(), indent=2))
+            return
+        _echo(f"{len(result.records)} episode(s), precise cohort path")
+        _echo(f"  usable as a cohort: {result.to_dict()['usable_as_cohort']}")
+        for record in result.records:
+            _echo(
+                f"  {record.episode_id:<40} {str(record.verdict):<9} "
+                f"{str(record.evidence_state):<13} "
+                f"{record.representation:<5} off={record.onset_offset_days}"
+            )
+        return
+
+    result = discover(
+        index, catalog,
         concept=query if is_concept else None,
         text=None if is_concept else query,
         assertion=list(assertion) or None,
-        evidence_state=list(evidence_state) or None,
-        window=bounds,
-        anchor=anchor,
         studies=list(study) or None,
-        definition_id=definition,
-        definition_version=resolved_version,
-        mode=mode,  # type: ignore[arg-type]
-        top_k=top_k,
+        mode=mode, top_k=top_k,
     )
     if as_json:
         _echo(json.dumps(result.to_dict(), indent=2))
         return
-
-    _echo(f"{len(result.records)} record(s), mode={result.mode}")
-    if result.expanded_terms:
-        _echo(f"  concept expanded to {len(result.expanded_terms)} surface forms")
+    _echo(f"{len(result.mentions)} mention(s), discovery path ({result.mode})")
     _echo(
-        f"  records asserting absence: {result.negation_false_positives} "
+        f"  mentions asserting absence: {result.negation_false_positives} "
         f"(rate {result.negation_false_positive_rate:.4f})"
     )
     for note in result.notes:
         _echo(f"  note: {note}")
     _echo("")
-    for record in result.records:
-        state = record.evidence_state or "-"
+    for mention in result.mentions:
         _echo(
-            f"  {record.subject_id:<16} {record.assertion:<14} {state:<10} "
-            f"off={str(record.onset_offset_days):<5} {record.doc_id}"
+            f"  {mention.subject_id:<18} {mention.assertion:<15} "
+            f"{mention.match_kind:<14} {mention.surface!r}"
         )
-        _echo(f"      {record.snippet}")
+        _echo(f"      {mention.sentence[:110]}")
 
 
 @app.command()
 def ask(
-    question: str = typer.Argument(..., help="A question in plain language."),
-    approve: bool = typer.Option(
-        False, "--approve", help="Approve the compiled spec and execute it."
-    ),
+    question: str = typer.Argument(...),
     backend: str = typer.Option("deterministic", help="deterministic | llm"),
+    show_trace: bool = typer.Option(True, "--trace/--no-trace"),
     as_json: bool = typer.Option(False, "--json"),
     data_dir: Optional[str] = typer.Option(None),
     store: Optional[str] = typer.Option(None),
 ) -> None:
-    """Compile a question into a spec. Execution requires --approve."""
-    from .agent import AgentSession
+    """Compile a question, execute it, and trace the number back to source."""
+    from .agent import AgentSession, render_trace
 
     pipeline = _pipeline(data_dir, store)
     session = AgentSession(pipeline, question, backend=backend)
@@ -326,71 +395,82 @@ def ask(
         _echo("")
         _echo(f"  Ambiguity: {clarification.ambiguity}")
         _echo(f"  Effect:    {clarification.effect}")
-        if clarification.options:
-            _echo("  Options:")
-            for option in clarification.options:
-                _echo(f"    - {option}")
+        for option in clarification.options:
+            _echo(f"    - {option}")
         _echo("")
         _echo("  No specification was compiled and nothing was executed.")
         raise typer.Exit(code=2)
 
-    spec = result.spec
-    if as_json and not approve:
-        _echo(json.dumps(result.to_dict(), indent=2))
-        return
-
-    _echo("Compiled specification (nothing has been executed yet):")
-    _echo("")
-    for line in json.dumps(spec.model_dump(mode="json"), indent=2).splitlines():
-        _echo(f"  {line}")
-    _echo("")
-
-    if not approve:
-        _echo("  Execution is blocked until this specification is approved.")
-        _echo("  Re-run with --approve to execute it.")
-        return
-
-    session.approve()
     package, manifest = session.execute()
     if as_json:
-        _echo(json.dumps(package.to_dict(), indent=2))
+        _echo(json.dumps(package.to_dict(), indent=2, default=str))
         return
 
+    _echo("Compiled specification:")
+    for line in json.dumps(package.spec.model_dump(mode="json"), indent=2).splitlines():
+        _echo(f"  {line}")
+    _echo("")
     summary = package.summary
-    _echo("Approved and executed.")
+    _echo(f"  primary cases      {summary['primary_case_count']}")
+    _echo(f"  review set         {summary['review_set_count']} (reported separately)")
+    _echo(f"  linkage flagged    {summary['linkage_flagged']}")
+    _echo(f"  incidence          {package.statistics['incidence_proportion']}")
+    _echo(f"  counts by state    {summary['counts_by_state']}")
     _echo("")
-    _echo(f"  primary cases   {summary['primary_case_count']}")
-    _echo(f"  review set      {summary['review_set_count']} (reported separately)")
-    _echo(f"  counts by state {summary['counts_by_state']}")
-    _echo(f"  by rule         {summary['counts_by_rule']}")
-    _echo("")
-    _echo("  per study:")
-    for study_id, counts in summary["per_study"].items():
-        _echo(f"    {study_id:<12} {counts}")
-    _echo("")
-    _echo(f"  definition      {package.definition['id']}.v{package.definition['version']} "
+    _echo(f"  definition  {package.definition['id']}.v{package.definition['version']} "
           f"({package.definition['status']}) hash={package.definition['hash']}")
-    _echo(f"  extractor       {package.extractor_version}")
-    _echo(f"  snapshot        {package.snapshot_id}")
-    _echo(f"  run             {package.run_id}  results={package.results_hash}")
+    _echo(f"  normalizer  {package.versions['normalizer_version']}")
+    _echo(f"  extractor   {package.versions['extractor_version']} "
+          f"({package.versions['extraction_backend']})")
+    _echo(f"  manifest    {package.manifest_id}  results={package.results_hash}")
+    _echo(f"  services    {', '.join(package.services_called)}")
     _echo("")
-    _echo("  example contributing spans:")
-    for span in package.contributing_spans[:5]:
-        _echo(f"    {span['subject_id']:<16} {span['field']:<12} {span['text'][:64]!r}")
-    _echo("")
+    if show_trace and package.trace:
+        _echo(f"  traceable to source: {package.trace.complete}")
+        _echo("")
+        for line in render_trace(package.trace).splitlines()[:24]:
+            _echo(f"  {line}")
+        _echo("")
     _echo("  limitations:")
     for limitation in package.limitations:
         _echo(f"    - {limitation}")
 
 
+@app.command()
+def trace(
+    manifest_id: str = typer.Argument(..., help="Manifest id from a prior run."),
+    verdict: str = typer.Option("case"),
+    data_dir: Optional[str] = typer.Option(None),
+    store: Optional[str] = typer.Option(None),
+) -> None:
+    """Follow a reported number back to the text a site wrote."""
+    from .agent import render_trace, trace_number
+    from .runs import ManifestStore, ReplayError, ResultStore
+
+    pipeline = _pipeline(data_dir, store)
+    try:
+        manifest = ManifestStore(paths.RUNS_DIR).load(manifest_id)
+        assignments = ResultStore(paths.RUNS_DIR / "results").read(manifest_id)
+    except ReplayError as exc:
+        _fail(str(exc))
+
+    count = sum(1 for a in assignments if a.verdict == verdict)
+    chain = trace_number(
+        number=count, label=f"{verdict} count", manifest=manifest,
+        assignments=assignments, episodes=pipeline.episodes(),
+        records=pipeline.records(),
+    )
+    _echo(render_trace(chain))
+    if not chain.complete:
+        raise typer.Exit(code=1)
+
+
 @app.command(name="eval")
 def eval_command(
-    report: Optional[str] = typer.Option(
-        str(paths.REPORTS_DIR / "eval.md"), "--report", help="Markdown report path."
-    ),
+    report: Optional[str] = typer.Option(str(paths.REPORTS_DIR / "eval.md"), "--report"),
     definition: str = typer.Option("te_symptomatic_hypoglycemia"),
     version: Optional[int] = typer.Option(None),
-    as_json: Optional[str] = typer.Option(None, "--json", help="Also write JSON here."),
+    as_json: Optional[str] = typer.Option(None, "--json"),
     data_dir: Optional[str] = typer.Option(None),
     store: Optional[str] = typer.Option(None),
 ) -> None:
@@ -400,48 +480,47 @@ def eval_command(
     pipeline = _pipeline(data_dir, store)
     results, written = run_evaluation(pipeline, definition, version, report)
 
-    extraction = results["extraction"]
-    phenotype = results["phenotype"]
-    retrieval = results["retrieval"]
-    stability = results["stability"]
-
+    layer1, layer2, layer3 = results["layer1"], results["layer2"], results["layer3"]
+    invariance, repro = results["invariance"], results["reproducibility"]
     _echo("Evaluation")
-    _echo(f"  extraction   assertion accuracy "
-          f"{extraction['assertion_confusion']['accuracy']:.3f}, "
-          f"concept F1 {extraction['concept_detection']['f1']:.3f}")
-    _echo(f"  phenotype    PPV {phenotype['pooled']['ppv']:.3f}, "
-          f"sensitivity {phenotype['pooled']['sensitivity']:.3f} "
-          f"over {phenotype['subjects']} subjects "
-          f"({phenotype['evaluated_definition']})")
-    if not phenotype.get("matches_gold_definition", True):
-        _echo(f"               note: {phenotype['comparability_note']}")
-    _echo(
-        f"  retrieval    negation FP rate "
-        f"{retrieval['assertion_filter_on']['negation_false_positive_rate']:.4f} "
-        f"with the assertion filter on, "
-        f"{retrieval['assertion_filter_off']['negation_false_positive_rate']:.4f} off"
-    )
-    _echo(f"  stability    run id stable={stability['run_id_stable']}, "
-          f"results stable={stability['results_stable']}")
-    violations = extraction["provenance_violations"]
-    _echo(f"  provenance   {len(violations)} violation(s)")
-    for sweep in results["sensitivity"]["sweeps"]:
-        low, high = sweep["case_count_range"]
-        _echo(f"  sensitivity  {sweep['parameter']}: case count {low}-{high}")
+    _echo(f"  layer 1  collection-state accuracy "
+          f"{layer1['collection_state_confusion']['accuracy']:.3f}, "
+          f"abstention precision {layer1['abstention']['abstention_precision']:.3f}, "
+          f"answer precision {layer1['abstention']['answer_precision']:.3f}")
+    _echo(f"  layer 2  boundary agreement {layer2['boundary_agreement']:.3f}, "
+          f"over-merge {layer2['over_merge']}, over-split {layer2['over_split']}")
+    pooled = layer3["pooled"]
+    _echo(f"  layer 3  PPV {pooled['ppv']:.3f}, sensitivity "
+          f"{pooled['sensitivity']:.3f} "
+          f"({pooled['false_negatives_from_linkage_review']} of "
+          f"{pooled['fn']} misses are declined linkage)")
+    _echo(f"  transport dev {layer3['transportability']['development']['sensitivity']:.3f} "
+          f"-> held-out {layer3['transportability']['held_out']['sensitivity']:.3f}")
+    _echo(f"  invariance verdict {invariance['verdict_agreement']:.3f}, "
+          f"state {invariance['state_agreement']:.3f} "
+          f"({invariance['discordant_count']} discordant)")
+    retrieval = results.get("retrieval") or {}
+    if retrieval.get("available"):
+        _echo(
+            f"  retrieval negation FP rate "
+            f"{retrieval['assertion_filter_on']['negation_false_positive_rate']:.4f} "
+            f"with the assertion filter on, "
+            f"{retrieval['assertion_filter_off']['negation_false_positive_rate']:.4f} off"
+        )
+    _echo(f"  repro    manifest stable={repro['manifest_id_stable']}, "
+          f"results stable={repro['results_stable']}")
+    violations = layer1["provenance_violations"]
+    _echo(f"  provenance {len(violations)} violation(s)")
 
     if as_json:
         target = Path(as_json)
         target.parent.mkdir(parents=True, exist_ok=True)
-        serialisable = {
-            k: v for k, v in results.items() if not k.endswith("_matrix")
+        cleaned = {
+            k: ({kk: vv for kk, vv in v.items() if not kk.endswith("_matrix")}
+                if isinstance(v, dict) else v)
+            for k, v in results.items()
         }
-        serialisable["extraction"] = {
-            k: v for k, v in results["extraction"].items() if not k.endswith("_matrix")
-        }
-        serialisable["phenotype"] = {
-            k: v for k, v in results["phenotype"].items() if not k.endswith("_matrix")
-        }
-        target.write_text(json.dumps(serialisable, indent=2, default=str), encoding="utf-8")
+        target.write_text(json.dumps(cleaned, indent=2, default=str), encoding="utf-8")
         _echo(f"  json   -> {target}")
     if written:
         _echo(f"  report -> {written}")
@@ -451,14 +530,14 @@ def eval_command(
 
 @app.command()
 def replay(
-    run_id: str = typer.Argument(..., help="Run id from a manifest."),
+    manifest_id: str = typer.Argument(...),
     data_dir: Optional[str] = typer.Option(None),
 ) -> None:
     """Reproduce a prior run and verify it matches, hash for hash."""
     from .runs import ReplayError, replay as do_replay
 
     try:
-        report, _manifest = do_replay(run_id, data_dir=data_dir)
+        report, _manifest = do_replay(manifest_id, data_dir=data_dir)
     except ReplayError as exc:
         _fail(str(exc))
     _echo(report.summary())
@@ -468,91 +547,135 @@ def replay(
         raise typer.Exit(code=1)
 
 
-@app.command()
-def runs(limit: int = typer.Option(20)) -> None:
-    """List recorded runs."""
-    from .runs import RunStore
+@knowledge_app.command("status")
+def knowledge_status(data_dir: Optional[str] = typer.Option(None)) -> None:
+    """What the registry holds. Empty on day one, and it says so."""
+    from .knowledge import KnowledgeRegistry
 
-    recorded = RunStore().list()
-    if not recorded:
-        _echo("No runs recorded yet.")
-        return
-    for manifest in recorded[-limit:]:
-        _echo(
-            f"{manifest.run_id}  {manifest.created_at}  "
-            f"{manifest.definition_id}.v{manifest.definition_version}  "
-            f"cases={manifest.counts_by_verdict.get('case', 0)}  "
-            f"review={manifest.counts_by_verdict.get('review', 0)}"
-        )
+    pipeline = _pipeline(data_dir)
+    status = KnowledgeRegistry.open(definitions=pipeline.definitions).status()
+    _echo(f"Manifests recorded: {status['manifests']}")
+    _echo(f"Capture mode:       {status['capture_mode']}")
+    _echo(f"Definitions:        {', '.join(status['definitions'])}")
+    if status["definitions_used"]:
+        _echo(f"Used in runs:       {', '.join(status['definitions_used'])}")
+    _echo("")
+    _echo(f"  {status['note']}")
+
+
+@knowledge_app.command("backfill")
+def knowledge_backfill(
+    manifest: str = typer.Option(..., "--manifest", help="Path to a manifest JSON."),
+) -> None:
+    """Add one historical execution, deliberately."""
+    from .knowledge import KnowledgeRegistry
+    from .models import Manifest
+
+    path = Path(manifest)
+    if not path.exists():
+        _fail(f"no manifest file at {path}")
+    try:
+        parsed = Manifest.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        _fail(f"{path} is not a valid manifest: {exc}")
+    written = KnowledgeRegistry.open().backfill(parsed)
+    _echo(f"Backfilled {parsed.manifest_id} -> {written}")
+    _echo(
+        "  Backfill adds exactly what you gave it. Nothing about earlier work "
+        "is reconstructed."
+    )
 
 
 @app.command()
 def demo(
     seed: int = typer.Option(7),
-    studies: int = typer.Option(4, min=1, max=6),
-    limit: int = typer.Option(12),
+    studies: int = typer.Option(6, min=1, max=6),
+    limit: int = typer.Option(10),
 ) -> None:
-    """Generate, extract, evaluate and print the case table, end to end."""
+    """Generate, normalize, extract, reconcile, evaluate — end to end."""
+    import collections
+
     from .generate import generate_corpus
-    from .runs import RunStore, execute
+    from .runs import execute
 
     _echo("=== 1. generate ===")
     root, manifest_data = generate_corpus(seed=seed, n_studies=studies)
     counts = manifest_data["counts"]
-    _echo(
-        f"  {counts['studies']} studies, {counts['subjects']} subjects, "
-        f"{counts['ae_records']} AE records with narratives -> {root}"
-    )
+    _echo(f"  {counts['studies']} studies, {counts['subjects']} subjects, "
+          f"{counts['ae_records']} source records -> {root}")
     _echo("  synthetic data only; no real patient records anywhere in this repo")
 
-    _echo("")
-    _echo("=== 2. extract ===")
     pipeline = _pipeline(None, str(paths.STORE_DB))
-    events = pipeline.events(refresh=True)
-    pipeline.index(refresh=True)
-    violations = [e.event_id for e in events if not e.has_full_provenance()]
-    _echo(f"  {len(events)} event objects, extractor {pipeline.extractor_version}")
-    _echo(
-        f"  {len(violations)} populated field(s) without a span"
-        + ("" if violations else "  (every derived value traces to source)")
+
+    _echo("")
+    _echo("=== 2. normalize (deterministic path) ===")
+    records = pipeline.records(refresh=True)
+    states = collections.Counter(
+        s for r in records for s in r.collection_states().values()
     )
+    _echo(f"  {len(records)} canonical records, normalizer "
+          f"{pipeline.normalizer_version}")
+    for state, count in sorted(states.items()):
+        _echo(f"    {state:<28} {count}")
+    _echo("  a blank is not a value: each of these means something different")
 
     _echo("")
-    _echo("=== 3. evaluate te_symptomatic_hypoglycemia v1 ===")
+    _echo("=== 3. extract (model path, unresolved fields only) ===")
+    versions = pipeline.versions()
+    _echo(f"  backend {versions['extraction_backend']}")
+    for note in pipeline.engine().notes:
+        _echo(f"  {note}")
+    recovered = sum(
+        1 for r in records for f in r.fields().values() if f.source == "text"
+    )
+    _echo(f"  {recovered} field value(s) recovered from narrative where the "
+          f"structured field was unresolved")
+    violations = [r.source_record_id for r in records if not r.has_full_provenance()]
+    _echo(f"  {len(violations)} populated field(s) without a span"
+          + ("" if violations else "  (every derived value traces to source)"))
+
+    _echo("")
+    _echo("=== 4. reconcile episodes ===")
+    episodes = pipeline.episodes(refresh=True)
+    rules = collections.Counter(e.linkage_rule for e in episodes)
+    flagged = sum(1 for e in episodes if e.linkage_review_required)
+    _echo(f"  {len(records)} records -> {len(episodes)} episodes")
+    for rule, count in sorted(rules.items()):
+        _echo(f"    {rule:<24} {count}")
+    _echo(f"  {flagged} flagged for review, reported rather than silently resolved")
+    _echo("  source records are unmodified: episodes are derived above them")
+
+    _echo("")
+    _echo("=== 5. evaluate te_symptomatic_hypoglycemia v1 ===")
     definition = pipeline.definition("te_symptomatic_hypoglycemia", 1)
-    run = execute(pipeline, definition)
-    RunStore().save(run)
-    pipeline.index().record_assignments(run.assignments)
-    _echo(f"  verdicts {run.counts_by_verdict}")
-    _echo(f"  states   {run.counts_by_state}")
-    _echo(f"  run {run.run_id}  results {run.results_hash}")
+    manifest, assignments = execute(pipeline, definition)
+    pipeline.index(refresh=True).record_assignments(assignments)
+    _echo(f"  verdicts {manifest.counts_by_verdict}")
+    _echo(f"  states   {manifest.counts_by_state}")
+    _echo(f"  manifest {manifest.manifest_id}  results {manifest.results_hash}")
 
     _echo("")
-    _echo("=== 4. case table ===")
-    _echo(f"  {'subject':<16} {'verdict':<9} {'state':<10} {'rule':<10} reason")
-    _echo(f"  {'-'*16} {'-'*9} {'-'*10} {'-'*10} {'-'*60}")
-    shown = [a for a in run.assignments if a.verdict in ("case", "review")][:limit]
+    _echo("=== 6. case table ===")
+    _echo(f"  {'episode':<40} {'verdict':<9} {'state':<13} {'rule':<13} reason")
+    _echo(f"  {'-'*40} {'-'*9} {'-'*13} {'-'*13} {'-'*40}")
+    shown = [a for a in assignments if a.verdict in ("case", "review")][:limit]
     for assignment in shown:
         reason = assignment.reason
-        if len(reason) > 90:
-            reason = reason[:87] + "..."
-        _echo(
-            f"  {assignment.subject_id:<16} {assignment.verdict:<9} "
-            f"{assignment.evidence_state:<10} "
-            f"{(assignment.matched_rule_id or '-'):<10} {reason}"
-        )
+        if len(reason) > 72:
+            reason = reason[:69] + "..."
+        _echo(f"  {assignment.episode_id:<40} {assignment.verdict:<9} "
+              f"{assignment.evidence_state:<13} "
+              f"{(assignment.matched_rule_id or '-'):<13} {reason}")
     _echo("")
-    _echo(
-        f"  {run.counts_by_verdict.get('review', 0)} subject(s) are in the review "
-        f"set, reported separately rather than discarded."
-    )
-    _echo(f"  Replay this run with:  aelayer replay {run.run_id}")
+    _echo(f"  {manifest.counts_by_verdict.get('review', 0)} episode(s) in the review "
+          f"set, reported separately rather than discarded.")
+    _echo(f"  Trace any number:  aelayer trace {manifest.manifest_id}")
+    _echo(f"  Replay this run:   aelayer replay {manifest.manifest_id}")
 
 
 @app.command()
 def serve(
-    host: str = typer.Option("127.0.0.1"),
-    port: int = typer.Option(8000),
+    host: str = typer.Option("127.0.0.1"), port: int = typer.Option(8000)
 ) -> None:
     """Serve the API and the single-page UI."""
     import uvicorn
@@ -561,7 +684,7 @@ def serve(
     uvicorn.run("aelayer.api:app", host=host, port=port, log_level="warning")
 
 
-def main() -> None:  # pragma: no cover - console entry point
+def main() -> None:  # pragma: no cover
     app()
 
 

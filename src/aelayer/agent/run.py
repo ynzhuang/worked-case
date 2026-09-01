@@ -1,79 +1,85 @@
-"""Approval gate and execution.
+"""Execution and the evidence package.
 
-The compiled spec is returned and execution blocks until it is explicitly
-approved.  This is not ceremony: the spec encodes which definition version
-runs, which assertion classes count, and which evidence states become cases.
-Those are scientific choices, and a person has to make them before any number
-is produced.
+There is no approval gate.  Approving a specification you cannot independently
+evaluate is ceremony: the reviewer sees a plan, not a result.  What replaces it
+is traceability — every number the package reports can be followed back through
+the analysis, the cohort, the definition version, the episodes and the source
+records to the text a site wrote.
+
+The specification is still compiled, still returned, and still inspectable.  It
+is just not treated as though clicking past it were a control.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field as _dc_field
 from typing import Any
 
-from ..models import Clarification, PhenotypeQuerySpec, RunManifest
+from ..models import Clarification, Manifest, PhenotypeQuerySpec, Trace
 from ..pipeline import Pipeline
-from ..runs import RunStore, execute
+from ..runs import ManifestStore, execute
 from .compile import CompileResult, compile_question
-from .tools import AgentTools
+from .tools import SERVICES, AgentServices
+from .trace import trace_number
 
 
-class ApprovalRequired(RuntimeError):
-    """Raised when execution is attempted on an unapproved spec."""
+class ClarificationRequired(RuntimeError):
+    """Raised when execution is attempted on an underdetermined question."""
 
 
 @dataclass
 class EvidencePackage:
-    """What a completed agent run returns.
+    """What a completed run returns.
 
-    Not a number in isolation: the counts, the spans behind them, the exact
-    versions that produced them, and the limits on reading them.
+    Not a number in isolation: the counts, the versions that produced them, the
+    limits on reading them, and a trace that reaches source text.
     """
 
     question: str
     spec: PhenotypeQuerySpec
     summary: dict[str, Any]
-    retrieval: dict[str, Any]
+    statistics: dict[str, Any]
+    cohort_context: dict[str, Any]
     definition: dict[str, Any]
-    extractor_version: str
-    snapshot_id: str
-    run_id: str
+    versions: dict[str, Any]
+    manifest_id: str
     results_hash: str
+    output_pointer: str
     limitations: list[str]
-    contributing_spans: list[dict[str, Any]] = field(default_factory=list)
+    trace: Trace | None = None
+    services_called: list[str] = _dc_field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "question": self.question,
             "spec": self.spec.model_dump(mode="json"),
             "summary": self.summary,
-            "retrieval": self.retrieval,
+            "statistics": self.statistics,
+            "cohort_context": self.cohort_context,
             "definition": self.definition,
-            "extractor_version": self.extractor_version,
-            "snapshot_id": self.snapshot_id,
-            "run_id": self.run_id,
+            "versions": self.versions,
+            "manifest_id": self.manifest_id,
             "results_hash": self.results_hash,
-            "contributing_spans": self.contributing_spans,
+            "output_pointer": self.output_pointer,
+            "services_called": self.services_called,
             "limitations": self.limitations,
+            "trace": self.trace.model_dump(mode="json") if self.trace else None,
+            "traceable": bool(self.trace and self.trace.complete),
         }
 
 
 @dataclass
 class AgentSession:
-    """One question, its compiled spec, and its approval state."""
-
     pipeline: Pipeline
     question: str
     backend: str = "deterministic"
     result: CompileResult | None = None
-    approved: bool = False
 
     def compile(self, *, allow_draft: bool = False) -> CompileResult:
         self.result = compile_question(
-            self.question, self.pipeline, backend=self.backend, allow_draft=allow_draft
+            self.question, self.pipeline, backend=self.backend,
+            allow_draft=allow_draft,
         )
-        self.approved = False
         return self.result
 
     @property
@@ -84,92 +90,73 @@ class AgentSession:
     def clarification(self) -> Clarification | None:
         return self.result.clarification if self.result else None
 
-    def approve(self) -> None:
-        if self.result is None:
-            raise ApprovalRequired("nothing has been compiled to approve")
-        if self.result.spec is None:
-            raise ApprovalRequired(
-                "the question produced a clarification request, not a "
-                "specification. Answer the clarification and compile again."
-            )
-        self.approved = True
-
     def execute(
-        self, *, run_store: RunStore | None = None, save: bool = True
-    ) -> tuple[EvidencePackage, RunManifest]:
-        if self.result is None or self.result.spec is None:
-            raise ApprovalRequired("no approved specification to execute")
-        if not self.approved:
-            raise ApprovalRequired(
-                "execution is blocked until the compiled specification is "
-                "explicitly approved. Review the spec, then approve it."
+        self, *, manifest_store: ManifestStore | None = None, save: bool = True
+    ) -> tuple[EvidencePackage, Manifest]:
+        if self.result is None:
+            self.compile()
+        if self.result.spec is None:
+            raise ClarificationRequired(
+                "the question leaves a rule underdetermined, so nothing was "
+                "executed. Answer the clarification and compile again."
             )
 
         spec = self.result.spec
-        tools = AgentTools(self.pipeline)
+        services = AgentServices(self.pipeline)
+        called: list[str] = []
 
-        cohort = tools.call("cohort", studies=list(spec.studies) or None)
-        evaluation = tools.call("evaluate", spec=spec)
-        summary = tools.call(
-            "summarise", assignments=evaluation["assignments"], spec=spec
+        evidence = services.call("cohort_evidence", spec=spec)
+        called.append("cohort_evidence")
+        assignments = evidence["assignments"]
+
+        summary = services.call("summarise", assignments=assignments, spec=spec)
+        called.append("summarise")
+        statistics = services.call(
+            "statistical_analysis", assignments=assignments, spec=spec
         )
-        retrieval = tools.call("retrieve", spec=spec)
+        called.append("statistical_analysis")
+        context = services.call("exposure_and_covariates", spec=spec)
+        called.append("exposure_and_covariates")
 
         definition = self.pipeline.definition(
             spec.definition_id, spec.definition_version
         )
-        manifest = execute(
-            self.pipeline,
-            definition,
+        manifest, live_assignments = execute(
+            self.pipeline, definition,
             studies=list(spec.studies) or None,
-            spec_extra={
-                "question": spec.question,
+            question=self.question,
+            actor="agent",
+            specification={
                 "backend": spec.backend,
-                "assertion": list(spec.assertion),
                 "evidence_state": list(spec.evidence_state),
+                "retrieval_mode": spec.retrieval_mode,
             },
+            manifest_store=manifest_store,
+            save=save,
         )
-        if save:
-            (run_store or RunStore()).save(manifest)
 
-        spans: list[dict[str, Any]] = []
-        for assignment in manifest.assignments:
-            if assignment.verdict != "case":
-                continue
-            for span in assignment.evidence_spans[:2]:
-                spans.append(
-                    {
-                        "subject_id": assignment.subject_id,
-                        "doc_id": span.doc_id,
-                        "field": span.field,
-                        "start": span.start,
-                        "end": span.end,
-                        "text": span.text,
-                        "rule": assignment.matched_rule_id,
-                    }
-                )
-            if len(spans) >= 25:
-                break
+        chain = trace_number(
+            number=summary["primary_case_count"],
+            label="primary case count",
+            manifest=manifest,
+            assignments=live_assignments,
+            episodes=self.pipeline.episodes(),
+            records=self.pipeline.records(),
+        )
 
-        summary["cohort"] = cohort
         package = EvidencePackage(
             question=self.question,
             spec=spec,
             summary=summary,
-            retrieval={
-                "count": retrieval["count"],
-                "expanded_terms": retrieval["expanded_terms"],
-                "negation_false_positive_rate": retrieval[
-                    "negation_false_positive_rate"
-                ],
-                "records": retrieval["records"][:10],
-            },
-            definition=evaluation["definition"],
-            extractor_version=self.pipeline.extractor_version,
-            snapshot_id=self.pipeline.snapshot_id,
-            run_id=manifest.run_id,
+            statistics=statistics,
+            cohort_context=context,
+            definition=evidence["definition"],
+            versions=self.pipeline.versions(),
+            manifest_id=manifest.manifest_id,
             results_hash=manifest.results_hash,
+            output_pointer=manifest.output_pointer,
             limitations=manifest.limitations,
-            contributing_spans=spans,
+            trace=chain,
+            services_called=called,
         )
         return package, manifest

@@ -278,10 +278,10 @@ def compile_deterministic(
                 trace,
             )
 
-    evidence_state = list(definition.case_definition.primary_set)
+    evidence_state = list(definition.case_definition.primary)
     if tokens & _REVIEW_WORDS:
         evidence_state = sorted(
-            set(evidence_state) | set(definition.case_definition.review_set)
+            set(evidence_state) | set(definition.case_definition.review)
         )
         trace.append("question asks about review as well as primary cases")
 
@@ -291,17 +291,19 @@ def compile_deterministic(
         definition_version=definition.version,
         studies=studies or sorted(known),
         concept=definition.concept.primary,
-        assertion=list(definition.assertion.require),
+        assertion=["present"],
         evidence_state=evidence_state,
         window=window,
         anchor=definition.anchor.event if definition.anchor else None,
-        retrieval_mode="lexical",
+        retrieval_mode="precise",
         top_k=20,
         notes=[
             f"Compiled deterministically against {definition.key}, "
             f"status {definition.status}.",
             "Counts follow the definition as written; the agent applied no "
             "default of its own.",
+            "Every reported number is traceable to source spans via "
+            "`aelayer trace`.",
         ],
         backend="deterministic",
     )

@@ -219,15 +219,14 @@ class ValueExtractor:
         unit is far worse than a missing value.
         """
         rules = (self.labs_config.get("default_units") or {}).get(test_id) or []
-        for rule in rules:
-            low = rule.get("min")
-            high = rule.get("max")
-            if low is not None and value < low:
-                continue
-            if high is not None and value > high:
-                continue
-            return rule.get("unit")
-        return None
+        matches = [
+            rule.get("unit") for rule in rules
+            if (rule.get("min") is None or value >= rule["min"])
+            and (rule.get("max") is None or value <= rule["max"])
+        ]
+        # A magnitude that fits two units is ambiguous, and a wrong unit is far
+        # worse than a missing value.
+        return matches[0] if len(matches) == 1 else None
 
     def _unused_labs_from_lb(
         self,
