@@ -87,6 +87,24 @@ concepts:
     lexicon: [anaemia, anemia, low haemoglobin, low hemoglobin]
     abbreviations: []
 
+# How source records are grouped into episodes.
+#
+# The default rule is deterministic and it is wrong for recurrent conditions:
+# two hypoglycemia records three days apart are plausibly two episodes, not one.
+# So the rule is stated here, per concept `recurrence_expected` decides which
+# way the default falls, and anything ambiguous is flagged rather than resolved.
+episode_reconciliation:
+  gap_days: 1                  # records this close, or overlapping, are one episode
+  ambiguous_gap_days: 4        # beyond gap_days but this close: decided, and flagged
+  confidence:
+    explicit_continuation: 1.0     # the CRF says this record continues that one
+    temporal_overlap: 0.95         # intervals actually overlap
+    gap_within_tolerance: 0.85     # close enough, for a concept that does not recur
+    declared_convention: 0.9       # the study declares it splits on severity change
+    recurrence_split: 0.9          # kept apart because the concept recurs
+    model_proposed: 0.5            # proposed where deterministic evidence ran out
+    single_record: 1.0
+
 concept_groups:
   GLYCEMIC_EVENTS:
     label: Glycaemic events (illustrative narrow grouping)

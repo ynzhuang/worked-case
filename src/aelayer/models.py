@@ -348,11 +348,12 @@ class CanonicalAERecord(BaseModel):
 
 LinkageRule = Literal[
     "single_record",
-    "explicit_continuation",
-    "temporal_overlap",
-    "gap_within_tolerance",
-    "recurrence_split",
-    "model_proposed",
+    "explicit_continuation",      # the CRF declares this record continues that one
+    "declared_convention",        # the study declares it splits on severity change
+    "temporal_overlap",           # the intervals actually overlap
+    "gap_within_tolerance",       # close enough, for a concept that does not recur
+    "recurrence_split",           # kept apart because the concept recurs
+    "model_proposed",             # proposed where deterministic evidence ran out
 ]
 
 
@@ -406,6 +407,13 @@ class CanonicalAEEpisode(BaseModel):
     linkage_confidence: float = 1.0
     linkage_review_required: bool = False
     linkage_note: str = ""
+
+    #: Collection state per derived field, summarised across the chain. A rule
+    #: that fails on a field consults this to learn *why* it failed: a value
+    #: the study collected and that did not meet the bar is a different finding
+    #: from a value the study never collected.
+    field_states: dict[str, str] = _PydanticField(default_factory=dict)
+    field_notes: dict[str, str] = _PydanticField(default_factory=dict)
 
     episode_provenance: dict[str, Any] = _PydanticField(default_factory=dict)
 

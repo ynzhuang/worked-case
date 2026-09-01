@@ -27,11 +27,11 @@ from ..hashing import hash_file, hash_payload
 from ..models import (
     ACTION_TAKEN_VALUES,
     ASSERTION_VALUES,
+    COLLECTION_STATES,
     EVIDENCE_STATE_VALUES,
     OUTCOME_VALUES,
-    RECHALLENGE_VALUES,
     RELATEDNESS_VALUES,
-    SERIOUSNESS_VALUES,
+    SERIOUSNESS_CRITERIA,
     SEVERITY_VALUES,
     PhenotypeDefinition,
 )
@@ -46,17 +46,21 @@ LAB_OPS = ("<", "<=", ">", ">=", "==", "!=")
 #: definition that fails validation does not run.
 _ENUM_PREDICATES: dict[str, tuple[str, ...]] = {
     "assertion": ASSERTION_VALUES,
+    # Treatment action is a valid *attribute* to filter on, and deliberately
+    # not part of the shipped hypoglycemia definition: gating a case
+    # definition on what the site did to the dose imports a field the clinical
+    # question never referenced, and one some studies cannot even express.
     "action_taken": ACTION_TAKEN_VALUES,
-    "severity": SEVERITY_VALUES,
-    "seriousness": SERIOUSNESS_VALUES,
+    "peak_severity": SEVERITY_VALUES,
+    "seriousness_criteria": SERIOUSNESS_CRITERIA,
     "outcome": OUTCOME_VALUES,
     "relatedness": RELATEDNESS_VALUES,
-    "rechallenge": RECHALLENGE_VALUES,
 }
 _BOOL_PREDICATES = (
     "coded_term_matches_concept",
     "has_coded_term",
-    "rescue_treatment",
+    "seriousness",
+    "linkage_review_required",
 )
 _COMBINATORS = ("any", "all", "not")
 
@@ -108,6 +112,15 @@ def validate_condition(
             _check_enum_values(body.get("assertion"), ASSERTION_VALUES, path)
             continue
 
+        if key == "collection_state":
+            if not isinstance(body, dict) or "field" not in body:
+                raise DefinitionError(f"{path}: expected a mapping with `field`")
+            unknown = set(body) - {"field", "is"}
+            if unknown:
+                raise DefinitionError(f"{path}: unknown keys {sorted(unknown)}")
+            _check_enum_values(body.get("is"), COLLECTION_STATES, path)
+            continue
+
         if key == "lab":
             _validate_lab(body, catalog, path)
             continue
@@ -139,7 +152,8 @@ def _known_predicates() -> Iterable[str]:
         list(_COMBINATORS)
         + list(_BOOL_PREDICATES)
         + list(_ENUM_PREDICATES)
-        + ["lexicon_match", "lab", "symptoms", "onset_offset_days"]
+        + ["lexicon_match", "lab", "symptoms", "onset_offset_days",
+           "collection_state"]
     )
 
 
@@ -249,10 +263,15 @@ def load_definition(
             rule.when, catalog, where=f"{path.name}:evidence_rules.{rule.id}.when"
         )
 
+    if definition.operates_on != "episode":
+        raise DefinitionError(
+            f"{path}: definitions operate on episodes; got "
+            f"{definition.operates_on!r}"
+        )
     referenced = {r.state for r in definition.evidence_rules}
     declared = set(
-        definition.case_definition.primary_set
-        + definition.case_definition.review_set
+        definition.case_definition.primary
+        + definition.case_definition.review
         + definition.case_definition.excluded
     )
     undeclared = referenced - declared

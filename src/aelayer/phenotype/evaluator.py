@@ -1,44 +1,43 @@
-"""Evaluate a phenotype definition over event objects.
+"""Evaluate a phenotype definition over episodes.
 
-Input: a set of ``EventObject``s and one ``PhenotypeDefinition``.
-Output: one ``CaseAssignment`` per subject.
+Input: derived ``CanonicalAEEpisode`` objects and one ``PhenotypeDefinition``.
+Output: one ``CaseAssignment`` per episode, each naming the rule that decided it.
 
-The order of work for each event is fixed, and each step can only remove an
-event from consideration or refine its state:
+Three things this evaluator does that a naive one would not.
 
-1. **Assertion policy.**  Excluded classes drop out here.  A documented absence
-   becomes state ``absent`` rather than disappearing, because a count of
-   documented absences is a real number a reviewer will ask for.
-2. **Window.**  The offset is measured against the anchor the definition names,
-   under the index rule it names.  An unresolvable onset is routed by
-   ``on_unresolved_onset``; the extractor never made that decision.
-3. **Evidence rules.**  Ordered; the first match assigns the state.
-4. **Case definition.**  The state maps to a verdict, downgraded to ``review``
-   where step 1 or 2 routed it there.
+**It distinguishes a failed test from an untestable one.**  A glucose value the
+study measured and that came back at 90 mg/dL fails the ``supported`` rule on
+the evidence.  A study that never measured glucose fails it for want of
+evidence.  Those are different findings, and the definition's ``missingness``
+policy decides what happens to each — the evaluator never assumes the second is
+the first.
 
-Every assignment names the rule that decided it.  When a clinician disputes a
-case, that is the first question asked.
+**It refuses to read a blank as absence unless the definition says so.**  And
+the definition cannot say so for ``not_collected_by_protocol`` or
+``not_applicable_gated``; the loader rejects that.
+
+**It carries linkage uncertainty forward.**  An episode assembled under a rule
+the reconciler flagged is routed by ``episode.on_review_required`` rather than
+counted as though the linkage were certain.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Iterable
+import datetime as _dt
+from dataclasses import dataclass, field as _dc_field
+from typing import Any, Iterable, Sequence
 
 from ..anchors import AnchorResolver
 from ..catalog import ConceptCatalog
 from ..models import (
     EVIDENCE_STATE_RANK,
+    CanonicalAEEpisode,
     CaseAssignment,
-    EventObject,
     PhenotypeDefinition,
     Span,
 )
 
 _VERDICT_RANK = {"excluded": 0, "review": 1, "case": 2}
-
-#: Concept-match kinds that count as a verbatim mention in text.
-_MENTION_KINDS = {"lexicon", "lexicon_fuzzy", "abbreviation"}
 
 _LAB_OPS = {
     "<": lambda a, b: a < b,
@@ -51,25 +50,32 @@ _LAB_OPS = {
 
 
 @dataclass
-class EventVerdict:
-    """What the definition made of one event object."""
+class PredicateResult:
+    """The outcome of one predicate, and why it came out that way."""
 
-    event: EventObject
+    satisfied: bool
+    explanation: str
+    spans: list[Span] = _dc_field(default_factory=list)
+    #: Set when the predicate could not be evaluated on the evidence available,
+    #: as opposed to being evaluated and failing.
+    unresolved_field: str | None = None
+    unresolved_state: str | None = None
+
+
+@dataclass
+class EpisodeVerdict:
+    episode: CanonicalAEEpisode
     state: str
-    route: str          # normal | review | excluded
-    verdict: str        # case | review | excluded
+    verdict: str
+    route: str
     rule_id: str | None
     reason: str
+    review_reasons: list[str] = _dc_field(default_factory=list)
+    spans: list[Span] = _dc_field(default_factory=list)
     offset_days: int | None = None
-    spans: list[Span] = field(default_factory=list)
 
     @property
-    def verdict_key(self) -> tuple[int, int]:
-        """Sort key for picking a subject's strongest event.
-
-        Verdict dominates, then evidence state, so a `case` on `supported`
-        outranks a `review` on `explicit`.
-        """
+    def rank(self) -> tuple[int, int]:
         return (_VERDICT_RANK[self.verdict], EVIDENCE_STATE_RANK[self.state])
 
 
@@ -86,427 +92,491 @@ class PhenotypeEvaluator:
         self.concept_ids = self._concept_ids()
 
     def _concept_ids(self) -> set[str]:
-        """Which concepts this definition considers.
-
-        A group is an explicit membership list from the catalogue.  Nothing is
-        inferred by walking a hierarchy.
-        """
+        """Concepts in scope, by explicit catalogue membership only."""
         ids = {self.definition.concept.primary}
         if self.definition.concept.group:
             ids.update(self.catalog.expand_group(self.definition.concept.group))
         return ids
 
-    # -- per event ----------------------------------------------------------
+    # -- concept identity ---------------------------------------------------
 
-    def evaluate_event(self, event: EventObject) -> EventVerdict:
-        policy = self.definition.assertion
+    def concept_terms(self, episode: CanonicalAEEpisode) -> set[str]:
+        """Coded terms that count as this concept for this episode.
 
-        if event.assertion in policy.exclude:
-            state = "absent" if event.assertion == "absent" else "none"
-            return self._verdict(
-                event, state, "excluded", "assertion.exclude",
-                f"assertion '{event.assertion}' is excluded by the definition's "
-                f"assertion policy",
+        With ``bridge_dictionary_versions`` the union across versions applies,
+        so a study coded under an earlier dictionary still matches.  Without
+        it, only the terms that episode's own dictionary version carried are
+        eligible — which is how you measure what bridging is worth.
+        """
+        concept = self.catalog.concept(self.definition.concept.primary)
+        if self.definition.concept.bridge_dictionary_versions:
+            terms = set(concept.all_coded_terms())
+        else:
+            terms = set()
+            for version in episode.dictionary_versions or [None]:
+                terms.update(concept.coded_terms_for_version(version))
+        return {t.strip().casefold() for t in terms}
+
+    # -- window -------------------------------------------------------------
+
+    def resolve_offset(
+        self, episode: CanonicalAEEpisode
+    ) -> tuple[int | None, bool, str]:
+        anchor = self.definition.anchor
+        if anchor is None:
+            return None, True, "no anchor required"
+        start = episode.episode_start.value
+        if start is None:
+            return None, False, (
+                f"episode start is {episode.episode_start.collection_state}, so "
+                f"the window cannot be evaluated"
             )
+        if self.resolver is None:
+            return None, False, "no exposure data available to resolve the anchor"
+        hit = self.resolver.resolve(
+            episode.subject_id, anchor.event,
+            index_rule=anchor.index_rule, onset_date=start.date(),
+        )
+        if hit is None:
+            return None, False, (
+                f"no {anchor.event} occurrence in {anchor.source_domain} for "
+                f"this subject"
+            )
+        return (start.date() - hit.date).days, True, (
+            f"episode start {start.date().isoformat()} against {anchor.event} "
+            f"on {hit.date.isoformat()} ({anchor.index_rule})"
+        )
 
+    # -- per episode --------------------------------------------------------
+
+    def evaluate_episode(self, episode: CanonicalAEEpisode) -> EpisodeVerdict:
         route = "normal"
-        routing_reason = ""
-        if event.assertion in policy.route_to_review:
-            route = "review"
-            routing_reason = (
-                f"assertion '{event.assertion}' is routed to review by the "
-                f"definition's assertion policy"
-            )
-        elif event.assertion not in policy.require:
+        review_reasons: list[str] = []
+
+        # A discovery candidate has not been adjudicated and may not enter a
+        # cohort on its own. It is surfaced, never counted.
+        if episode.candidate:
             return self._verdict(
-                event, "none", "excluded", "assertion.require",
-                f"assertion '{event.assertion}' is not in the required set "
-                f"{policy.require}",
+                episode, "none", "excluded", "candidate",
+                "the episode is an unadjudicated discovery candidate and "
+                "cannot enter a cohort without adjudication or a new "
+                "definition version",
+                review_reasons,
+            )
+
+        if episode.standardized_concept not in self.concept_ids:
+            # Not this definition's concept at all. Only an episode whose
+            # concept could not be standardized is worth flagging.
+            if episode.standardized_concept is None and episode.verbatim_terms:
+                review_reasons.append(
+                    "the episode has no standardized concept, so it could not "
+                    "be tested against this definition"
+                )
+            return self._verdict(
+                episode, "none", "excluded", "concept",
+                f"episode concept {episode.standardized_concept!r} is not "
+                f"{sorted(self.concept_ids)}",
+                review_reasons,
+            )
+
+        # Linkage uncertainty travels with the episode.
+        policy = self.definition.episode
+        if episode.linkage_review_required:
+            route = "review"
+            review_reasons.append(
+                f"episode linkage was flagged for review: {episode.linkage_note}"
+            )
+        elif episode.linkage_confidence < policy.require_linkage_confidence:
+            route = "review"
+            review_reasons.append(
+                f"linkage confidence {episode.linkage_confidence:.2f} is below "
+                f"the definition's threshold "
+                f"{policy.require_linkage_confidence:.2f} "
+                f"(rule: {episode.linkage_rule})"
             )
 
         offset = None
         if self.definition.window is not None:
-            offset, resolved, detail = self.resolve_offset(event)
+            offset, resolved, detail = self.resolve_offset(episode)
             if not resolved:
                 action = self.definition.window.on_unresolved_onset
                 if action == "exclude":
                     return self._verdict(
-                        event, "none", "excluded", "window.on_unresolved_onset",
+                        episode, "none", "excluded", "window.on_unresolved_onset",
                         f"onset could not be resolved ({detail}); the definition "
-                        f"excludes unresolved onsets",
+                        f"excludes unresolved onsets", review_reasons,
                     )
                 if action == "review":
                     route = "review"
-                    routing_reason = (
+                    review_reasons.append(
                         f"onset could not be resolved ({detail}); the definition "
                         f"routes unresolved onsets to review"
                     )
             elif not self.definition.window.contains(offset):
                 return self._verdict(
-                    event, "none", "excluded", "window",
+                    episode, "none", "excluded", "window",
                     f"onset {offset} days from {self.definition.anchor.event} is "
-                    f"outside the window "
-                    f"[{self.definition.window.min}, {self.definition.window.max}]",
-                    offset=offset,
+                    f"outside [{self.definition.window.min}, "
+                    f"{self.definition.window.max}]",
+                    review_reasons, offset=offset,
                 )
 
         for rule in self.definition.evidence_rules:
-            matched, spans, explanation = self._match(rule.when, event)
-            if matched:
+            result = self._match(rule.when, episode)
+            if result.satisfied:
                 reason = (
-                    f"rule '{rule.id}' assigned state '{rule.state}' because "
-                    f"{explanation}"
+                    f"rule {rule.id!r} assigned state {rule.state!r} because "
+                    f"{result.explanation}"
                 )
-                if routing_reason:
-                    reason = f"{reason}; routed to review because {routing_reason}"
                 return self._verdict(
-                    event, rule.state, route, rule.id, reason, offset=offset, spans=spans
+                    episode, rule.state, None, rule.id, reason, review_reasons,
+                    offset=offset, spans=result.spans, route=route,
                 )
+            # A rule that could not be evaluated for want of evidence is
+            # reported as such, and routed if the definition says so.
+            if result.unresolved_field and result.unresolved_state:
+                if result.unresolved_state in self.definition.missingness.route_to_review:
+                    route = "review"
+                    review_reasons.append(
+                        f"rule {rule.id!r} could not be evaluated: "
+                        f"{result.unresolved_field} is "
+                        f"{result.unresolved_state} — {result.explanation}"
+                    )
 
-        reason = "no evidence rule matched this event"
-        if routing_reason:
-            reason = f"{reason}; {routing_reason}"
-        return self._verdict(event, "none", route, None, reason, offset=offset)
-
-    def _verdict(self, event, state, route, rule_id, reason, offset=None, spans=None):
-        """Map an evidence state and a routing decision onto a verdict.
-
-        Routing is more specific than the state-to-verdict mapping and wins
-        over it.  When a definition says ``route_to_review: [uncertain]`` it is
-        asking for those events to reach a human, and that is true whether or
-        not an evidence rule also fired: an uncertain mention with no
-        corroboration is precisely what adjudication exists for.  The remainder
-        is then reported as a separate count rather than discarded.
-        """
-        resolved = self.definition.case_definition.verdict_for(state)
-        if route == "excluded":
-            resolved = "excluded"
-        elif route == "review":
-            resolved = "review"
-        # The reason always names the deciding rule, including the policy
-        # pseudo-rules (`assertion.exclude`, `window`, ...). When a clinician
-        # disputes a verdict, the first question is which rule fired, and the
-        # answer has to be in the row rather than inferred from a nearby field.
-        if rule_id and f"'{rule_id}'" not in reason:
-            reason = f"rule '{rule_id}': {reason}"
-        return EventVerdict(
-            event=event, state=state, route=route, verdict=resolved,
-            rule_id=rule_id, reason=reason, offset_days=offset,
-            spans=list(spans or []),
+        reason = "no evidence rule matched this episode"
+        return self._verdict(
+            episode, "none", None, None, reason, review_reasons,
+            offset=offset, route=route,
         )
 
-    # -- window -------------------------------------------------------------
+    def _verdict(
+        self, episode, state, forced_verdict, rule_id, reason, review_reasons,
+        offset=None, spans=None, route="normal",
+    ) -> EpisodeVerdict:
+        """Map a state and a routing decision onto a verdict.
 
-    def resolve_offset(self, event: EventObject) -> tuple[int | None, bool, str]:
-        """Days from the definition's anchor to the event's onset.
-
-        Recomputed from the onset date wherever one exists, because the
-        definition's own ``index_rule`` decides which anchor occurrence counts
-        and that may differ from the convention the extractor used.
+        Routing is more specific than the state-to-verdict mapping and wins over
+        it: when a definition routes something to review it is asking for a
+        human, and that is true whether or not a rule also fired.
         """
-        anchor = self.definition.anchor
-        if anchor is None:
-            return None, True, "no anchor required"
-
-        if event.onset_date is not None and self.resolver is not None:
-            hit = self.resolver.resolve(
-                event.subject_id, anchor.event,
-                index_rule=anchor.index_rule, onset_date=event.onset_date,
-            )
-            if hit is not None:
-                return (event.onset_date - hit.date).days, True, (
-                    f"onset {event.onset_date.isoformat()} against {anchor.event} "
-                    f"on {hit.date.isoformat()} ({anchor.index_rule})"
-                )
-            return None, False, (
-                f"no {anchor.event} occurrence found in {anchor.source_domain} "
-                f"for this subject"
-            )
-
-        if event.onset_offset_days is not None and event.anchor_event == anchor.event:
-            return event.onset_offset_days, True, (
-                f"offset carried on the event object, anchored to {anchor.event}"
-            )
-
-        if event.onset_offset_days is not None:
-            return None, False, (
-                f"offset is relative to '{event.anchor_event}', not the "
-                f"definition's anchor '{anchor.event}'"
-            )
-        return None, False, "no onset date and no resolvable offset"
+        if forced_verdict is not None:
+            verdict = forced_verdict
+        else:
+            verdict = self.definition.case_definition.verdict_for(state)
+            if route == "review":
+                verdict = "review"
+        if rule_id and f"{rule_id!r}" not in reason:
+            reason = f"rule {rule_id!r}: {reason}"
+        if review_reasons and verdict == "review":
+            reason = f"{reason}; routed to review because {review_reasons[0]}"
+        return EpisodeVerdict(
+            episode=episode, state=state, verdict=verdict, route=route,
+            rule_id=rule_id, reason=reason, review_reasons=list(review_reasons),
+            spans=list(spans or []), offset_days=offset,
+        )
 
     # -- rule language ------------------------------------------------------
 
-    def _match(
-        self, condition: Any, event: EventObject
-    ) -> tuple[bool, list[Span], str]:
-        """Evaluate a ``when`` block, returning the spans that satisfied it."""
+    def _match(self, condition: Any, episode: CanonicalAEEpisode) -> PredicateResult:
         if isinstance(condition, list):
             spans: list[Span] = []
             parts: list[str] = []
             for item in condition:
-                ok, item_spans, explanation = self._match(item, event)
-                if not ok:
-                    return False, [], explanation
-                spans.extend(item_spans)
-                parts.append(explanation)
-            return True, spans, " and ".join(parts)
+                result = self._match(item, episode)
+                if not result.satisfied:
+                    return result
+                spans.extend(result.spans)
+                parts.append(result.explanation)
+            return PredicateResult(True, " and ".join(parts), spans)
 
-        results: list[tuple[bool, list[Span], str]] = []
-        for key, body in condition.items():
-            results.append(self._match_predicate(key, body, event))
-        for ok, _spans, explanation in results:
-            if not ok:
-                return False, [], explanation
-        spans = [s for _ok, item_spans, _e in results for s in item_spans]
-        return True, spans, " and ".join(e for _o, _s, e in results)
-
-    def _match_predicate(
-        self, key: str, body: Any, event: EventObject
-    ) -> tuple[bool, list[Span], str]:
-        if key == "all":
-            return self._match(body, event)
-        if key == "any":
-            failures = []
-            for item in body:
-                ok, spans, explanation = self._match(item, event)
-                if ok:
-                    return True, spans, explanation
-                failures.append(explanation)
-            return False, [], f"none of ({'; '.join(failures)})"
-        if key == "not":
-            ok, _spans, explanation = self._match(body, event)
-            return (not ok), [], f"not ({explanation})"
-
-        if key == "coded_term_matches_concept":
-            matches = "coded_term" in event.concept_match_kinds
-            spans = event.spans_for("coded_term") if matches else []
-            described = (
-                f"the coded term {event.coded_term!r} is a catalogue term for "
-                f"{event.concept_id}"
-                if matches
-                else f"the coded term {event.coded_term!r} is not a catalogue "
-                     f"term for {event.concept_id}"
-            )
-            return (matches is bool(body)), spans, described
-
-        if key == "has_coded_term":
-            present = event.coded_term is not None
-            return (present is bool(body)), event.spans_for("coded_term"), (
-                f"coded term {'present' if present else 'absent'}"
-            )
-
-        if key == "lexicon_match":
-            wanted = body.get("assertion")
-            wanted_list = (
-                [wanted] if isinstance(wanted, str) else list(wanted or [])
-            )
-            has_mention = bool(set(event.concept_match_kinds) & _MENTION_KINDS)
-            assertion_ok = not wanted_list or event.assertion in wanted_list
-            ok = has_mention and assertion_ok
-            spans = event.spans_for("concept_id") if ok else []
-            if not has_mention:
-                described = "there is no verbatim mention of the concept in text"
-            elif not assertion_ok:
-                described = (
-                    f"the mention's assertion is '{event.assertion}', not "
-                    f"{wanted_list}"
-                )
-            else:
-                described = (
-                    f"a verbatim mention of the concept is asserted "
-                    f"'{event.assertion}'"
-                )
-            return ok, spans, described
-
-        if key == "lab":
-            return self._match_lab(body, event)
-
-        if key == "symptoms":
-            return self._match_symptoms(body, event)
-
-        if key == "onset_offset_days":
-            offset = event.onset_offset_days
-            if offset is None:
-                return False, [], "no onset offset on the event"
-            low, high = body.get("min"), body.get("max")
-            ok = (low is None or offset >= low) and (high is None or offset <= high)
-            return ok, event.spans_for("onset_offset_days"), (
-                f"onset offset {offset} days is "
-                f"{'within' if ok else 'outside'} [{low}, {high}]"
-            )
-
-        if key == "rescue_treatment":
-            ok = event.rescue_treatment is bool(body)
-            return ok, event.spans_for("rescue_treatment"), (
-                f"rescue treatment {'was' if event.rescue_treatment else 'was not'} given"
-            )
-
-        # Remaining enumerated fields: membership in a list of allowed values.
-        value = getattr(event, key, None)
-        allowed = body if isinstance(body, list) else [body]
-        if isinstance(value, list):
-            hit = sorted(set(value) & set(allowed))
-            return bool(hit), event.spans_for(key), (
-                f"{key} includes {hit}" if hit else f"{key} {value} does not include any of {allowed}"
-            )
-        ok = value in allowed
-        return ok, event.spans_for(key), (
-            f"{key} is {value!r}" + ("" if ok else f", not one of {allowed}")
+        results = [
+            self._predicate(key, body, episode) for key, body in condition.items()
+        ]
+        for result in results:
+            if not result.satisfied:
+                return result
+        return PredicateResult(
+            True,
+            " and ".join(r.explanation for r in results),
+            [s for r in results for s in r.spans],
         )
 
-    def _match_lab(self, body: dict, event: EventObject) -> tuple[bool, list[Span], str]:
-        test_id = body["test"]
+    def _predicate(
+        self, key: str, body: Any, episode: CanonicalAEEpisode
+    ) -> PredicateResult:
+        if key == "all":
+            return self._match(body, episode)
+        if key == "any":
+            failures = []
+            unresolved = None
+            for item in body:
+                result = self._match(item, episode)
+                if result.satisfied:
+                    return result
+                failures.append(result.explanation)
+                unresolved = unresolved or result
+            return PredicateResult(
+                False, f"none of ({'; '.join(failures)})",
+                unresolved_field=unresolved.unresolved_field if unresolved else None,
+                unresolved_state=unresolved.unresolved_state if unresolved else None,
+            )
+        if key == "not":
+            result = self._match(body, episode)
+            return PredicateResult(not result.satisfied, f"not ({result.explanation})")
+
+        if key == "coded_term_matches_concept":
+            return self._coded_term(body, episode)
+        if key == "has_coded_term":
+            present = bool(episode.coded_terms)
+            return self._stateful(
+                episode, "coded_term", present is bool(body),
+                f"coded term {'present' if present else 'absent'}",
+            )
+        if key == "lab":
+            return self._lab(body, episode)
+        if key == "symptoms":
+            return self._symptoms(body, episode)
+        if key == "onset_offset_days":
+            return self._onset(body, episode)
+        if key == "collection_state":
+            return self._collection_state(body, episode)
+        if key == "linkage_review_required":
+            value = episode.linkage_review_required
+            return PredicateResult(
+                value is bool(body),
+                f"linkage review {'is' if value else 'is not'} required",
+            )
+        if key == "seriousness":
+            field = episode.seriousness
+            return self._stateful(
+                episode, "seriousness", field.value is bool(body),
+                f"seriousness is {field.value!r}",
+            )
+        if key == "peak_severity":
+            allowed = body if isinstance(body, list) else [body]
+            peak = episode.peak_severity
+            return self._stateful(
+                episode, "severity", peak in allowed,
+                f"peak severity is {peak!r}"
+                + ("" if peak in allowed else f", not one of {allowed}"),
+            )
+        if key == "seriousness_criteria":
+            allowed = set(body if isinstance(body, list) else [body])
+            present = {c for _when, cs in episode.seriousness_trajectory for c in cs}
+            hit = sorted(present & allowed)
+            return self._stateful(
+                episode, "seriousness", bool(hit),
+                f"seriousness criteria {sorted(present)} "
+                f"{'include' if hit else 'do not include'} {sorted(allowed)}",
+            )
+
+        # Remaining enumerated attributes, read off the episode's Field.
+        field = episode.field_for(key)
+        if field is None:
+            return PredicateResult(False, f"episode has no field {key!r}")
+        allowed = body if isinstance(body, list) else [body]
+        return self._stateful(
+            episode, key, field.value in allowed,
+            f"{key} is {field.value!r}"
+            + ("" if field.value in allowed else f", not one of {allowed}"),
+        )
+
+    def _stateful(
+        self, episode: CanonicalAEEpisode, field_name: str, satisfied: bool,
+        explanation: str,
+    ) -> PredicateResult:
+        """Attach the field's collection state to a failed predicate.
+
+        A predicate that failed on collected evidence is a finding.  One that
+        failed because the study never collected the field is not, and the
+        difference has to reach the definition's missingness policy intact.
+        """
+        if satisfied:
+            return PredicateResult(True, explanation, self._spans_for(episode, field_name))
+        state = episode.field_states.get(field_name, "unknown")
+        if state == "collected":
+            return PredicateResult(False, explanation)
+        note = episode.field_notes.get(field_name)
+        detail = (
+            f"{explanation}; {field_name} is {state}"
+            + (f" ({note})" if note else "")
+            + (
+                "" if state in self.definition.missingness.treat_as_absent
+                else ", which is not evidence of absence"
+            )
+        )
+        return PredicateResult(
+            False, detail, unresolved_field=field_name, unresolved_state=state,
+        )
+
+    @staticmethod
+    def _spans_for(episode: CanonicalAEEpisode, field_name: str) -> list[Span]:
+        return [s for s in episode.linked_evidence if s.field == field_name]
+
+    def _coded_term(self, body: Any, episode: CanonicalAEEpisode) -> PredicateResult:
+        eligible = self.concept_terms(episode)
+        found = sorted(
+            t for t in episode.coded_terms if t.strip().casefold() in eligible
+        )
+        matched = bool(found)
+        bridged = self.definition.concept.bridge_dictionary_versions
+        explanation = (
+            f"coded term {found} is a catalogue term for "
+            f"{self.definition.concept.primary}"
+            if matched else
+            f"coded terms {episode.coded_terms} are not catalogue terms for "
+            f"{self.definition.concept.primary}"
+            + ("" if bridged else " under this episode's dictionary version")
+        )
+        return self._stateful(
+            episode, "coded_term", matched is bool(body), explanation
+        )
+
+    def _lab(self, body: dict, episode: CanonicalAEEpisode) -> PredicateResult:
+        test = body["test"]
         operator = _LAB_OPS[body["op"]]
         threshold = float(body["value"])
         unit = body.get("unit")
-        lab_test = self.catalog.lab_tests.get(test_id)
+        lab_test = self.catalog.lab_tests.get(test)
 
-        # The threshold is expressed in some unit; convert it once into the
-        # catalogue's canonical unit and compare canonical to canonical. This is
-        # the whole reason unit conversion exists: a study reporting mmol/L must
-        # not be silently misclassified against a mg/dL threshold.
+        # The threshold is converted into canonical units once, so a study
+        # reporting mmol/L is compared like for like rather than misread.
         if unit and lab_test is not None:
             converted = lab_test.to_canonical(threshold, unit)
             if converted is None:
-                return False, [], (
-                    f"threshold unit {unit!r} has no conversion for {test_id}"
+                return PredicateResult(
+                    False, f"threshold unit {unit!r} has no conversion for {test}"
                 )
             threshold = converted
-        for lab in event.labs:
-            if lab.test != test_id or lab.canonical_value is None:
-                continue
+
+        values = [l for l in episode.labs if l.test == test and l.canonical_value is not None]
+        for lab in values:
             if operator(lab.canonical_value, threshold):
                 canonical_unit = lab_test.canonical_unit if lab_test else ""
-                return True, [lab.span], (
-                    f"{test_id} {lab.value} {lab.unit} "
-                    f"(= {lab.canonical_value} {canonical_unit}) "
-                    f"{body['op']} {threshold} {canonical_unit}"
+                return PredicateResult(
+                    True,
+                    f"{test} {lab.value} {lab.unit} (= {lab.canonical_value} "
+                    f"{canonical_unit}) {body['op']} {threshold} {canonical_unit}",
+                    [lab.span],
                 )
-        if not any(lab.test == test_id for lab in event.labs):
-            return False, [], f"no {test_id} value on the event"
-        return False, [], (
-            f"no {test_id} value satisfies {body['op']} {body['value']} "
-            f"{unit or ''}".strip()
+        if values:
+            # Measured, and it did not meet the bar. That is a finding.
+            return PredicateResult(
+                False,
+                f"{test} values {[l.canonical_value for l in values]} do not "
+                f"satisfy {body['op']} {threshold}",
+            )
+        return self._stateful(
+            episode, f"labs.{test}", False,
+            f"no {test} value is available for this episode",
         )
 
-    def _match_symptoms(
-        self, body: dict, event: EventObject
-    ) -> tuple[bool, list[Span], str]:
-        min_count = int(body.get("min_count", 1))
+    def _symptoms(self, body: dict, episode: CanonicalAEEpisode) -> PredicateResult:
+        minimum = int(body.get("min_count", 1))
         if "from" in body:
             qualifying = self.catalog.symptoms_in_sets(list(body["from"]))
             label = f"symptom sets {sorted(body['from'])}"
         else:
             qualifying = set(body.get("any_of") or [])
             label = f"symptoms {sorted(qualifying)}"
-        matched = [s for s in event.symptoms if s.symptom in qualifying]
+        matched = [
+            s for s in episode.symptoms
+            if s.symptom in qualifying and s.assertion == "present"
+        ]
         names = sorted({s.symptom for s in matched})
-        ok = len(names) >= min_count
-        return ok, [s.span for s in matched] if ok else [], (
-            f"{len(names)} qualifying symptom(s) from {label}"
-            + (f": {names}" if names else "")
+        if len(names) >= minimum:
+            return PredicateResult(
+                True,
+                f"{len(names)} qualifying symptom(s) from {label}: {names}",
+                [s.span for s in matched],
+            )
+        return self._stateful(
+            episode, "symptoms", False,
+            f"{len(names)} qualifying symptom(s) from {label}, fewer than "
+            f"the {minimum} required",
         )
 
-    # -- subject level ------------------------------------------------------
+    def _onset(self, body: dict, episode: CanonicalAEEpisode) -> PredicateResult:
+        offset, resolved, detail = self.resolve_offset(episode)
+        if not resolved or offset is None:
+            return PredicateResult(
+                False, f"onset offset is unresolved: {detail}",
+                unresolved_field="onset_datetime",
+                unresolved_state=episode.episode_start.collection_state,
+            )
+        low, high = body.get("min"), body.get("max")
+        ok = (low is None or offset >= low) and (high is None or offset <= high)
+        return PredicateResult(
+            ok, f"onset offset {offset} days is "
+                f"{'within' if ok else 'outside'} [{low}, {high}]",
+        )
+
+    def _collection_state(
+        self, body: dict, episode: CanonicalAEEpisode
+    ) -> PredicateResult:
+        """Query the collection state of a field directly.
+
+        Lets a definition say, explicitly, what it wants done about a field the
+        study could not record — rather than leaving it to a blanket rule.
+        """
+        field_name = body["field"]
+        wanted = body.get("is")
+        wanted_list = [wanted] if isinstance(wanted, str) else list(wanted or [])
+        state = episode.field_states.get(field_name, "unknown")
+        ok = state in wanted_list if wanted_list else True
+        return PredicateResult(
+            ok, f"collection state of {field_name} is {state!r}"
+                + ("" if ok else f", not one of {wanted_list}"),
+        )
+
+    # -- cohort -------------------------------------------------------------
 
     def evaluate(
-        self,
-        events: Iterable[EventObject],
-        subjects: Iterable[tuple[str, str]] | None = None,
+        self, episodes: Iterable[CanonicalAEEpisode]
     ) -> list[CaseAssignment]:
-        """One assignment per subject.
-
-        ``subjects`` is the full cohort as ``(subject_id, study_id)`` pairs.
-        Supplying it matters: a subject with no qualifying event object is still
-        part of the denominator and still gets a row saying so.
-        """
-        by_subject: dict[str, list[EventObject]] = {}
-        study_of: dict[str, str] = {}
-        for event in events:
-            if event.concept_id not in self.concept_ids:
-                continue
-            by_subject.setdefault(event.subject_id, []).append(event)
-            study_of.setdefault(event.subject_id, event.study_id)
-
-        cohort: dict[str, str] = {}
-        if subjects is not None:
-            cohort.update({s: study for s, study in subjects})
-        cohort.update(
-            {s: study_of[s] for s in by_subject if s not in cohort}
-        )
-
+        """One assignment per episode, in a stable order."""
         assignments: list[CaseAssignment] = []
-        for subject_id in sorted(cohort):
-            subject_events = sorted(
-                by_subject.get(subject_id, []), key=lambda e: e.event_id
-            )
+        for episode in sorted(episodes, key=lambda e: e.episode_id):
+            verdict = self.evaluate_episode(episode)
             assignments.append(
-                self._assign(subject_id, cohort[subject_id], subject_events)
+                CaseAssignment(
+                    episode_id=episode.episode_id,
+                    subject_id=episode.subject_id,
+                    study_id=episode.study_id,
+                    verdict=verdict.verdict,  # type: ignore[arg-type]
+                    evidence_state=verdict.state,  # type: ignore[arg-type]
+                    matched_rule_id=verdict.rule_id,
+                    reason=verdict.reason,
+                    source_record_ids=list(episode.source_record_ids),
+                    evidence_spans=sorted(
+                        verdict.spans, key=lambda s: (s.field, s.doc_id, s.start)
+                    ),
+                    definition_id=self.definition.id,
+                    definition_version=self.definition.version,
+                    definition_hash=self.definition.definition_hash,
+                    linkage_review_required=episode.linkage_review_required,
+                    review_reasons=verdict.review_reasons,
+                )
             )
         return assignments
 
-    def _assign(
-        self, subject_id: str, study_id: str, events: list[EventObject]
-    ) -> CaseAssignment:
-        definition = self.definition
-        if not events:
-            return CaseAssignment(
-                subject_id=subject_id,
-                study_id=study_id,
-                verdict="excluded",
-                evidence_state="none",
-                matched_rule_id=None,
-                reason=(
-                    f"no event object for concept "
-                    f"{sorted(self.concept_ids)} on this subject"
-                ),
-                contributing_event_ids=[],
-                evidence_spans=[],
-                definition_id=definition.id,
-                definition_version=definition.version,
-                definition_hash=definition.definition_hash,
-            )
-
-        verdicts = [self.evaluate_event(event) for event in events]
-        best = max(verdicts, key=lambda v: (v.verdict_key, v.event.event_id))
-        # Every event that reached the same state contributes, so the row shows
-        # the full basis rather than a single arbitrary record.
-        contributing = [
-            v for v in verdicts
-            if v.verdict == best.verdict and v.state == best.state
-        ]
-        spans = [span for v in contributing for span in v.spans]
-        seen: set[tuple] = set()
-        unique_spans = []
-        for span in spans:
-            if span.key() not in seen:
-                seen.add(span.key())
-                unique_spans.append(span)
-
-        return CaseAssignment(
-            subject_id=subject_id,
-            study_id=study_id,
-            verdict=best.verdict,  # type: ignore[arg-type]
-            evidence_state=best.state,  # type: ignore[arg-type]
-            matched_rule_id=best.rule_id,
-            reason=best.reason,
-            contributing_event_ids=sorted(v.event.event_id for v in contributing),
-            evidence_spans=sorted(
-                unique_spans, key=lambda s: (s.field, s.doc_id, s.start, s.end)
-            ),
-            definition_id=definition.id,
-            definition_version=definition.version,
-            definition_hash=definition.definition_hash,
-        )
+    def evaluate_subjects(
+        self, episodes: Iterable[CanonicalAEEpisode]
+    ) -> dict[str, str]:
+        """Subject-level verdict: the strongest verdict across their episodes."""
+        best: dict[str, tuple[int, str]] = {}
+        for assignment in self.evaluate(episodes):
+            rank = _VERDICT_RANK[assignment.verdict]
+            current = best.get(assignment.subject_id)
+            if current is None or rank > current[0]:
+                best[assignment.subject_id] = (rank, assignment.verdict)
+        return {subject: verdict for subject, (_r, verdict) in sorted(best.items())}
 
 
 def evaluate_definition(
-    events: Iterable[EventObject],
+    episodes: Iterable[CanonicalAEEpisode],
     definition: PhenotypeDefinition,
     catalog: ConceptCatalog,
     anchor_resolver: AnchorResolver | None = None,
-    subjects: Iterable[tuple[str, str]] | None = None,
 ) -> list[CaseAssignment]:
-    evaluator = PhenotypeEvaluator(definition, catalog, anchor_resolver)
-    return evaluator.evaluate(events, subjects)
+    return PhenotypeEvaluator(definition, catalog, anchor_resolver).evaluate(episodes)

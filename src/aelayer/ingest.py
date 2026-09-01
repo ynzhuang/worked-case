@@ -29,11 +29,11 @@ from . import paths
 from .anchors import AnchorResolver, parse_date
 from .hashing import snapshot_id as compute_snapshot_id
 
-TABLES = ("dm", "ae", "ex", "lb", "cm")
+TABLES = ("dm", "ae", "ex", "lb", "linked_hypo_event")
 
 #: Columns whose values are numeric when present.  Kept narrow on purpose: SDTM
 #: character columns stay characters.
-_NUMERIC_COLUMNS = {"EXDOSE", "LBSTRESN", "AESEQ", "EXSEQ", "LBSEQ", "CMSEQ", "AGE"}
+_NUMERIC_COLUMNS = {"EXDOSE", "LBSTRESN", "AESEQ", "EXSEQ", "LBSEQ", "AGE", "GLUCVAL"}
 
 
 class IngestError(RuntimeError):
@@ -115,19 +115,41 @@ class TrialStore:
         """AE records in a stable order, paired with their narrative."""
         for row in sorted(
             self.rows("ae"),
-            key=lambda r: (str(r.get("STUDYID")), str(r.get("USUBJID")), int(r.get("AESEQ") or 0)),
+            key=lambda r: (str(r.get("STUDYID")), str(r.get("USUBJID")),
+                           int(r.get("AESEQ") or 0)),
         ):
             yield row, self.narratives.get(str(row.get("DOCID") or ""))
 
-    def gold(self) -> list[dict[str, Any]]:
-        """Ground truth. Only the evaluation harness may call this."""
-        path = self.root / "gold.jsonl"
-        if not path.exists():
-            return []
-        return [json.loads(line) for line in _iter_lines(path)]
+    def linked_rows(self, source_record_id: str) -> list[dict[str, Any]]:
+        return [
+            row for row in self.rows("linked_hypo_event")
+            if str(row.get("AESPID")) == source_record_id
+        ]
 
-    def gold_by_doc(self) -> dict[str, dict[str, Any]]:
-        return {g["doc_id"]: g for g in self.gold()}
+    # -- ground truth -------------------------------------------------------
+    #
+    # Reached only through these accessors, and only by the evaluation harness.
+    # Nothing in normalization, extraction, reconciliation or evaluation may
+    # touch them: an answer key readable from the pipeline is not an answer key.
+
+    def _jsonl(self, name: str) -> list[dict[str, Any]]:
+        path = self.root / name
+        return [json.loads(line) for line in _iter_lines(path)] if path.exists() else []
+
+    def gold_records(self) -> list[dict[str, Any]]:
+        """True field values and collection states, one entry per source record."""
+        return self._jsonl("gold_records.jsonl")
+
+    def gold_episodes(self) -> list[dict[str, Any]]:
+        """True episode boundaries and phenotype classification."""
+        return self._jsonl("gold_episodes.jsonl")
+
+    def truths(self) -> list[dict[str, Any]]:
+        """The sampled ground truth, before any study wrote it down."""
+        return self._jsonl("truths.jsonl")
+
+    def gold_records_by_id(self) -> dict[str, dict[str, Any]]:
+        return {g["source_record_id"]: g for g in self.gold_records()}
 
     def study_conventions(self, study_id: str) -> dict[str, Any]:
         return (self.manifest.get("studies") or {}).get(study_id, {})
@@ -141,7 +163,7 @@ class TrialStore:
             "narratives": len(self.narratives),
             "lb_records": len(self.rows("lb")),
             "ex_records": len(self.rows("ex")),
-            "cm_records": len(self.rows("cm")),
+            "linked_form_records": len(self.rows("linked_hypo_event")),
         }
 
 
@@ -217,6 +239,8 @@ def load_store(data_dir: str | Path | None = None) -> TrialStore:
     # labels: gold is evaluation scaffolding, not input data, and including it
     # would make a run id change when only the answer key changed.
     inputs = [root / f"{n}.csv" for n in TABLES] + [narrative_path, manifest_path]
+    # The answer key is evaluation scaffolding, not input data: a run id must
+    # not change when only the answer key changes.
     payload = []
     from .hashing import hash_file
 

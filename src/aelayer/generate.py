@@ -434,7 +434,14 @@ class CorpusGenerator:
                 end=end if (is_last and outcome in TERMINAL_OUTCOMES) else None,
                 outcome=outcome, is_last=is_last,
                 narrative_doc_id=narrative_doc_id if step_index == 0 else None,
-                continuation_of=record_ids[step_index - 1] if step_index else None,
+                # Half of the split records carry an explicit continuation
+                # pointer; the rest must be linked from the study's declared
+                # splitting convention, so both paths are exercised.
+                continuation_of=(
+                    record_ids[step_index - 1]
+                    if step_index and self.rng.random() < 0.5
+                    else None
+                ),
             )
             corpus.tables["ae"].append(row)
             corpus.gold_records.append(
@@ -556,14 +563,19 @@ class CorpusGenerator:
         note("outcome", outcome, row["AEOUT"])
         note("onset_datetime", onset.isoformat(), row["AESTDTC"])
 
-        # End date is gated on the outcome being terminal.
+        # End date is gated on the outcome being terminal — as *recorded*, not
+        # as it truly was. Where the outcome cell is itself blank, nothing in
+        # the record says whether the event has ended, so the end date is
+        # `unknown` rather than `pending_ongoing`. The answer key must not
+        # claim a state the record cannot support.
+        recorded_outcome = row["AEOUT"]
         if row["AEENDTC"]:
             values["end_datetime"] = row["AEENDTC"]
             states["end_datetime"] = "collected"
         elif not study.collects("end_datetime"):
             values["end_datetime"] = None
             states["end_datetime"] = study.state_for_blank("end_datetime")
-        elif outcome not in TERMINAL_OUTCOMES:
+        elif recorded_outcome and recorded_outcome not in TERMINAL_OUTCOMES:
             values["end_datetime"] = None
             states["end_datetime"] = "pending_ongoing"
         else:

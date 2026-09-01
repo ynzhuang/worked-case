@@ -155,6 +155,10 @@ class ConceptCatalog:
                 plausible_range=(float(rng[0]), float(rng[1])) if rng else None,
             )
 
+        self.episode_reconciliation: dict[str, Any] = (
+            raw.get("episode_reconciliation") or {}
+        )
+
         self.concept_groups: dict[str, list[str]] = {}
         for gid, body in (raw.get("concept_groups") or {}).items():
             members = list(body.get("members") or [])
