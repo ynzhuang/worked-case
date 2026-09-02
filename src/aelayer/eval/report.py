@@ -1,41 +1,40 @@
-"""Render evaluation results as markdown.
+"""Rendering the evaluation as markdown.
 
-Separate from the harness so that adding a table can never change a number.
+Order matters: the disclaimer comes before any number, the silver standard is
+labelled as silver everywhere it appears, and the not-ascertainable rate is a
+column of its own rather than something folded into a denominator.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from .harness import DISCLAIMER, INVARIANCE_CAVEAT
+from ..silver import SILVER_CAVEAT
+from .harness import ABLATION_NOTE, DISCLAIMER, INVARIANCE_CAVEAT
 
 
 def _fmt(value: Any) -> str:
-    if isinstance(value, bool):
-        return "yes" if value else "no"
     if isinstance(value, float):
         return f"{value:.3f}"
-    if value is None:
-        return "-"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
     if isinstance(value, (list, tuple)):
-        return ", ".join(str(v) for v in value) or "-"
-    return str(value)
+        return ", ".join(str(v) for v in value) or "—"
+    if isinstance(value, dict):
+        return ", ".join(f"{k}={v}" for k, v in value.items()) or "—"
+    return "—" if value is None else str(value)
 
 
 def _table(headers: list[str], rows: list[list[Any]]) -> str:
-    lines = ["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers)]
-    for row in rows:
-        lines.append("| " + " | ".join(_fmt(c) for c in row) + " |")
-    return "\n".join(lines)
-
-
-def _prf_rows(section: dict[str, dict[str, Any]]) -> list[list[Any]]:
-    return [
-        [name, d["precision"], d["recall"], d["f1"], d["support"],
-         d["tp"], d["fp"], d["fn"]]
-        for name, d in section.items()
-        if d["support"] or d.get("predicted")
+    if not rows:
+        return "_(nothing to report)_"
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "|" + "---|" * len(headers),
     ]
+    for row in rows:
+        lines.append("| " + " | ".join(_fmt(cell) for cell in row) + " |")
+    return "\n".join(lines)
 
 
 def render_markdown(results: dict[str, Any]) -> str:
@@ -52,7 +51,8 @@ def render_markdown(results: dict[str, Any]) -> str:
     add("")
     add(_table(["", "value"], [
         ["generated", results["generated_at"]],
-        ["definition", f"`{definition['id']}` v{definition['version']} ({definition['status']})"],
+        ["definition", f"`{definition['id']}` v{definition['version']} "
+                       f"({definition['status']})"],
         ["definition hash", f"`{definition['hash']}`"],
         ["normalizer", f"`{versions['normalizer_version']}`"],
         ["extractor", f"`{versions['extractor_version']}`"],
@@ -63,297 +63,223 @@ def render_markdown(results: dict[str, Any]) -> str:
     ]))
     add("")
 
-    # ---------------------------------------------------------------- L1
-    layer1 = results["layer1"]
-    add("## Layer 1 — clinical validity")
+    # ------------------------------------------------------------- silver
+    silver = results["silver"]
+    overall = silver["overall"]
+    add("## Silver standard — extraction against the study's own structured field")
+    add("")
+    add(f"> {SILVER_CAVEAT}")
     add("")
     add(
-        "Does the pipeline recover what the source says? Field-level agreement "
-        "against the gold record values, over "
-        f"{layer1['records']} source records."
+        f"Attribute: **{silver['attribute']}**. Eligible profiles: "
+        f"{', '.join(silver['profiles'])} — the ones that record the attribute "
+        f"in a structured variable *and* in the investigator's own words. The "
+        f"structured value is masked from the extractor and used only as the "
+        f"comparator."
     )
     add("")
-    violations = layer1["provenance_violations"]
-    if violations:
-        add(f"**{len(violations)} record(s) carry a populated field with no span.** "
-            "Each is a defect:")
-        for entry in violations[:10]:
-            add(f"- `{entry}`")
-    else:
-        add("Every populated field on every record traces to at least one span. "
-            "No provenance violations.")
-    add("")
-    add("### Per field")
-    add("")
-    add(_table(["field", "precision", "recall", "f1", "gold", "tp", "fp", "fn"],
-               _prf_rows(layer1["overall"])))
-    add("")
-
-    add("### By source path")
+    add(_table(
+        ["precision", "recall", "f1", "coverage", "abstention rate",
+         "normalized agreement", "eligible", "answered"],
+        [[overall["precision"], overall["recall"], overall["f1"],
+          overall["coverage"], overall["abstention_rate"],
+          overall["normalized_agreement"], overall["eligible_records"],
+          overall["answered"]]],
+    ))
     add("")
     add(
-        "`structured` is the deterministic path; `text` is the model path. The "
-        "model path is asked only about fields the deterministic path left "
-        "unresolved, so these are different populations, not a head-to-head."
+        "Coverage and abstention are reported beside precision on purpose: a "
+        "precision reached by answering three times in a hundred is not a "
+        "useful extractor, and the pair is what makes that visible."
     )
     add("")
-    rows = []
-    for path, fields in layer1["by_source_path"].items():
-        for name, body in fields.items():
-            if body["support"]:
-                rows.append([path, name, body["precision"], body["recall"],
-                             body["f1"], body["support"]])
-    add(_table(["path", "field", "precision", "recall", "f1", "gold"], rows))
+    add("### By reported-term style")
+    add("")
+    add(_table(
+        ["style", "precision", "recall", "coverage", "abstention", "answered"],
+        [[style, body["precision"], body["recall"], body["coverage"],
+          body["abstention_rate"], body["answered"]]
+         for style, body in silver["by_reported_term_style"].items()],
+    ))
     add("")
 
-    add("### Collection-state classification")
+    # ---------------------------------------------------------- phenotype
+    phenotype = results["phenotype"]
+    pooled = phenotype["pooled"]
+    add("## Phenotype")
     add("")
-    add("A blank is not a value. This matrix is whether the pipeline reads each "
-        "blank for what it is.")
+    add(
+        f"`{phenotype['evaluated_definition']}` over {phenotype['episodes']} "
+        f"episodes, {phenotype['matched_to_gold']} of them matched to a gold "
+        f"label."
+    )
     add("")
-    matrix = layer1.get("collection_state_matrix")
+    add(_table(
+        ["PPV", "sensitivity", "F1", "gold cases", "predicted cases",
+         "not-ascertainable rate", "not-ascertainable agreement"],
+        [[pooled["ppv"], pooled["sensitivity"], pooled["f1"],
+          pooled["gold_cases"], pooled["predicted_cases"],
+          pooled["not_ascertainable_rate"], pooled["not_ascertainable_agreement"]]],
+    ))
+    add("")
+    add(
+        "**not_ascertainable is not a negative.** It counts episodes where a "
+        "required attribute was never recorded and cannot be recovered — no "
+        "reviewer can settle them either. Reporting them inside the negatives "
+        "would understate the cohort's uncertainty; reporting them as review "
+        "items would send work to a human who has nothing to work with."
+    )
+    add("")
+    add("### By profile")
+    add("")
+    add(_table(
+        ["profile", "episodes", "PPV", "sensitivity", "cases",
+         "not-ascertainable", "rate"],
+        [[profile, body["episodes"], body["ppv"], body["sensitivity"],
+          body["predicted_cases"], body["not_ascertainable_predicted"],
+          body["not_ascertainable_rate"]]
+         for profile, body in phenotype["per_profile"].items()],
+    ))
+    add("")
+    add("### Where the evidence came from")
+    add("")
+    add(
+        "Counted over cases only. A cohort that depended on text extraction "
+        "says so here, rather than leaving a later reader to work it out."
+    )
+    add("")
+    add(_table(
+        ["route", "attributes satisfied"],
+        [[method, count] for method, count in phenotype["attribute_methods"].items()],
+    ))
+    add("")
+    add(_table(
+        ["source variable", "attributes satisfied"],
+        [[variable, count] for variable, count in phenotype["attribute_sources"].items()],
+    ))
+    add("")
+
+    # ----------------------------------------------------------- ablation
+    ablation = results["ablation"]
+    add("## Value ablation — what text recovery is worth")
+    add("")
+    add(f"{ABLATION_NOTE}")
+    add("")
+    add(_table(
+        ["structured only", "with text", "only findable through text",
+         "fraction", "not-ascertainable resolved by text"],
+        [[ablation["cases_structured_only"], ablation["cases_with_text"],
+          ablation["cases_only_findable_through_text"],
+          ablation["fraction_only_findable_through_text"],
+          ablation["not_ascertainable_resolved_by_text"]]],
+    ))
+    add("")
+    add(
+        f"**{ablation['cases_only_findable_through_text']} of "
+        f"{ablation['cases_with_text']} qualifying events "
+        f"({ablation['fraction_only_findable_through_text']:.1%}) are findable "
+        f"only through text.** Without the extraction layer they are not "
+        f"negatives — they are unascertainable, and "
+        f"{ablation['not_ascertainable_resolved_by_text']} of them move out of "
+        f"that bucket when text is read."
+    )
+    add("")
+    add(_table(
+        ["profile", "cases found only through text"],
+        [[profile, count] for profile, count in ablation["by_profile"].items()],
+    ))
+    add("")
+
+    # ------------------------------------------------------- availability
+    availability = results["availability"]
+    add("## Availability — does the system tell the kinds of missing apart?")
+    add("")
+    add(
+        "Confusing \"no location recorded\" with \"no location\" is the failure "
+        "that quietly biases every downstream estimate, so it is scored "
+        "directly rather than left to a single accuracy number."
+    )
+    add("")
+    matrix = availability.get("matrix")
     if matrix is not None:
         add(matrix.to_markdown())
         add("")
-        add(f"Accuracy: **{matrix.accuracy:.3f}** over {matrix.total} field readings.")
+    add(_table(
+        ["accuracy", "collected read as missing", "missing read as collected",
+         "not-collected read as unknown"],
+        [[availability["accuracy"], availability["collected_read_as_missing"],
+          availability["missing_read_as_collected"],
+          availability["not_collected_read_as_unknown"]]],
+    ))
     add("")
 
-    add("### Abstention quality")
+    # ---------------------------------------------------------- transport
+    transport = results["transport"]
+    add("## Transportability — whole studies held out")
     add("")
-    abstention = layer1["abstention"]
-    add(
-        "Scored only where the model path was asked. Abstaining when the text "
-        "does not support a value is correct behaviour; guessing is a defect."
-    )
-    add("")
-    add(_table(["outcome", "count"], [
-        ["correctly abstained", abstention["correct_abstention"]],
-        ["wrongly abstained (value was recoverable)", abstention["wrong_abstention"]],
-        ["answered correctly", abstention["correct_answer"]],
-        ["answered wrongly", abstention["wrong_answer"]],
-        ["**abstention precision**", abstention["abstention_precision"]],
-        ["**answer precision**", abstention["answer_precision"]],
-    ]))
-    add("")
-
-    # ---------------------------------------------------------------- L2
-    layer2 = results["layer2"]
-    add("## Layer 2 — episode reconciliation")
-    add("")
-    add(
-        f"{layer2['gold_episodes']} true episodes; {layer2['derived_episodes']} "
-        f"derived. Boundary agreement **{layer2['boundary_agreement']:.3f}**."
-    )
-    add("")
-    add(_table(["", "count", "rate"], [
-        ["exact boundary matches", layer2["exact_boundary_matches"],
-         layer2["boundary_agreement"]],
-        ["over-merged episodes", layer2["over_merge"], layer2["over_merge_rate"]],
-        ["over-split episodes", layer2["over_split"], layer2["over_split_rate"]],
-        ["flagged for linkage review", layer2["flagged_for_review"], "-"],
-    ]))
-    add("")
-    add("### Split behaviour by recurrence expectation")
-    add("")
-    add(
-        "The default linkage rule is wrong for recurrent conditions, which is "
-        "why the catalogue declares `recurrence_expected` per concept. These "
-        "two rows are the reason it is declared rather than assumed."
-    )
-    add("")
-    add(_table(["concepts", "episodes", "over-split", "rate"], [
-        ["recurrence expected", layer2["recurrence_expected"]["episodes"],
-         layer2["recurrence_expected"]["over_split"],
-         layer2["recurrence_expected"]["over_split_rate"]],
-        ["recurrence not expected", layer2["recurrence_not_expected"]["episodes"],
-         layer2["recurrence_not_expected"]["over_split"],
-         layer2["recurrence_not_expected"]["over_split_rate"]],
-    ]))
-    add("")
-    add(_table(["linkage rule", "episodes"],
-               [[k, v] for k, v in layer2["linkage_rules"].items()]))
-    if layer2["mismatches_by_representation"]:
-        add("")
-        add("Boundary mismatches by representation: "
-            + ", ".join(f"{k} ({v})" for k, v in
-                        layer2["mismatches_by_representation"].items()))
-    add("")
-
-    # ---------------------------------------------------------------- L3
-    layer3 = results["layer3"]
-    pooled = layer3["pooled"]
-    add("## Layer 3 — phenotype")
-    add("")
-    add(
-        f"Over {layer3['episodes']} episodes under `{layer3['evaluated_definition']}`: "
-        f"PPV **{pooled['ppv']:.3f}**, sensitivity **{pooled['sensitivity']:.3f}** "
-        f"for the `case` verdict ({pooled['tp']} true positives, {pooled['fp']} "
-        f"false positives, {pooled['fn']} false negatives)."
-    )
-    add("")
-    add(_table(["", "value"], [
-        ["false negatives routed to review by linkage uncertainty",
-         pooled["false_negatives_from_linkage_review"]],
-        ["false negatives from anything else", pooled["false_negatives_other"]],
-        ["sensitivity excluding the declined",
-         pooled["sensitivity_excluding_declined"]],
-    ]))
-    add("")
-    add(
-        "A case the system routed to review because the episode boundary was a "
-        "judgement call is a different kind of miss from one it got wrong. The "
-        "first is the system declining to assert something it cannot settle, "
-        "which is the behaviour the definition asks for; only the second is an "
-        "accuracy problem."
-    )
-    add("")
-    add("### Per study")
-    add("")
-    add(_table(["study", "PPV", "sensitivity", "F1", "gold cases", "predicted", "tp", "fp", "fn"],
-               [[s, d["ppv"], d["sensitivity"], d["f1"], d["gold_cases"],
-                 d["predicted_cases"], d["tp"], d["fp"], d["fn"]]
-                for s, d in layer3["per_study"].items()]))
-    add("")
-    add("### Verdict confusion")
-    add("")
-    verdict_matrix = layer3.get("verdict_matrix")
-    if verdict_matrix is not None:
-        add(verdict_matrix.to_markdown())
-    add("")
-    add(f"The review set holds **{layer3['review_set_size']}** episodes and is "
-        f"reported as its own count, never folded into the case count.")
-    add("")
-    add("### Cross-study transportability")
-    add("")
-    transport = layer3["transportability"]
     add(f"{transport['note']}")
     add("")
-    add(_table(["set", "studies", "PPV", "sensitivity", "gold cases"], [
-        ["development", transport["development_studies"],
-         transport["development"]["ppv"], transport["development"]["sensitivity"],
-         transport["development"]["gold_cases"]],
-        ["held out", transport["held_out_studies"],
-         transport["held_out"]["ppv"], transport["held_out"]["sensitivity"],
-         transport["held_out"]["gold_cases"]],
-        ["**drop**", "-", transport["ppv_drop"], transport["sensitivity_drop"], "-"],
-    ]))
+    add(_table(
+        ["side", "profiles", "episodes", "PPV", "sensitivity",
+         "not-ascertainable rate"],
+        [
+            ["development", transport["development_profiles"],
+             transport["development"]["episodes"], transport["development"]["ppv"],
+             transport["development"]["sensitivity"],
+             transport["development"]["not_ascertainable_rate"]],
+            ["held out", transport["held_out_profiles"],
+             transport["held_out"]["episodes"], transport["held_out"]["ppv"],
+             transport["held_out"]["sensitivity"],
+             transport["held_out"]["not_ascertainable_rate"]],
+        ],
+    ))
+    add("")
+    add(
+        f"Sensitivity drop **{transport['sensitivity_drop']:+.3f}**, PPV drop "
+        f"**{transport['ppv_drop']:+.3f}**, change in the not-ascertainable "
+        f"rate **{transport['not_ascertainable_rate_change']:+.3f}**. "
+        f"{transport['not_fitted']}"
+    )
     add("")
 
-    # ------------------------------------------------------- invariance
+    # --------------------------------------------------------- invariance
     invariance = results["invariance"]
-    add("## Stress test — representation invariance")
+    add("## Representation invariance")
     add("")
-    add(f"> **{INVARIANCE_CAVEAT}**")
+    add(f"> {INVARIANCE_CAVEAT}")
     add("")
     add(
-        f"{invariance['truths_compared']} sampled truths, each rendered under "
-        f"{len(invariance['representations'])} collection conventions "
-        f"({', '.join(invariance['representations'])})."
+        f"{invariance['truths_compared']} clinical truths rendered under more "
+        f"than one profile. Raw agreement across every rendering is "
+        f"**{invariance['raw_agreement']:.3f}**; agreement across the renderings "
+        f"that could actually record the attribute is "
+        f"**{invariance['agreement_where_evidence_supports_it']:.3f}** over "
+        f"{invariance['truths_with_supporting_evidence']} truths."
     )
     add("")
-    add(_table(["", "rate"], [
-        ["verdict agreement across representations", invariance["verdict_agreement"]],
-        ["evidence-state agreement across representations",
-         invariance["state_agreement"]],
-        ["discordant truths", invariance["discordant_count"]],
-    ]))
-    add("")
-    if invariance["discordance_by_representation"]:
-        add("Which representation departs from the majority:")
-        add("")
-        add(_table(["representation", "departures"],
-                   [[k, sum(v.values())] for k, v in
-                    invariance["discordance_by_representation"].items()]))
-        add("")
-    if invariance["discordant"]:
-        add("Examples:")
-        add("")
-        rows = []
-        for entry in invariance["discordant"][:8]:
-            verdicts = entry["verdicts"]
-            odd = [r for r, v in verdicts.items() if v != entry["majority"]]
-            rows.append([entry["truth_id"], entry["reference_verdict"],
-                         entry["majority"], ", ".join(odd),
-                         ", ".join(f"{r}={verdicts[r]}" for r in odd)])
-        add(_table(["truth", "reference", "majority", "departs", "verdict"], rows))
-        add("")
     add(
-        "A lower state agreement than verdict agreement is expected and is not "
-        "a fault: a study that codes the event reaches `explicit` while a study "
-        "that leaves it to narrative reaches `supported`, by different rules, "
-        "on the same patient. The verdict is what a cohort is built from."
+        "The two numbers are different questions. Raw agreement is low by "
+        "construction: a study that never collected the location returns "
+        "not_ascertainable, and it is *right* to. Counting that as a "
+        "disagreement would be scoring the system for the study's collection "
+        "decision."
     )
     add("")
-
-    # ---------------------------------------------------------- retrieval
-    retrieval = results.get("retrieval") or {}
-    if retrieval.get("available"):
-        add("## Retrieval")
-        add("")
-        precise = retrieval["precise"]
-        add("### Precise cohort path")
-        add("")
-        add(_table(["", "value"], [
-            ["cohort size under the definition", precise["cohort_size"]],
-            ["returned by the precise path", precise["returned"]],
-            ["exact match", precise["exact_match"]],
-            ["candidates returned", precise["candidates_returned"]],
-            ["usable as a cohort", precise["usable_as_cohort"]],
-        ]))
-        add("")
-        add("### Discovery path — assertion filter on vs off")
-        add("")
-        add(
-            "This is where assertion matters. A coded AE row asserts presence by "
-            "construction; a narrative can name a concept in order to rule it "
-            "out, and a discovery search that cannot tell them apart returns "
-            "documented absences as though they were events."
-        )
-        add("")
-        on = retrieval["assertion_filter_on"]
-        off = retrieval["assertion_filter_off"]
-        add(_table(["", "assertion=present", "no assertion filter"], [
-            ["mentions returned", on["returned"], off["returned"]],
-            ["mentions asserting absence", on["mentions_asserting_absence"],
-             off["mentions_asserting_absence"]],
-            ["**negation false positive rate**",
-             on["negation_false_positive_rate"], off["negation_false_positive_rate"]],
-            ["MRR", on["mrr"], off["mrr"]],
-            ["precision@10", on["precision@10"], off["precision@10"]],
-            ["recall@50 (ceiling)",
-             f"{on['recall@50']:.3f} ({on['ceiling@50']:.3f})",
-             f"{off['recall@50']:.3f} ({off['ceiling@50']:.3f})"],
-        ]))
-        add("")
-        add(
-            "Recall@k is bounded by k divided by the number of relevant "
-            "mentions, so the ceiling is shown alongside; precision@k is the "
-            "figure that is not capped."
-        )
-        add("")
-        add(_table(["study", "relevant", "returned", "MRR", "P@10", "recall@50", "ceiling@50"],
-                   [[q["study"], q["relevant"], q["returned"], q["mrr"],
-                     q["precision@10"], q["recall@50"], q["ceiling@50"]]
-                    for q in retrieval["per_study"]]))
-        add("")
+    add(_table(
+        ["profile", "verdicts over the shared truths"],
+        [[profile, body]
+         for profile, body in invariance["verdicts_by_profile"].items()],
+    ))
+    add("")
 
     # ----------------------------------------------------- reproducibility
     repro = results["reproducibility"]
     add("## Reproducibility")
     add("")
-    add(_table(["check", "stable", "value"], [
-        ["normalization output hash", repro["normalization_stable"],
-         f"`{repro['record_hashes'][0]}`"],
-        ["manifest id", repro["manifest_id_stable"], f"`{repro['manifest_ids'][0]}`"],
-        ["results hash", repro["results_stable"], f"`{repro['result_hashes'][0]}`"],
-    ]))
+    add(_table(
+        ["manifest id stable", "results stable", "normalization stable", "repeats"],
+        [[repro["manifest_id_stable"], repro["results_stable"],
+          repro["normalization_stable"], repro["repeats"]]],
+    ))
     add("")
-    add("---")
-    add("")
-    add(
-        "Every figure above is reproducible from a clean checkout with "
-        "`make eval`. Manifest ids and results hashes are content-derived, so "
-        "identical inputs always produce identical numbers."
-    )
-    add("")
-    return "\n".join(out)
+    return "\n".join(out) + "\n"

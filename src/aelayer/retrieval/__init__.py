@@ -1,9 +1,8 @@
-"""Retrieval: a precise cohort path and a discovery path, kept apart."""
+"""Retrieval: a precise cohort path and a discovery path."""
 
-from .index import EpisodeIndex, IndexMeta, build_index
-from .query import CandidateInCohort, RetrievalResult, RetrievedEpisode, retrieve
+from .index import EpisodeIndex, build_index
+from .query import CandidateInCohort, discover, retrieve
 
 __all__ = [
-    "CandidateInCohort", "EpisodeIndex", "IndexMeta", "RetrievalResult",
-    "RetrievedEpisode", "build_index", "retrieve",
+    "CandidateInCohort", "EpisodeIndex", "build_index", "discover", "retrieve",
 ]

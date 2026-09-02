@@ -32,8 +32,10 @@ STANDING_LIMITATIONS = [
     "configured; the manifest records which one ran.",
     "Counts are per the named definition version only. A different version can "
     "reach different verdicts on the same episodes.",
-    "Episode boundaries are a declared assumption. Episodes flagged for linkage "
-    "review are reported separately, not folded into the counts.",
+    "Episodes counted as not_ascertainable are reported separately and are "
+    "neither cases nor negatives: nobody can evaluate the rule on them.",
+    "Where an attribute was recovered from text, the extractor carries a "
+    "measured error rate from the silver-standard harness, not an assumed one.",
     "Coded terms in the concept catalogue are illustrative placeholders, not "
     "licensed dictionary content.",
 ]
@@ -48,6 +50,13 @@ def _counts(assignments: Sequence[CaseAssignment], attribute: str) -> dict[str, 
     for assignment in assignments:
         key = getattr(assignment, attribute)
         counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _counted(values) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
     return dict(sorted(counts.items()))
 
 
@@ -185,6 +194,9 @@ def execute(
         "definition_version": definition.version,
         "operates_on": definition.operates_on,
         "concept": definition.concept.primary,
+        "accept_methods": sorted(
+            {m for r in definition.required_attributes for m in r.accept_methods}
+        ),
         "studies": sorted(studies) if studies else sorted(pipeline.store.studies()),
     }
     if specification:
@@ -232,8 +244,17 @@ def execute(
         validation_status="unvalidated",
         output_pointer=pointer,
         results_hash=hash_payload(payload, length=32),
-        counts_by_state=_counts(assignments, "evidence_state"),
         counts_by_verdict=_counts(assignments, "verdict"),
+        # Which routes supplied the evidence behind this cohort, so a later
+        # reader can see it depended on text extraction without re-deriving it.
+        attribute_sources=_counted(
+            variable for a in assignments if a.verdict == "case"
+            for variable in a.attribute_sources.values()
+        ),
+        attribute_methods=_counted(
+            method for a in assignments if a.verdict == "case"
+            for method in a.attribute_methods.values()
+        ),
         deterministic=not nondeterministic,
         nondeterministic_paths=nondeterministic,
         limitations=list(STANDING_LIMITATIONS),

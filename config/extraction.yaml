@@ -1,259 +1,69 @@
-# Extraction rules for the lexicon-and-rule baseline extractor.
+# Extraction configuration.
 #
-# This is a deterministic, offline, configurable rule system. It is not a
-# trained clinical NLP model and must not be described as one.
+# The default backend is a deterministic lexicon-and-pattern extractor, so
+# everything runs offline. Its recall is exactly the surface forms declared in
+# concepts.yaml plus the patterns below — that is a property of the config, not
+# of the method, and the README says so.
 
-version: 1
+version: extract-3.0.0
 
-assertion:
-  scope: sentence                    # sentence | window
-  window_tokens: 6                   # used when scope: window
-  default: present
-  # Cue lists may be a flat list (treated as `pre`) or a mapping with `pre`
-  # and `post`. `pre` cues govern concept mentions that follow the cue;
-  # `post` cues govern mentions that precede it.
-  cues:
-    absent:
-      pre: ["no evidence of", "no evidence for", "no evidence to suggest",
-            "negative for", "ruled out", "denies", "denied", "without",
-            "absent", "not consistent with", "no signs of", "no symptoms of",
-            "did not experience", "did not report", "there was no",
-            "no episodes of", "no "]
-      post: ["was ruled out", "were ruled out", "was excluded", "was not present",
-             "was not observed", "was negative"]
-    hypothetical:
-      pre: ["if", "should the patient", "in case of", "in the event of",
-            "risk of", "at risk for", "monitor for", "monitored for",
-            "advised to report", "instructed to report", "watch for",
-            "to prevent", "prophylaxis for"]
-    historical:
-      pre: ["history of", "past medical history", "previously", "prior to study",
-            "prior to enrolment", "prior to enrollment", "pre-study",
-            "before screening", "longstanding", "known"]
-      post: ["was documented previously", "documented previously", "previously",
-             "before screening", "prior to study entry", "prior to enrolment",
-             "in the past", "at screening only"]
-    family_history:
-      pre: ["mother", "father", "sibling", "brother", "sister",
-            "family history of", "maternal", "paternal"]
-      post: ["runs in the family", "in a first-degree relative"]
-    uncertain:
-      pre: ["possible", "possibly", "suspected", "cannot be excluded",
-            "cannot exclude", "may represent", "query", "?", "versus",
-            "differential includes", "concerning for", "equivocal"]
-      post: ["cannot be excluded", "cannot be ruled out", "is uncertain",
-             "remains unclear"]
-  # Standard pseudo-cue handling: these phrases contain a cue token but do not
-  # negate or qualify. Without them "no " negates half the corpus.
-  pseudo_cues:
-    - "no change"
-    - "no dose change"
-    - "no change to study drug"
-    - "no further"
-    - "no need"
-    - "no additional"
-    - "no other"
-    - "no significant change"
-    - "not only"
-    - "no recurrence"
-    - "not done"
-    - "did not recur"
-    - "did not require"
-    - "without difficulty"
-    - "without incident"
-    - "without sequelae"
-  terminators: ["but", "however", "although", "though", ";", "except",
-                "aside from", "apart from", "in contrast"]
-  # When several classes fire in scope, the first class listed wins.
-  precedence: [family_history, historical, hypothetical, absent, uncertain]
+# Where the model path is allowed to read. Anything not listed here it never
+# sees; `guards.py` enforces it.
+readable_sources:
+  - reported_term
+  - comment
 
-temporality:
-  # Ordered; the first pattern that matches a sentence containing the concept
-  # wins. Named groups: n/unit/anchor for relative, day for study day,
-  # date for absolute.
-  offset_patterns:
-    - id: relative_after
-      pattern: '(?P<n>\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|a few|several)[\s-]+(?P<unit>days?|weeks?)\s+(?:after|following|post|post-|from)\s+(?:the\s+|a\s+|his\s+|her\s+|their\s+)?(?P<anchor>[a-z][a-z \-]{2,40})'
-    - id: relative_later
-      pattern: '(?P<n>\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|a few|several)[\s-]+(?P<unit>days?|weeks?)\s+(?:later|afterwards|afterward|subsequently)'
-    - id: relative_within
-      pattern: 'within\s+(?P<n>\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|a few|several)\s+(?P<unit>days?|weeks?)\s+of\s+(?:the\s+)?(?P<anchor>[a-z][a-z \-]{2,40})'
-    - id: day_after
-      pattern: 'the\s+day\s+(?:after|following)\s+(?:the\s+)?(?P<anchor>[a-z][a-z \-]{2,40})'
-      offset_days: 1
-    # A pattern may declare a fixed offset instead of capturing a magnitude.
-    - id: same_day
-      pattern: 'on\s+the\s+day\s+of\s+(?:the\s+)?(?P<anchor>[a-z][a-z \-]{2,40})'
-      offset_days: 0
-    - id: study_day
-      pattern: 'on\s+(?:study\s+)?day\s+(?P<day>\d+)'
-    - id: absolute_date
-      pattern: 'on\s+(?P<date>\d{1,2}[-/](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[-/]\d{4})'
-    - id: absolute_iso
-      pattern: 'on\s+(?P<date>\d{4}-\d{2}-\d{2})'
-  number_words:
-    one: 1
-    two: 2
-    three: 3
-    four: 4
-    five: 5
-    six: 6
-    seven: 7
-    eight: 8
-    nine: 9
-    ten: 10
-    eleven: 11
-    twelve: 12
-    # Vague quantifiers are mapped to a single value and flagged; extraction
-    # metrics for onset are reported broken out by phrasing so the cost of
-    # this assumption stays visible instead of hiding in a pooled number.
-    a few: 3
-    several: 3
-  vague_quantifiers: ["a few", "several"]
-  unit_days:
-    day: 1
-    days: 1
-    week: 7
-    weeks: 7
-  # Where a relative expression names no anchor ("four days later"), it is
-  # resolved against this event. An expression that names its own anchor always
-  # wins over this default.
-  default_anchor: dose_escalation
-  anchor_aliases:
-    dose_escalation: ["dose escalation", "dose increase", "uptitration",
-                      "up-titration", "dose was increased", "increase in dose",
-                      "escalation of study drug", "dose titration",
-                      "escalation", "increased dose"]
-    first_dose: ["first dose", "initial dose", "study drug initiation",
-                 "start of study drug", "randomisation", "randomization",
-                 "treatment initiation"]
-    dose_reduction: ["dose reduction", "dose decrease", "downtitration",
-                     "dose was reduced"]
+# Attributes the model path may be asked about. A standard structured variable
+# is never on this list: a value the CRF settled is not a question.
+extractable_attributes: [location, laterality, pattern, quality]
 
-# How anchor events are located in the structured exposure record. The anchor
-# comes from structured data; the offset comes from text.
+modifiers:
+  # A modifier mention is anchored to a concept mention in the same text, so
+  # "rash on chest, prior eczema on the back" does not attach `back` to the
+  # rash. `max_distance_tokens` is how far the anchor reaches.
+  scope: sentence
+  max_distance_tokens: 8
+  connectors: ["on", "over", "of", "across", "involving", "affecting", "to",
+               "at", "in", "along"]
+  # A cue that a following site phrase does NOT belong to this event.
+  disqualifiers: ["history of", "previous", "prior", "resolved", "no rash on",
+                  "denies", "family history of", "unrelated"]
+  confidence:
+    direct_connector: 0.95      # "rash on chest"
+    adjacent: 0.85              # "chest rash"
+    same_sentence: 0.7          # "rash. it was on the chest"
+    comment_record: 0.8
+
+# Quality descriptors are extracted but are not a phenotype criterion here.
+# They exist so the discovery path has something un-normalized to surface.
+quality_lexicon:
+  itchy: [itchy, pruritic, itching]
+  painful: [painful, tender, sore]
+  spreading: [spreading, extending, progressive]
+  confluent: [confluent, coalescing]
+
+severity:
+  mild: ["mild", "mildly", "grade 1", "slight"]
+  moderate: ["moderate", "moderately", "grade 2"]
+  severe: ["severe", "severely", "grade 3", "grade 4", "extensive"]
+
+# Anchors resolve against the exposure record. The window in a phenotype
+# definition is measured from one of these.
 anchors:
+  first_exposure:
+    domain: EX
+    rule: first_record
+    date_field: EXSTDTC
   dose_escalation:
     domain: EX
     rule: dose_increase
     date_field: EXSTDTC
-  first_dose:
-    domain: EX
-    rule: first_record
-    date_field: EXSTDTC
-  dose_reduction:
-    domain: EX
-    rule: dose_decrease
-    date_field: EXSTDTC
-
-labs:
-  # Value phrases such as "glucose 54 mg/dL", "BG of 3.1 mmol/L",
-  # "capillary glucose was 48".
-  # The negative lookahead matters: "low blood glucose 1 days after the dose
-  # escalation" contains a number next to a test name, and without it the
-  # temporal quantity is read as a result.
-  value_pattern: '(?P<test>{test_names})\s*(?:level\s*)?(?:was|of|=|:|at|measured|reading)?\s*(?P<value>\d{1,3}(?:\.\d{1,2})?)\s*(?P<unit>mg/dL|mg/dl|mmol/L|mmol/l|%)?(?!\s*(?:day|days|week|weeks|hour|hours|month|months|year|years)\b)'
-  default_units:
-    # When a narrative gives a bare number, infer the unit from magnitude.
-    # Deliberately conservative: ambiguous magnitudes yield no lab value.
-    GLUCOSE:
-      # Bounded at both ends. A bare "1" is not a glucose result in any unit,
-      # and inferring one from magnitude alone is how a duration becomes a
-      # laboratory value.
-      - {min: 1.5, max: 30, unit: "mmol/L"}
-      - {min: 35, max: 900, unit: "mg/dL"}
-  require_unit_or_inference: true
-
-values:
-  severity:
-    mild: ["mild", "mildly", "grade 1", "slight"]
-    moderate: ["moderate", "moderately", "grade 2"]
-    severe: ["severe", "severely", "grade 3", "grade 4", "profound",
-             "requiring third party assistance", "third-party assistance"]
-  # Seriousness is a regulatory category, entirely separate from severity.
-  # These cues never write to `severity`, and severity cues never write here.
-  seriousness:
-    death: ["died", "death", "fatal outcome", "deceased"]
-    life_threatening: ["life-threatening", "life threatening"]
-    hospitalisation: ["hospitalised", "hospitalized", "hospitalisation",
-                      "hospitalization", "admitted to hospital",
-                      "admission to hospital", "inpatient admission",
-                      "prolonged hospitalisation", "emergency department",
-                      "attended the emergency"]
-    disability: ["persistent disability", "significant disability",
-                 "permanent disability"]
-    congenital_anomaly: ["congenital anomaly", "birth defect"]
-    other_medically_important: ["medically important", "medically significant"]
-  relatedness:
-    not_related: ["not related", "unrelated", "no causal relationship"]
-    unlikely: ["unlikely related", "unlikely to be related", "doubtfully related"]
-    possible: ["possibly related", "possible relationship", "possibly drug-related"]
-    probable: ["probably related", "probable relationship", "likely related"]
-    definite: ["definitely related", "certainly related", "definite relationship"]
-    unknown: ["relationship not assessable", "causality not assessed"]
-  action_taken:
-    dose_reduced: ["study drug dose was reduced", "dose was reduced",
-                   "dose reduced", "dose reduction", "reduced the dose",
-                   "down-titrated", "dose decreased"]
-    dose_interrupted: ["study drug was interrupted", "drug was interrupted",
-                       "study drug interrupted", "dose was interrupted",
-                       "dose interrupted", "drug held", "study drug was held",
-                       "temporarily discontinued", "dosing was paused",
-                       "interruption of study drug"]
-    drug_withdrawn: ["permanently withdrawn from study drug",
-                     "withdrawn from study drug", "study drug was withdrawn",
-                     "drug withdrawn", "permanently discontinued",
-                     "discontinued from study drug", "withdrawn from treatment"]
-    none: ["no change was made to study drug", "no change to study drug",
-           "study drug continued unchanged", "dose unchanged", "no dose change"]
-    not_applicable: ["no study drug action was applicable",
-                     "study drug action was not applicable"]
-    unknown: ["action taken with study drug was not recorded",
-              "action taken not recorded", "action unknown"]
-  outcome:
-    resolved: ["resolved", "resolution", "recovered", "settled", "symptoms abated"]
-    resolving: ["resolving", "recovering", "improving"]
-    not_resolved: ["not resolved", "ongoing", "unresolved", "persisted",
-                   "continues"]
-    fatal: ["fatal", "died", "death"]
-    unknown: ["outcome unknown", "outcome not recorded",
-              "outcome was not recorded", "lost to follow-up"]
-  rechallenge:
-    not_done: ["rechallenge was not performed", "no rechallenge",
-               "rechallenge not done", "not rechallenged"]
-    done_recurred: ["on rechallenge the event recurred", "rechallenge resulted in recurrence",
-                    "symptoms recurred on rechallenge", "recurred upon rechallenge",
-                    "rechallenge positive"]
-    done_no_recurrence: ["rechallenge without recurrence", "no recurrence on rechallenge",
-                         "rechallenged without recurrence", "rechallenge negative",
-                         "rechallenge with no recurrence"]
-  # An explicit statement that symptoms were looked for and not found. This is
-  # what lets "asymptomatic" be distinguished from "not documented".
-  symptoms_absent:
-    cues: ["no associated symptoms", "without associated symptoms",
-           "reported no symptoms", "denied any symptoms", "asymptomatic",
-           "no symptoms were reported", "symptom free"]
-  rescue_treatment:
-    cues: ["oral glucose", "glucose gel", "glucose tablets", "dextrose",
-           "glucagon", "juice was given", "orange juice", "rescue carbohydrate",
-           "rescue treatment", "sugar was administered", "IV dextrose",
-           "carbohydrate was given"]
-
-normalisation:
-  spelling_variants: true            # -ise/-ize, British/US
-  fuzzy_max_edits: 1                 # for lexicon terms longer than 8 characters
-  fuzzy_min_length: 9
+default_anchor: first_exposure
 
 confidence:
-  # Deterministic, rule-derived confidences. Not model probabilities.
-  coded_term_exact: 0.99
-  lexicon_exact: 0.95
-  lexicon_fuzzy: 0.75
-  abbreviation_gated: 0.70
-  assertion_cue: 0.90
-  assertion_default: 0.80
-  lab_with_unit: 0.95
-  lab_inferred_unit: 0.75
-  temporal_explicit: 0.92
-  temporal_vague: 0.55
-  temporal_structured: 0.98
+  structured_direct: 1.0
+  sponsor_normalized: 0.98
+  extraction_default: 0.8
+  # Below this, a value is reported but routed by the definition's
+  # `on_low_confidence` rather than counted.
+  review_below: 0.6

@@ -1,19 +1,22 @@
-"""Load SDTM-shaped tables, narratives and gold labels into an in-memory store.
+"""Load the tables, documents and gold labels of one snapshot into memory.
 
 The corpus on disk is:
 
-``dm.csv`` ``ae.csv`` ``ex.csv`` ``lb.csv`` ``cm.csv``
-    SDTM-shaped tables, one row per record.
-``narratives.jsonl``
-    one case narrative per AE record, keyed by ``doc_id``.
-``gold.jsonl``
-    the generator's ground truth for each AE record.  Never read by the
-    extractor or the evaluator; only by the evaluation harness.
-``manifest.json``
-    generator seed and study-level conventions.
+``dm.csv`` ``ae.csv`` ``ex.csv``
+    the standard domains, one row per record
+``suppae.csv``
+    sponsor-defined supplemental qualifiers, keyed back to an AE record by
+    ``IDVAR``/``IDVARVAL`` — the same fact under a name no standard knows
+``co.csv``
+    comment records pointing at an AE record
+``documents.jsonl``
+    the free text of each comment, keyed by ``doc_id``, which is what span
+    offsets are measured against
+``truths.jsonl`` ``gold_records.jsonl`` ``gold_episodes.jsonl``
+    the generator's answer key
 
-Gold labels are deliberately loaded through a separate accessor so that no
-extraction or evaluation code path can reach them by accident.
+Gold labels are loaded through separate accessors so no extraction or
+evaluation code path can reach them by accident.
 """
 
 from __future__ import annotations
@@ -29,11 +32,11 @@ from . import paths
 from .anchors import AnchorResolver, parse_date
 from .hashing import snapshot_id as compute_snapshot_id
 
-TABLES = ("dm", "ae", "ex", "lb", "linked_hypo_event")
+TABLES = ("dm", "ae", "ex", "suppae", "co")
 
 #: Columns whose values are numeric when present.  Kept narrow on purpose: SDTM
 #: character columns stay characters.
-_NUMERIC_COLUMNS = {"EXDOSE", "LBSTRESN", "AESEQ", "EXSEQ", "LBSEQ", "AGE", "GLUCVAL"}
+_NUMERIC_COLUMNS = {"EXDOSE", "AESEQ", "EXSEQ", "COSEQ", "AGE"}
 
 
 class IngestError(RuntimeError):
@@ -41,12 +44,15 @@ class IngestError(RuntimeError):
 
 
 @dataclass
-class Narrative:
+class Document:
+    """One piece of free text, with the record it belongs to."""
+
     doc_id: str
     study_id: str
     subject_id: str
-    ae_seq: int | None
+    source_record_id: str
     text: str
+    kind: str = "comment"
     header: str = ""
 
     @property
@@ -61,7 +67,7 @@ class TrialStore:
 
     root: Path
     tables: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    narratives: dict[str, Narrative] = field(default_factory=dict)
+    documents: dict[str, Document] = field(default_factory=dict)
     snapshot_id: str = ""
     manifest: dict[str, Any] = field(default_factory=dict)
 
@@ -105,26 +111,39 @@ class TrialStore:
     def anchor_resolver(self, anchor_config: dict[str, Any]) -> AnchorResolver:
         return AnchorResolver(anchor_config, self.exposures_by_subject())
 
-    def narratives_for(self, subject_id: str) -> list[Narrative]:
+    def documents_for(self, subject_id: str) -> list[Document]:
         return sorted(
-            (n for n in self.narratives.values() if n.subject_id == subject_id),
-            key=lambda n: n.doc_id,
+            (d for d in self.documents.values() if d.subject_id == subject_id),
+            key=lambda d: d.doc_id,
         )
 
-    def iter_ae_with_narrative(self) -> Iterator[tuple[dict[str, Any], Narrative | None]]:
-        """AE records in a stable order, paired with their narrative."""
-        for row in sorted(
+    def ae_rows(self) -> list[dict[str, Any]]:
+        """AE records in a stable order."""
+        return sorted(
             self.rows("ae"),
             key=lambda r: (str(r.get("STUDYID")), str(r.get("USUBJID")),
-                           int(r.get("AESEQ") or 0)),
-        ):
-            yield row, self.narratives.get(str(row.get("DOCID") or ""))
+                           str(r.get("AESPID"))),
+        )
 
-    def linked_rows(self, source_record_id: str) -> list[dict[str, Any]]:
+    def supplemental_for(self, source_record_id: str) -> list[dict[str, Any]]:
+        """Sponsor-defined qualifiers attached to one AE record."""
         return [
-            row for row in self.rows("linked_hypo_event")
-            if str(row.get("AESPID")) == source_record_id
+            row for row in self.rows("suppae")
+            if str(row.get("IDVARVAL")) == source_record_id
         ]
+
+    def comments_for(self, source_record_id: str) -> list[dict[str, Any]]:
+        return [
+            row for row in self.rows("co")
+            if str(row.get("IDVARVAL")) == source_record_id
+        ]
+
+    def documents_of(self, source_record_id: str) -> list[Document]:
+        return sorted(
+            (d for d in self.documents.values()
+             if d.source_record_id == source_record_id),
+            key=lambda d: d.doc_id,
+        )
 
     # -- ground truth -------------------------------------------------------
     #
@@ -151,8 +170,11 @@ class TrialStore:
     def gold_records_by_id(self) -> dict[str, dict[str, Any]]:
         return {g["source_record_id"]: g for g in self.gold_records()}
 
-    def study_conventions(self, study_id: str) -> dict[str, Any]:
-        return (self.manifest.get("studies") or {}).get(study_id, {})
+    def profile_of(self, study_id: str) -> str | None:
+        for profile_id, body in (self.manifest.get("profiles") or {}).items():
+            if body.get("study_id") == study_id:
+                return profile_id
+        return None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -160,10 +182,10 @@ class TrialStore:
             "studies": len(self.studies()),
             "subjects": len(self.subjects()),
             "ae_records": len(self.rows("ae")),
-            "narratives": len(self.narratives),
-            "lb_records": len(self.rows("lb")),
+            "documents": len(self.documents),
+            "supplemental_records": len(self.rows("suppae")),
+            "comment_records": len(self.rows("co")),
             "ex_records": len(self.rows("ex")),
-            "linked_form_records": len(self.rows("linked_hypo_event")),
         }
 
 
@@ -215,20 +237,21 @@ def load_store(data_dir: str | Path | None = None) -> TrialStore:
             continue
         tables[name] = load_table(path)
 
-    narratives: dict[str, Narrative] = {}
-    narrative_path = root / "narratives.jsonl"
-    if narrative_path.exists():
-        for line in _iter_lines(narrative_path):
+    documents: dict[str, Document] = {}
+    document_path = root / "documents.jsonl"
+    if document_path.exists():
+        for line in _iter_lines(document_path):
             payload = json.loads(line)
-            narrative = Narrative(
+            document = Document(
                 doc_id=payload["doc_id"],
                 study_id=payload["study_id"],
                 subject_id=payload["subject_id"],
-                ae_seq=payload.get("ae_seq"),
+                source_record_id=payload.get("source_record_id", ""),
                 text=payload["text"],
+                kind=payload.get("kind", "comment"),
                 header=payload.get("header", ""),
             )
-            narratives[narrative.doc_id] = narrative
+            documents[document.doc_id] = document
 
     manifest: dict[str, Any] = {}
     manifest_path = root / "manifest.json"
@@ -238,7 +261,7 @@ def load_store(data_dir: str | Path | None = None) -> TrialStore:
     # The snapshot hash covers the input tables and narratives, never the gold
     # labels: gold is evaluation scaffolding, not input data, and including it
     # would make a run id change when only the answer key changed.
-    inputs = [root / f"{n}.csv" for n in TABLES] + [narrative_path, manifest_path]
+    inputs = [root / f"{n}.csv" for n in TABLES] + [document_path, manifest_path]
     # The answer key is evaluation scaffolding, not input data: a run id must
     # not change when only the answer key changes.
     payload = []
@@ -252,7 +275,7 @@ def load_store(data_dir: str | Path | None = None) -> TrialStore:
     store = TrialStore(
         root=root,
         tables=tables,
-        narratives=narratives,
+        documents=documents,
         snapshot_id=hash_payload(payload),
         manifest=manifest,
     )
@@ -260,8 +283,8 @@ def load_store(data_dir: str | Path | None = None) -> TrialStore:
 
 
 __all__ = [
+    "Document",
     "IngestError",
-    "Narrative",
     "TrialStore",
     "load_store",
     "load_table",

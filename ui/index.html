@@ -23,183 +23,139 @@
 </header>
 
 <nav class="tabs" role="tablist">
-  <button role="tab" class="tab active" data-panel="p-record">1 · Source &amp; canonical record</button>
-  <button role="tab" class="tab" data-panel="p-episode">2 · Episodes</button>
-  <button role="tab" class="tab" data-panel="p-definition">3 · Definition</button>
+  <button role="tab" class="tab active" data-panel="p-attribute">1 · One attribute, five homes</button>
+  <button role="tab" class="tab" data-panel="p-silver">2 · Silver standard</button>
+  <button role="tab" class="tab" data-panel="p-phenotype">3 · Phenotype &amp; ablation</button>
   <button role="tab" class="tab" data-panel="p-retrieval">4 · Retrieval &amp; discovery</button>
   <button role="tab" class="tab" data-panel="p-agent">5 · Ask &amp; trace</button>
 </nav>
 
-<!-- ============ 1. RECORD ============ -->
-<section id="p-record" class="panel active">
-  <div id="state-summary" class="summary"></div>
+<!-- ============ 1. ATTRIBUTE ============ -->
+<section id="p-attribute" class="panel active">
+  <div id="route-summary" class="summary"></div>
   <p class="hint">
-    A blank is not a value. Each source record carries a <em>collection state</em>
-    per field, and the state is what a rule is allowed to read. Nothing here is
-    merged or overwritten: this is the grain the study actually collected.
+    Anatomical location can live in a standard qualifier, a sponsor-defined
+    supplemental variable, the investigator's own words, a linked comment — or
+    nowhere. Which one applies is a per-study collection decision, and
+    <strong>the route is part of the fact</strong>: every value below says which
+    variable it came from and by which method.
   </p>
+  <div id="profile-table"></div>
   <div class="split">
     <aside class="list">
       <label class="field">
-        <span>Study</span>
-        <select id="rec-study"><option value="">all</option></select>
+        <span>Profile</span>
+        <select id="rec-profile"><option value="">all</option></select>
       </label>
       <label class="field">
-        <span>Collection state</span>
-        <select id="rec-state">
+        <span>Location route</span>
+        <select id="rec-method">
           <option value="">any</option>
-          <option value="collected">collected</option>
-          <option value="not_collected_by_protocol">not_collected_by_protocol</option>
-          <option value="not_applicable_gated">not_applicable_gated</option>
-          <option value="pending_ongoing">pending_ongoing</option>
-          <option value="intentionally_blank">intentionally_blank</option>
-          <option value="not_representable">not_representable</option>
-          <option value="unknown">unknown</option>
+          <option value="direct">direct</option>
+          <option value="normalized">normalized</option>
+          <option value="extracted">extracted</option>
         </select>
       </label>
       <div id="rec-list" class="scroll"></div>
     </aside>
     <div class="pane">
-      <h2>Source narrative</h2>
+      <h2>Source</h2>
       <p class="hint">
-        Highlighted ranges are the spans backing extracted values. Hover to see
-        which field each supports. A populated field with no span is a defect,
-        not a caveat.
+        The reported term, the supplemental qualifier, and any linked comment.
+        Highlighted text is the span behind an extracted value.
       </p>
-      <div id="rec-text" class="doc">Select a record.</div>
+      <div id="rec-source" class="doc">Select a record.</div>
     </div>
     <div class="pane">
       <h2>Canonical record<span id="rec-badge" class="badge"></span></h2>
       <p class="hint">
-        The deterministic path fills what the CRF settled; the model path is
-        asked only about what it left unresolved, and may answer
-        <em>abstained</em>. Neither assigns an evidence state.
+        An empty attribute says which kind of empty it is. Only
+        <code>collected</code> is evidence; the rest are questions, not answers.
       </p>
       <div id="rec-view"></div>
     </div>
   </div>
 </section>
 
-<!-- ============ 2. EPISODES ============ -->
-<section id="p-episode" class="panel">
-  <div class="controls">
-    <label class="field"><span>Study</span>
-      <select id="ep-study"><option value="">all</option></select></label>
-    <label class="field"><span>Concept</span>
-      <select id="ep-concept"><option value="">all</option></select></label>
-    <label class="check" style="align-self:end">
-      <input type="checkbox" id="ep-review"> only episodes flagged for linkage review
-    </label>
-    <div class="row"><button id="btn-episodes" class="primary">Load episodes</button></div>
+<!-- ============ 2. SILVER ============ -->
+<section id="p-silver" class="panel">
+  <div class="notice">
+    <strong>Silver standard, not ground truth.</strong> The comparator is the
+    study's own structured qualifier, which has its own error rate. A
+    disagreement means the two disagree — not that the extractor is wrong.
   </div>
   <p class="hint">
-    An episode is derived above the records, never in place of them. Where the
-    linkage rule is a judgement call the episode is <strong>flagged, not
-    resolved</strong>, and the flag travels into every downstream verdict.
+    One profile records the location in a structured variable <em>and</em> in the
+    investigator's own words. Masking the structured value gives a genuine
+    evaluation set on data nobody hand-annotated.
   </p>
+  <div id="silver-summary" class="summary"></div>
   <div class="split two">
     <div class="pane">
-      <h2>Episodes<span id="ep-count" class="badge"></span></h2>
-      <div id="ep-list" class="scroll"></div>
+      <h2>By reported-term style</h2>
+      <div id="silver-style"></div>
+      <h2>Method</h2>
+      <ol class="hint">
+        <li>mask the structured variable from the extractor</li>
+        <li>run the model path over the text alone</li>
+        <li>normalize both sides to the concept catalogue</li>
+        <li>compare the extracted value against the masked one</li>
+      </ol>
     </div>
     <div class="pane">
-      <h2>Derivation</h2>
-      <p class="hint">Which source records this episode was assembled from, and under which rule.</p>
-      <div id="ep-view">Select an episode.</div>
+      <h2>Adjudication queue<span id="queue-badge" class="badge"></span></h2>
+      <p class="hint">
+        Disagreements, low-confidence predictions, <strong>and a random sample of
+        agreements</strong>. The sample is not optional: without it you only ever
+        inspect failures and can never estimate the comparator's own error rate.
+      </p>
+      <div id="silver-queue" class="scroll"></div>
     </div>
   </div>
 </section>
 
-<!-- ============ 3. DEFINITION ============ -->
-<section id="p-definition" class="panel">
+<!-- ============ 3. PHENOTYPE ============ -->
+<section id="p-phenotype" class="panel">
+  <div class="controls">
+    <label class="field"><span>Definition</span>
+      <select id="def-select"></select></label>
+    <div class="row">
+      <button id="btn-evaluate" class="primary">Evaluate</button>
+      <button id="btn-ablation">Value ablation</button>
+    </div>
+  </div>
+  <p class="hint">
+    Four verdicts. <strong><code>not_ascertainable</code> is not a negative</strong>:
+    a required attribute was never recorded and cannot be recovered, so nobody
+    can evaluate the rule — not the system and not a reviewer.
+  </p>
+  <div id="verdict-summary" class="summary"></div>
   <div class="split two">
     <div class="pane">
-      <h2>
-        Definition
-        <span id="def-badge" class="badge"></span>
-        <span id="def-status" class="badge status"></span>
-      </h2>
-      <label class="field">
-        <span>Version</span>
-        <select id="def-select"></select>
-      </label>
-      <p class="hint" id="def-label"></p>
-
-      <fieldset>
-        <legend>Concept and missingness</legend>
-        <label class="field"><span>Primary concept</span>
-          <input id="c-concept" readonly></label>
-        <label class="field"><span>Treated as absence</span>
-          <input id="c-absent" readonly></label>
-        <label class="field"><span>Routed to review</span>
-          <input id="c-review" readonly></label>
-        <label class="field"><span>Minimum linkage confidence</span>
-          <input id="c-linkage" readonly></label>
-        <p class="hint">
-          A definition may not read <code>not_collected_by_protocol</code> or
-          <code>not_applicable_gated</code> as evidence of absence; the loader
-          rejects one that tries. Treatment action is an attribute of the
-          episode and appears in no rule.
-        </p>
-      </fieldset>
-
-      <fieldset>
-        <legend>Editable rule parameters</legend>
-        <p class="hint">
-          Editing these builds a <em>candidate</em> next version. The frozen
-          definition on disk is never touched.
-        </p>
-        <label class="field"><span>Glucose threshold (mg/dL)</span>
-          <input id="c-glucose" type="number" step="1"></label>
-        <label class="field"><span>Window minimum (days)</span>
-          <input id="c-wmin" type="number" step="1"></label>
-        <label class="field"><span>Window maximum (days)</span>
-          <input id="c-wmax" type="number" step="1"></label>
-        <label class="field"><span>Unresolved onset</span>
-          <select id="c-unresolved">
-            <option value="case">case</option>
-            <option value="review">review</option>
-            <option value="exclude">exclude</option>
-          </select></label>
-        <div class="row">
-          <button id="btn-candidate" class="primary">Build candidate</button>
-          <button id="btn-evaluate">Evaluate this version</button>
-          <button id="btn-reset" class="ghost">Reset controls</button>
-        </div>
-      </fieldset>
-
-      <fieldset>
-        <legend>Compare two versions</legend>
-        <p class="hint">
-          The comparison is executed, not textual: both versions run against the
-          same snapshot and the answer is the episodes each one claims. A scope
-          is required — this is for evidence reuse within a stated question, not
-          for sweeping a programme to audit past choices.
-        </p>
-        <div class="pair">
-          <input id="cmp-left" type="number" value="1">
-          <input id="cmp-right" type="number" value="2">
-        </div>
-        <label class="field"><span>Scope (the scientific question)</span>
-          <input id="cmp-scope" placeholder="e.g. hypoglycemia incidence after escalation"></label>
-        <div class="row"><button id="btn-compare">Compare</button></div>
-      </fieldset>
+      <h2>Verdicts</h2>
+      <div id="verdict-table"></div>
     </div>
-
     <div class="pane">
-      <h2>Candidate YAML</h2>
-      <p class="hint" id="candidate-note">
-        Build a candidate to see it. The UI never silently mutates a frozen
-        definition; publishing is a separate, deliberate act.
+      <h2>Value ablation</h2>
+      <p class="hint">
+        The same frozen definition run twice: structured routes only, then with
+        text as well. The difference is what the extraction layer is worth.
       </p>
-      <pre id="candidate-yaml" class="code"></pre>
-      <div class="row">
-        <button id="btn-download" disabled>Download candidate YAML</button>
+      <div id="ablation-view">Run the ablation to see it.</div>
+      <h2>Compare two versions</h2>
+      <p class="hint">
+        Executed, not textual: both versions run against the same snapshot. A
+        scope is required — this is for evidence reuse within a stated question,
+        not for sweeping a programme to audit past choices.
+      </p>
+      <div class="pair">
+        <input id="cmp-left" type="number" value="1">
+        <input id="cmp-right" type="number" value="2">
       </div>
-      <h2>Evaluation</h2>
-      <div id="def-eval"></div>
-      <h2>Comparison</h2>
-      <div id="def-compare">No comparison run.</div>
+      <label class="field"><span>Scope</span>
+        <input id="cmp-scope" placeholder="e.g. truncal rash incidence"></label>
+      <div class="row"><button id="btn-compare">Compare</button></div>
+      <div id="compare-view"></div>
     </div>
   </div>
 </section>
@@ -210,54 +166,42 @@
     <label class="field"><span>Path</span>
       <select id="r-path">
         <option value="precise">precise — adjudicated episodes (cohort-eligible)</option>
-        <option value="discovery">discovery — narrative mentions (candidates)</option>
+        <option value="discovery">discovery — text mentions (candidates)</option>
       </select></label>
-    <label class="field"><span>Concept</span>
-      <select id="r-concept"></select></label>
-    <label class="field"><span>Assertion filter</span>
-      <select id="r-assertion" multiple size="6">
-        <option value="present" selected>present</option>
-        <option value="absent">absent</option>
-        <option value="hypothetical">hypothetical</option>
-        <option value="historical">historical</option>
-        <option value="family_history">family_history</option>
-        <option value="uncertain">uncertain</option>
+    <label class="field"><span>Region</span>
+      <select id="r-region">
+        <option value="">any</option>
+        <option value="trunk">trunk</option>
+        <option value="limb">limb</option>
+        <option value="head">head</option>
+        <option value="whole_body">whole_body</option>
+      </select></label>
+    <label class="field"><span>Route (precise only)</span>
+      <select id="r-method" multiple size="3">
+        <option value="direct">direct</option>
+        <option value="normalized">normalized</option>
+        <option value="extracted">extracted</option>
       </select></label>
     <label class="field"><span>Verdict (precise only)</span>
-      <select id="r-verdict" multiple size="3">
+      <select id="r-verdict" multiple size="4">
         <option value="case">case</option>
+        <option value="not_case">not_case</option>
+        <option value="not_ascertainable">not_ascertainable</option>
         <option value="review">review</option>
-        <option value="excluded">excluded</option>
       </select></label>
-    <label class="field"><span>Representation (precise only)</span>
-      <select id="r-representation" multiple size="6">
-        <option value="V-A">V-A</option><option value="V-B">V-B</option>
-        <option value="V-C">V-C</option><option value="V-D">V-D</option>
-        <option value="V-E">V-E</option><option value="V-F">V-F</option>
-      </select></label>
-    <label class="field"><span>Window (days, precise only)</span>
-      <span class="pair">
-        <input id="r-wmin" type="number" placeholder="min">
-        <input id="r-wmax" type="number" placeholder="max">
-      </span></label>
-    <label class="field"><span>Discovery mode</span>
-      <select id="r-mode">
-        <option value="lexical">lexical</option>
-        <option value="dense">dense</option>
-        <option value="hybrid">hybrid</option>
-      </select></label>
+    <label class="check" style="align-self:end">
+      <input type="checkbox" id="r-unnormalized"> discovery: only mentions no
+      catalogue value covers yet
+    </label>
     <label class="field"><span>Top k</span>
       <input id="r-topk" type="number" value="20"></label>
-    <div class="row">
-      <button id="btn-retrieve" class="primary">Search</button>
-      <button id="btn-clear-assertion" class="ghost">Clear assertion filter</button>
-    </div>
+    <div class="row"><button id="btn-search" class="primary">Search</button></div>
   </div>
   <p class="hint">
-    Assertion is a structured predicate on both paths. A coded AE row asserts
-    presence by construction; a narrative can name a concept precisely in order
-    to record that it did <em>not</em> happen, which is where the filter earns
-    its keep — and absence stays queryable in its own right.
+    Cohort membership is decided by normalized attributes and a definition's
+    verdict — no embedding is consulted for it. Discovery is where semantic
+    search earns its place: finding modifiers the value space does not cover yet,
+    so a person can decide whether to extend it.
   </p>
   <div id="r-summary" class="summary"></div>
   <div id="r-results"></div>
@@ -268,53 +212,47 @@
   <div class="pane wide">
     <h2>Ask a question</h2>
     <p class="hint">
-      The agent compiles a question into an inspectable specification and runs
-      it through validated code. Where the question leaves a rule
-      underdetermined it says which rule and why, instead of picking a default.
-      <strong>There is no approval click.</strong> Approving a specification you
-      cannot independently evaluate is ceremony; what makes the number checkable
-      is the trace returned with it, which anyone can follow back to the
-      sentence a site wrote.
+      The agent compiles a question into an inspectable specification and runs it
+      through typed, permissioned tools. It computes nothing itself: there is no
+      SQL surface and no tool that writes to a source record.
+      <strong>There is no approval click</strong> — what makes a number checkable
+      is the trace returned with it.
     </p>
     <div class="row">
       <input id="a-question" class="grow"
-             value="how many subjects had symptomatic hypoglycemia?">
+             value="how many rash cases were there after first exposure?">
       <button id="btn-compile">Compile only</button>
       <button id="btn-ask" class="primary">Ask</button>
     </div>
     <div class="row examples">
       <span class="hint">Try:</span>
-      <button class="link" data-q="how many subjects had severe hypoglycemia?">a severity ambiguity</button>
-      <button class="link" data-q="serious severe hypoglycemia cases">severity vs seriousness</button>
-      <button class="link" data-q="hypoglycemia within 7 days of dose escalation">a window that differs from the definition</button>
-      <button class="link" data-q="symptomatic hypoglycemia with glucose below 70 mg/dL">a threshold that differs</button>
+      <button class="link" data-q="how many severe rash cases required hospitalisation?">severity vs seriousness</button>
+      <button class="link" data-q="rash within 30 days of first exposure">a window the definition does not use</button>
       <button class="link" data-q="how many patients had a stroke?">no matching definition</button>
+      <button class="link" data-q="how many rash cases and how many are not ascertainable?">ascertainability</button>
     </div>
 
     <div id="a-clarification" class="clarify hidden"></div>
-
     <div id="a-spec-wrap" class="hidden">
       <h2>Compiled specification <span id="a-spec-badge" class="badge warn">not executed</span></h2>
       <pre id="a-spec" class="code"></pre>
     </div>
-
     <div id="a-result"></div>
 
     <h2>Trace</h2>
     <p class="hint">
       number → analysis run → cohort → definition version → episodes → source
-      records → spans. A number that cannot be followed to source text is a
-      failing test, not a footnote.
+      records → spans. A number that cannot be followed to source is a failing
+      test, not a footnote.
     </p>
     <pre id="a-trace" class="code">Ask a question to produce a trace.</pre>
 
-    <h2>Program knowledge layer</h2>
+    <h2>Tool surface</h2>
     <p class="hint">
-      Built from execution manifests, forward-capture only. It is empty until
-      something has been run, and it says so rather than implying that history
-      was reconstructed.
+      Every tool declares an input schema, an output schema and a permission.
+      Calls are validated both ways.
     </p>
-    <div id="k-status"></div>
+    <div id="tool-table"></div>
   </div>
 </section>
 

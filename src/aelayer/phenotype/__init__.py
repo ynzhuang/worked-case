@@ -1,18 +1,16 @@
-"""Phenotype definitions: load, validate, version, evaluate."""
+"""Phenotype definitions and their evaluation."""
 
+from .evaluator import PhenotypeEvaluator, evaluate_definition
 from .loader import (
     DefinitionCatalog,
     DefinitionError,
-    diff_definitions,
+    definition_content_hash,
     load_definition,
+    validate_definition,
 )
-from .evaluator import PhenotypeEvaluator, evaluate_definition
 
 __all__ = [
-    "DefinitionCatalog",
-    "DefinitionError",
-    "PhenotypeEvaluator",
-    "diff_definitions",
-    "evaluate_definition",
-    "evaluate_definition",
+    "DefinitionCatalog", "DefinitionError", "PhenotypeEvaluator",
+    "definition_content_hash", "evaluate_definition", "load_definition",
+    "validate_definition",
 ]

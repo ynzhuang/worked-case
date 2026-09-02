@@ -25,8 +25,8 @@ class DiscordantEpisode:
     study_id: str
     verdict_a: str
     verdict_b: str
-    state_a: str
-    state_b: str
+    deciding_a: str | None
+    deciding_b: str | None
     reason_a: str
     reason_b: str
 
@@ -37,8 +37,8 @@ class DiscordantEpisode:
             "study_id": self.study_id,
             "verdict_a": self.verdict_a,
             "verdict_b": self.verdict_b,
-            "state_a": self.state_a,
-            "state_b": self.state_b,
+            "deciding_a": self.deciding_a,
+            "deciding_b": self.deciding_b,
             "reason_a": self.reason_a,
             "reason_b": self.reason_b,
         }
@@ -106,8 +106,8 @@ def diff_definitions(
             study_id=by_a[episode_id].study_id,
             verdict_a=by_a[episode_id].verdict,
             verdict_b=by_b[episode_id].verdict,
-            state_a=by_a[episode_id].evidence_state,
-            state_b=by_b[episode_id].evidence_state,
+            deciding_a=by_a[episode_id].deciding_attribute,
+            deciding_b=by_b[episode_id].deciding_attribute,
             reason_a=by_a[episode_id].reason,
             reason_b=by_b[episode_id].reason,
         )

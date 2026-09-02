@@ -1,314 +1,192 @@
-"""The model path: assertion, values, temporality, and concept surface forms.
-
-These are the pieces the extraction backends are built from. Each is tested on
-text written here rather than on corpus output, so a failure names the rule that
-broke rather than the pipeline stage that noticed.
-"""
+"""The model path: finding modifiers in language and normalizing them."""
 
 from __future__ import annotations
 
-import datetime as _dt
-
 import pytest
 
-from aelayer.anchors import AnchorResolver
-from aelayer.extract.assertion import AssertionClassifier
-from aelayer.extract.concepts import ConceptMatcher
-from aelayer.extract.temporal import TemporalExtractor
-from aelayer.extract.text import edit_distance, split_sentences, tokenize
-from aelayer.extract.values import ValueExtractor
+from aelayer.extract.backends import ExtractionRequest, LLMBackend, RulesBackend, select_backend
+from aelayer.extract.modifiers import ModifierExtractor
 
 
 @pytest.fixture(scope="module")
-def extraction(configs):
-    return configs.extraction
+def extractor(catalog, configs):
+    return ModifierExtractor(catalog, configs.extraction)
 
 
 @pytest.fixture(scope="module")
-def classifier(extraction):
-    return AssertionClassifier(extraction)
+def backend(catalog, configs):
+    return RulesBackend(catalog, configs.extraction, configs.extractor_version)
 
 
-@pytest.fixture(scope="module")
-def matcher(catalog, extraction):
-    return ConceptMatcher(catalog, extraction)
+# -- anchoring --------------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def values(catalog, extraction):
-    return ValueExtractor(catalog, extraction)
+@pytest.mark.parametrize("text,expected", [
+    ("rash on the chest", "CHEST"),
+    ("skin rash over the anterior chest", "CHEST"),
+    ("maculopapular rash affecting the abdomen", "ABDOMEN"),
+    ("rash involving the lower back", "BACK"),
+    ("chest rash", "CHEST"),
+    ("eruption over the periumbilical area", "ABDOMEN"),
+])
+def test_a_site_joined_to_the_event_is_found(extractor, text, expected):
+    hit = extractor.best(text, "location", "RASH")
+    assert hit is not None, text
+    assert hit.value == expected
 
 
-def classify(classifier, text: str, needle: str):
-    start = text.lower().index(needle.lower())
-    return classifier.classify(text, start, start + len(needle), split_sentences(text))
+def test_a_site_belonging_to_another_event_is_not_attached(extractor):
+    """"rash resolved; history of eczema on the back" is not a truncal rash."""
+    assert extractor.best(
+        "rash resolved; history of eczema on the back", "location", "RASH"
+    ) is None
 
 
-# -- sentences and tokens ---------------------------------------------------
+def test_a_site_in_another_sentence_is_not_attached(extractor):
+    assert extractor.best(
+        "Rash noted. The patient has a tattoo on the back.", "location", "RASH"
+    ) is None
 
 
-def test_sentences_carry_their_own_offsets():
-    text = "Onset on day 3. Glucose was 54 mg/dL. Resolved."
-    sentences = split_sentences(text)
-    assert len(sentences) == 3
-    for sentence in sentences:
-        assert text[sentence.start:sentence.end] == sentence.text
+def test_a_connector_only_counts_when_nothing_else_intervenes(extractor):
+    hits = {h.value: h for h in extractor.find("rash on the chest and the back",
+                                               "location", "RASH")}
+    assert hits["CHEST"].confidence > hits["BACK"].confidence
 
 
-def test_a_token_points_back_at_the_characters_it_came_from():
-    text = "Severe hypoglycaemia overnight"
-    for token in tokenize(text):
-        assert text[token.start:token.end] == token.text
+def test_confidence_reflects_how_the_site_was_attached(extractor):
+    joined = extractor.best("rash on the chest", "location", "RASH")
+    adjacent = extractor.best("chest rash", "location", "RASH")
+    assert joined.confidence > adjacent.confidence
+    assert "joined to the event" in joined.rule
 
 
-def test_edit_distance_stops_counting_past_the_ceiling():
-    assert edit_distance("hypoglycaemia", "hypoglycemia", maximum=2) == 1
-    assert edit_distance("hypoglycaemia", "anaemia", maximum=2) > 2
-
-
-# -- assertion --------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "text,expected",
-    [
-        ("Patient reported hypoglycemia overnight.", "present"),
-        ("There was no hypoglycemia during the infusion.", "absent"),
-        ("The patient denied hypoglycemia at the visit.", "absent"),
-        ("Possible hypoglycemia; glucose not drawn.", "uncertain"),
-        ("History of hypoglycemia prior to enrolment.", "historical"),
-        ("Advised to report hypoglycemia if it recurs.", "hypothetical"),
-        ("Mother has hypoglycemia unawareness.", "family_history"),
-    ],
-)
-def test_each_assertion_class_is_reachable(classifier, text, expected):
-    assert classify(classifier, text, "hypoglycemia").assertion == expected
-
-
-def test_a_mention_with_no_cue_defaults_to_present(classifier):
-    result = classify(classifier, "Hypoglycemia at 03:00.", "hypoglycemia")
-    assert result.assertion == "present"
-    assert result.cue is None
-    assert "default" in result.rule
-
-
-def test_a_pseudo_cue_does_not_negate(classifier):
-    """'no change' contains a negation token but negates nothing clinical."""
-    text = "No change in dose; hypoglycemia recurred the next night."
-    assert classify(classifier, text, "hypoglycemia").assertion == "present"
-
-
-def test_a_cue_does_not_reach_past_a_terminator(classifier):
-    text = "No nausea, but hypoglycemia was documented."
-    assert classify(classifier, text, "hypoglycemia").assertion == "present"
-
-
-def test_a_cue_does_not_reach_into_the_next_sentence(classifier):
-    text = "There was no nausea. Hypoglycemia was documented overnight."
-    assert classify(classifier, text, "Hypoglycemia").assertion == "present"
-
-
-def test_a_post_cue_governs_a_mention_that_precedes_it(classifier):
-    text = "Hypoglycemia was ruled out on repeat testing."
-    assert classify(classifier, text, "Hypoglycemia").assertion == "absent"
-
-
-def test_the_nearest_cue_wins(classifier):
-    text = "History of diabetes; possible hypoglycemia this morning."
-    assert classify(classifier, text, "hypoglycemia").assertion == "uncertain"
-
-
-def test_the_classifier_reports_the_cue_it_used(classifier):
-    result = classify(
-        classifier, "There was no hypoglycemia overnight.", "hypoglycemia"
+def test_a_comment_gets_its_own_confidence(extractor):
+    """A comment is written about this record, so it supports more than prose."""
+    prose = extractor.best(
+        "Site clarification: rash noted, the chest was affected.", "location", "RASH"
     )
-    assert result.cue
-    assert result.has_cue
-    assert result.cue in "There was no hypoglycemia overnight."
-
-
-# -- concepts ---------------------------------------------------------------
-
-
-def test_a_lexicon_surface_form_is_matched(matcher):
-    mentions = matcher.find_concepts("Patient reported hypoglycemia overnight.")
-    assert any(m.concept_id == "HYPOGLYCEMIA" for m in mentions)
-
-
-def test_an_abbreviation_matches_only_with_the_context_its_gate_requires(matcher):
-    """'hypo' is ambiguous prose until something in the sentence anchors it."""
-    bare = matcher.find_concepts("Patient had a hypo overnight.")
-    assert not any(m.concept_id == "HYPOGLYCEMIA" for m in bare)
-    gated = matcher.find_concepts("Hypo overnight with tremor and sweating.")
-    assert any(m.concept_id == "HYPOGLYCEMIA" for m in gated)
-
-
-def test_a_spelling_variant_is_matched(matcher):
-    for surface in ("hypoglycaemia", "hypoglycemia", "low blood sugar"):
-        mentions = matcher.find_concepts(f"Reported {surface} at 02:00.")
-        assert any(m.concept_id == "HYPOGLYCEMIA" for m in mentions), surface
-
-
-def test_every_mention_points_at_the_text_it_matched(matcher):
-    text = "Reported hypoglycaemia and later anaemia."
-    for mention in matcher.find_concepts(text):
-        assert text[mention.start:mention.end].lower() == mention.surface.lower()
-
-
-def test_overlapping_matches_resolve_to_the_longest(matcher):
-    mentions = matcher.find_concepts("Severe hypoglycemia unawareness noted.")
-    spans = [(m.start, m.end) for m in mentions]
-    assert len(spans) == len(set(spans))
-    for i, (start, end) in enumerate(spans):
-        for other_start, other_end in spans[i + 1:]:
-            assert end <= other_start or other_end <= start
-
-
-def test_symptoms_are_matched_from_the_catalogue(matcher):
-    found = {m.symptom for m in matcher.find_symptoms("Tremor and sweating noted.")}
-    assert {"tremor", "sweating"} <= found
-
-
-def test_a_coded_term_maps_to_a_concept(matcher):
-    assert matcher.coded_term_concept("Hypoglycaemia") == "HYPOGLYCEMIA"
-    assert matcher.coded_term_concept("Malaise") is None
-    assert matcher.coded_term_concept(None) is None
-
-
-# -- values -----------------------------------------------------------------
-
-
-def test_a_lab_value_with_its_unit_is_read(values):
-    hits = values.find_labs("Blood glucose was 54 mg/dL at the time.")
-    assert len(hits) == 1
-    assert (hits[0].test, hits[0].value, hits[0].unit) == ("GLUCOSE", 54.0, "mg/dL")
-
-
-def test_an_si_value_is_read_in_its_own_unit(values):
-    hit = values.find_labs("Glucose 3.1 mmol/L.")[0]
-    assert (hit.value, hit.unit) == (3.1, "mmol/L")
-
-
-def test_a_bare_number_is_given_a_unit_only_when_it_can_only_be_one(values):
-    assert values.find_labs("Glucose was 54.")[0].unit == "mg/dL"
-    assert values.find_labs("Glucose 3.1.")[0].unit == "mmol/L"
-
-
-def test_a_magnitude_that_fits_no_declared_range_yields_no_value(values):
-    """Between the two unit ranges there is no honest reading, so there is none."""
-    assert values.find_labs("Glucose 32.") == []
-    assert values.find_labs("Glucose 1.") == []
-
-
-def test_a_duration_is_not_a_laboratory_result(values):
-    """'glucose ... 1 days after' must not become 1.0 mmol/L."""
-    assert values.find_labs("Blood glucose checked 1 days after escalation.") == []
-
-
-def test_severity_and_seriousness_are_read_from_separate_cue_sets(values):
-    severity = values.single_value("The event was severe.", "severity")
-    assert severity.value == "severe"
-    assert values.single_value("The event was severe.", "seriousness") is None
-    serious = values.multi_value("The patient was hospitalised.", "seriousness")
-    assert [c.value for c in serious] == ["hospitalisation"]
-
-
-def test_a_cue_shadowed_by_a_longer_one_is_dropped(values):
-    hit = values.single_value(
-        "Required third-party assistance overnight.", "severity"
+    comment = extractor.best(
+        "Site clarification: rash noted, the chest was affected.", "location",
+        "RASH", "comment",
     )
-    assert hit.value == "severe"
+    assert comment.confidence >= prose.confidence
 
 
-def test_a_value_cue_reports_where_it_was_found(values):
-    text = "The event was moderate in intensity."
-    hit = values.single_value(text, "severity")
-    assert text[hit.start:hit.end].lower() == hit.cue.lower()
-    assert hit.field == "severity"
+# -- abstention -------------------------------------------------------------
 
 
-# -- temporality ------------------------------------------------------------
+def test_a_term_with_no_site_yields_nothing(extractor):
+    assert extractor.best("rash", "location", "RASH") is None
+    assert extractor.best("Skin disorder", "location", "RASH") is None
 
 
-ANCHORS = {"dose_escalation": {"domain": "EX", "rule": "dose_increase",
-                               "date_field": "EXSTDTC"}}
-EXPOSURES = {"S1": [
-    {"USUBJID": "S1", "EXSEQ": 1, "EXDOSE": 10, "EXSTDTC": "2024-01-01"},
-    {"USUBJID": "S1", "EXSEQ": 2, "EXDOSE": 20, "EXSTDTC": "2024-02-01"},
-]}
+def test_a_word_no_lexicon_carries_yields_nothing(extractor):
+    """Abstaining is correct: inventing a catalogue value would be the defect."""
+    for text in ("rash over the torso", "rash on the midriff",
+                 "rash affecting the shoulder blade area"):
+        assert extractor.best(text, "location", "RASH") is None, text
 
 
-@pytest.fixture(scope="module")
-def temporal(extraction):
-    return TemporalExtractor(extraction, AnchorResolver(ANCHORS, EXPOSURES))
+def test_two_equally_supported_values_yield_nothing(extractor):
+    hits = extractor.find("rash on the chest, rash on the back", "location", "RASH")
+    values = {h.value for h in hits if h.confidence == max(x.confidence for x in hits)}
+    if len(values) > 1:
+        assert extractor.best("rash on the chest, rash on the back",
+                              "location", "RASH") is None
 
 
-def resolve(temporal, text, **kwargs):
-    return temporal.resolve(
-        subject_id="S1", text=text, scope=None,
-        default_anchor="dose_escalation", **kwargs,
+# -- patterns and qualities -------------------------------------------------
+
+
+def test_a_pattern_is_normalized_to_the_catalogue(extractor):
+    hit = extractor.best("morbilliform rash on the chest", "pattern", "RASH")
+    assert hit.value == "MACULOPAPULAR"
+
+
+def test_quality_descriptors_are_found_but_not_normalized(extractor):
+    hits = extractor.qualities("itchy spreading rash on the chest")
+    assert {h.value for h in hits} == {"itchy", "spreading"}
+    assert all(h.attribute == "quality" for h in hits)
+
+
+# -- the backend contract ---------------------------------------------------
+
+
+def test_the_backend_returns_attributes_that_validate(backend):
+    result = backend.extract(ExtractionRequest(
+        doc_id="AE:R1:AETERM", text="rash on the chest",
+        attributes=("location", "pattern"), concept_id="RASH",
+    ))
+    assert result.values["location"].value == "CHEST"
+    assert result.values["location"].method == "extracted"
+    assert result.values["location"].evidence
+    assert "pattern" in result.abstained
+
+
+def test_a_span_points_at_the_characters_it_claims(backend):
+    text = "maculopapular rash over the lower back"
+    result = backend.extract(ExtractionRequest(
+        doc_id="D1", text=text, attributes=("location",), concept_id="RASH",
+    ))
+    span = result.values["location"].evidence[0]
+    assert text[span.start:span.end].lower() == span.text.lower()
+    assert span.extracted_value == "BACK"
+
+
+def test_the_backend_stamps_the_versions_that_produced_the_value(backend, configs):
+    result = backend.extract(ExtractionRequest(
+        doc_id="D1", text="rash on the chest", attributes=("location",),
+        concept_id="RASH",
+    ))
+    attribute = result.values["location"]
+    assert attribute.extractor_version == configs.extractor_version
+    assert attribute.prompt_version
+
+
+def test_the_backend_reports_abstention_rather_than_guessing(backend):
+    result = backend.extract(ExtractionRequest(
+        doc_id="D1", text="rash", attributes=("location",), concept_id="RASH",
+    ))
+    assert result.values == {}
+    assert result.abstained == ["location"]
+
+
+# -- backend selection ------------------------------------------------------
+
+
+def test_without_credentials_the_model_path_is_the_offline_baseline(
+    catalog, configs, monkeypatch
+):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    backend, notes = select_backend(
+        catalog, configs.extraction, configs.extractor_version, "auto"
     )
+    assert isinstance(backend, RulesBackend)
+    assert any("offline rules baseline" in note for note in notes)
 
 
-def test_the_structured_onset_date_is_preferred_over_the_narrative(temporal):
-    result = resolve(
-        temporal, "Six days after the dose escalation.",
-        recorded_onset="2024-02-04",
+def test_asking_for_an_llm_without_credentials_says_it_degraded(
+    catalog, configs, monkeypatch
+):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    backend, notes = select_backend(
+        catalog, configs.extraction, configs.extractor_version, "llm"
     )
-    assert result.source == "structured_onset_date"
-    assert result.onset_date == _dt.date(2024, 2, 4)
-    assert result.onset_offset_days == 3
+    assert isinstance(backend, RulesBackend)
+    assert any("degraded to the offline rules baseline" in n for n in notes)
 
 
-def test_a_relative_expression_is_anchored_to_the_exposure_record(temporal):
-    result = resolve(temporal, "Six days after the dose escalation the patient fell.")
-    assert result.onset_offset_days == 6
-    assert result.onset_date == _dt.date(2024, 2, 7)
-    assert result.anchor_event == "dose_escalation"
-
-
-def test_a_study_day_needs_a_reference_start_and_says_so_without_one(temporal):
-    unresolved = resolve(temporal, "Event on day 12.")
-    assert unresolved.source == "unresolved_study_day"
-    assert not unresolved.resolved
-    assert "reference start date" in unresolved.detail
-
-    resolved = resolve(
-        temporal, "Event on day 12.", reference_start=_dt.date(2024, 1, 1)
+def test_the_llm_backend_validates_its_output_against_the_catalogue(catalog, configs):
+    llm = LLMBackend(catalog, configs.extraction, configs.extractor_version)
+    request = ExtractionRequest(
+        doc_id="D1", text="rash on the chest", attributes=("location",),
     )
-    assert resolved.onset_date == _dt.date(2024, 1, 12)
-
-
-def test_an_absolute_date_in_the_narrative_is_read(temporal):
-    result = resolve(temporal, "Event on 2024-02-09 overnight.")
-    assert result.onset_date == _dt.date(2024, 2, 9)
-    assert result.onset_offset_days == 8
-
-
-def test_a_vague_quantifier_is_resolved_and_marked_vague(temporal):
-    result = resolve(temporal, "A few days after the dose escalation.")
-    assert result.source == "narrative_relative_vague"
-    assert result.mention.vague
-    assert result.confidence < 0.92
-
-
-def test_a_subject_with_no_anchor_keeps_the_offset_and_drops_the_date(temporal):
-    result = temporal.resolve(
-        subject_id="NOBODY", text="Six days after the dose escalation.",
-        scope=None, default_anchor="dose_escalation",
+    assert llm._validate("location", {"value": "ELBOW_PIT", "start": 0, "end": 4},
+                         request) is None
+    assert llm._validate("location", {"value": "CHEST", "start": 99, "end": 200},
+                         request) is None
+    good = llm._validate(
+        "location", {"value": "anterior chest", "start": 12, "end": 17}, request
     )
-    assert result.onset_offset_days == 6
-    assert result.onset_date is None
-    assert "no resolvable anchor date" in result.detail
-
-
-def test_text_with_no_temporal_expression_resolves_to_nothing(temporal):
-    result = resolve(temporal, "The patient felt unwell.")
-    assert not result.resolved
-    assert result.source == "unresolved"
-
-
-def test_an_anchor_phrase_in_text_beats_the_default(temporal):
-    assert temporal.match_anchor("the dose escalation") == "dose_escalation"
-    assert temporal.match_anchor("the first dose") == "first_dose"
-    assert temporal.match_anchor("the moon landing") is None
+    assert good is not None and good.value == "CHEST"

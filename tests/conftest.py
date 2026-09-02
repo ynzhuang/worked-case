@@ -19,16 +19,13 @@ from aelayer.generate import generate_corpus  # noqa: E402
 from aelayer.ingest import load_store  # noqa: E402
 from aelayer.pipeline import Pipeline  # noqa: E402
 
-SEED = 13
+SEED = 11
 
 
 @pytest.fixture(scope="session")
 def corpus_dir(tmp_path_factory) -> Path:
     root = tmp_path_factory.mktemp("corpus")
-    generate_corpus(
-        seed=SEED, n_studies=6, out_dir=root,
-        invariance_truths=10, background_per_study=6,
-    )
+    generate_corpus(seed=SEED, out_dir=root, shared_truths=16, extra_per_profile=8)
     return root
 
 
@@ -43,8 +40,8 @@ def catalog(configs):
 
 
 @pytest.fixture(scope="session")
-def semantics(configs):
-    return configs.semantics
+def profiles(configs):
+    return configs.profiles
 
 
 @pytest.fixture(scope="session")
@@ -70,16 +67,21 @@ def episodes(pipeline):
 
 @pytest.fixture(scope="session")
 def definition_v1(pipeline):
-    return pipeline.definition("te_symptomatic_hypoglycemia", 1)
+    return pipeline.definition("te_truncal_rash", 1)
 
 
 @pytest.fixture(scope="session")
 def definition_v2(pipeline):
-    return pipeline.definition("te_symptomatic_hypoglycemia", 2)
+    return pipeline.definition("te_truncal_rash", 2)
 
 
 @pytest.fixture(scope="session")
-def index(pipeline, definition_v1):
+def assignments(pipeline, definition_v1):
+    return pipeline.evaluate(definition_v1)
+
+
+@pytest.fixture(scope="session")
+def index(pipeline, assignments):
     idx = pipeline.index()
-    idx.record_assignments(pipeline.evaluate(definition_v1))
+    idx.record_assignments(assignments)
     return idx

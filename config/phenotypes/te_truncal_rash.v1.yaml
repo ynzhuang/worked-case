@@ -1,0 +1,65 @@
+id: te_truncal_rash
+version: 1
+status: frozen
+label: Treatment-emergent truncal rash
+operates_on: episode
+description: >
+  A rash with a truncal location, first recorded within 14 days of first
+  exposure. Evaluated over derived episodes, not over source records.
+supersedes: null
+authors: ["clinical-evidence-prototype"]
+created: 2026-09-02
+
+concept:
+  primary: RASH
+  # Coded terms move between dictionary versions; bridging unions the terms the
+  # catalogue lists for each. Without it, a study coded under 24.0 undercounts.
+  bridge_dictionary_versions: true
+  include_coded_terms: true
+  include_lexicon: true
+
+required_attributes:
+  - name: location
+    in: [CHEST, ABDOMEN, BACK]
+    # Route-agnostic by design. The rule does not care whether the location
+    # came from AELOC, from a sponsor variable, from the investigator's own
+    # words, or from a comment — only that it is present and points at
+    # something a reader can check.
+    accept_methods: [direct, normalized, extracted]
+    min_confidence: 0.6
+    on_unavailable: not_ascertainable
+    on_low_confidence: review
+    description: >
+      Where the location was never collected and cannot be recovered, the
+      phenotype cannot be evaluated. That is not a negative case and is
+      reported separately.
+
+  - name: onset
+    window: {unit: days, min: 0, max: 14, anchor: first_exposure}
+    accept_methods: [direct, normalized, extracted]
+    on_unavailable: not_ascertainable
+    on_unresolved: review
+
+anchor:
+  event: first_exposure
+  source_domain: EX
+  index_rule: first_occurrence
+
+episode_linkage_confidence: 0.8
+on_linkage_review: review
+
+verdicts:
+  case: All required attributes are present and satisfy their rule.
+  not_case: A required attribute is present and fails its rule.
+  not_ascertainable: >
+    A required attribute is unavailable and unrecoverable, so no one can
+    evaluate the rule — not the system and not a reviewer.
+  review: >
+    A required attribute is present but below the confidence threshold, or an
+    onset could not be resolved against the anchor.
+
+reporting:
+  counts_by_verdict: true
+  counts_by_attribute_source: true
+  require_evidence_span_for_extracted: true
+  report_not_ascertainable_separately: true

@@ -1,12 +1,10 @@
-"""Evaluation harness: extraction, phenotype, retrieval, stability, sensitivity."""
+"""Evaluation: phenotype, ablation, availability, silver, transport, invariance."""
 
-from .metrics import ConfusionMatrix, PRF, prf_from_counts
 from .harness import EvaluationHarness, run_evaluation
+from .metrics import ConfusionMatrix, PRF
+from .transport import transportability
 
 __all__ = [
-    "ConfusionMatrix",
-    "PRF",
-    "EvaluationHarness",
-    "prf_from_counts",
-    "run_evaluation",
+    "ConfusionMatrix", "EvaluationHarness", "PRF", "run_evaluation",
+    "transportability",
 ]

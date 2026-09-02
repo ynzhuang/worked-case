@@ -1,9 +1,8 @@
-"""Deterministic coercion of controlled values, dates and units.
+"""Deterministic coercion of controlled values and dates.
 
-Every function here is total and explicit: given a cell and the study's
-conventions, it returns a value and the collection state that describes it.
-Nothing guesses, and nothing returns a bare ``None`` that a caller could mistake
-for "the site said no".
+Every function here is total and explicit: given a cell and the study's profile,
+it returns a value and the availability that describes it. Nothing guesses, and
+nothing returns a bare ``None`` a caller could mistake for "the site said no".
 """
 
 from __future__ import annotations
@@ -16,18 +15,17 @@ from ..models import (
     OUTCOME_VALUES,
     RELATEDNESS_VALUES,
     SEVERITY_VALUES,
-    CollectionState,
+    Availability,
 )
-from ..semantics import Codelist, StudySemantics
+from ..profiles import StudyProfile
 
 #: Spellings that appear in real extracts for the same controlled concept.
 #: Mapping them is deterministic; inferring beyond them is not attempted.
-_ALIASES: dict[str, dict[str, str]] = {
+ALIASES: dict[str, dict[str, str]] = {
     "severity": {
-        "grade 1": "mild", "grade_1": "mild", "1": "mild", "mild": "mild",
-        "grade 2": "moderate", "grade_2": "moderate", "2": "moderate",
-        "moderate": "moderate",
-        "grade 3": "severe", "grade_3": "severe", "3": "severe", "severe": "severe",
+        "grade 1": "mild", "1": "mild", "mild": "mild",
+        "grade 2": "moderate", "2": "moderate", "moderate": "moderate",
+        "grade 3": "severe", "3": "severe", "severe": "severe",
     },
     "relatedness": {
         "not related": "not_related", "unrelated": "not_related",
@@ -39,37 +37,40 @@ _ALIASES: dict[str, dict[str, str]] = {
         "unknown": "unknown", "not assessable": "unknown",
     },
     "action_taken": {
-        "dose not changed": "dose_not_changed", "dose_not_changed": "dose_not_changed",
-        "none": "dose_not_changed", "no change": "dose_not_changed",
+        "dose not changed": "dose_not_changed",
+        "dose_not_changed": "dose_not_changed", "none": "dose_not_changed",
         "dose reduced": "dose_reduced", "dose_reduced": "dose_reduced",
-        "drug interrupted": "drug_interrupted", "drug_interrupted": "drug_interrupted",
-        "dose interrupted": "drug_interrupted",
+        "drug interrupted": "drug_interrupted",
+        "drug_interrupted": "drug_interrupted",
         "drug withdrawn": "drug_withdrawn", "drug_withdrawn": "drug_withdrawn",
         "not applicable": "not_applicable", "not_applicable": "not_applicable",
         "unknown": "unknown",
     },
     "outcome": {
         "recovered": "recovered", "resolved": "recovered",
-        "recovered/resolved": "recovered",
         "recovering": "recovering", "resolving": "recovering",
         "not recovered": "not_recovered", "not_recovered": "not_recovered",
-        "not resolved": "not_recovered", "ongoing": "not_recovered",
+        "ongoing": "not_recovered",
         "recovered with sequelae": "recovered_with_sequelae",
         "recovered_with_sequelae": "recovered_with_sequelae",
-        "fatal": "fatal", "death": "fatal",
-        "unknown": "unknown",
+        "fatal": "fatal", "death": "fatal", "unknown": "unknown",
     },
 }
 
-_ALLOWED: dict[str, tuple[str, ...]] = {
+ALLOWED: dict[str, tuple[str, ...]] = {
     "severity": SEVERITY_VALUES,
     "relatedness": RELATEDNESS_VALUES,
     "action_taken": ACTION_TAKEN_VALUES,
     "outcome": OUTCOME_VALUES,
 }
 
-_BOOLEAN_TRUE = {"y", "yes", "true", "1"}
-_BOOLEAN_FALSE = {"n", "no", "false", "0"}
+_TRUE = {"y", "yes", "true", "1"}
+_FALSE = {"n", "no", "false", "0"}
+
+#: Formats a study might write a date in. Partial dates are handled separately:
+#: a month is a real fact, and not one that supports day arithmetic.
+_DATE_FORMATS = ("%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y", "%Y-%m-%dT%H:%M:%S",
+                 "%Y-%m-%dT%H:%M")
 
 
 def is_blank(cell: Any) -> bool:
@@ -77,109 +78,98 @@ def is_blank(cell: Any) -> bool:
 
 
 def coerce_enum(
-    field: str, cell: Any, study: StudySemantics
-) -> tuple[str | None, CollectionState, str]:
+    attribute: str, cell: Any, profile: StudyProfile, variable: str,
+) -> tuple[str | None, Availability, str]:
     """Map a controlled cell onto a canonical value.
 
-    Returns ``(value, collection_state, note)``.  A blank asks the study what
-    the blank means; a value outside the codelist is reported as such rather
-    than silently coerced to the nearest permissible code.
+    A blank asks the profile what the blank means; a value outside the codelist
+    is reported as such rather than silently coerced to the nearest permissible
+    code.
     """
     if is_blank(cell):
-        return None, study.state_for_blank(field), ""
-
+        return None, profile.availability_for_blank(variable), ""
     raw = str(cell).strip().lower().replace("-", " ")
-    canonical = _ALIASES.get(field, {}).get(raw)
+    canonical = ALIASES.get(attribute, {}).get(raw)
     if canonical is None:
         squashed = raw.replace(" ", "_")
-        if squashed in _ALLOWED.get(field, ()):
+        if squashed in ALLOWED.get(attribute, ()):
             canonical = squashed
     if canonical is None:
         return None, "unknown", (
-            f"value {cell!r} is not in the canonical codelist for {field}"
-        )
-
-    codelist: Codelist | None = study.codelist_for(field)
-    if codelist is not None and canonical not in codelist.permissible:
-        # The study recorded something its own codelist does not permit. Report
-        # it rather than accept it: the discrepancy is a data question.
-        return None, "unknown", (
-            f"value {canonical!r} is not permissible for {field} in "
-            f"{study.study_id}; permissible: {list(codelist.permissible)}"
+            f"value {cell!r} is not in the canonical codelist for {attribute}"
         )
     return canonical, "collected", ""
 
 
-def unresolved_concept(
-    field: str, concept: str | None, study: StudySemantics
-) -> tuple[CollectionState, str]:
-    """The state for a field whose intended concept the codelist cannot express.
-
-    ``not_representable`` is a statement about the field, not an inference
-    about what the site did instead.  Substituting the nearest permissible
-    code would assert something stronger than the evidence supports.
-    """
-    codelist = study.codelist_for(field)
-    if codelist is None or concept is None:
-        return study.state_for_blank(field), ""
-    if concept in codelist.absent_concepts:
-        return "not_representable", (
-            f"{study.study_id} has no permissible {field} value for {concept!r}; "
-            f"the field is left unresolved rather than coerced"
-        )
-    return study.state_for_blank(field), ""
-
-
 def coerce_bool(
-    field: str, cell: Any, study: StudySemantics
-) -> tuple[bool | None, CollectionState, str]:
+    cell: Any, profile: StudyProfile, variable: str,
+) -> tuple[bool | None, Availability, str]:
     if is_blank(cell):
-        return None, study.state_for_blank(field), ""
+        return None, profile.availability_for_blank(variable), ""
     raw = str(cell).strip().lower()
-    if raw in _BOOLEAN_TRUE:
+    if raw in _TRUE:
         return True, "collected", ""
-    if raw in _BOOLEAN_FALSE:
+    if raw in _FALSE:
         return False, "collected", ""
-    return None, "unknown", f"value {cell!r} is not a recognised yes/no for {field}"
+    return None, "unknown", f"value {cell!r} is not a recognised yes/no"
 
 
-def coerce_datetime(
-    field: str, cell: Any, study: StudySemantics
-) -> tuple[_dt.datetime | None, CollectionState, str]:
-    """Parse an ISO-8601 or partial SDTM date.
+def coerce_date(
+    cell: Any, profile: StudyProfile, variable: str,
+) -> tuple[_dt.date | None, Availability, str]:
+    """Parse a date written in whichever convention the study uses.
 
-    A partial date (year, or year-month) is a real value, but not one that
-    supports day-level arithmetic, so it is reported as ``unknown`` with a note
-    rather than silently rounded to the first of the month.
+    A partial date is a real value, but not one that supports day-level
+    arithmetic, so it is reported as ``unknown`` with a note rather than being
+    silently rounded to the first of the month.
     """
     if is_blank(cell):
-        return None, study.state_for_blank(field), ""
+        return None, profile.availability_for_blank(variable), ""
+    if isinstance(cell, _dt.datetime):
+        return cell.date(), "collected", ""
+    if isinstance(cell, _dt.date):
+        return cell, "collected", ""
     text = str(cell).strip()
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+    for fmt in _DATE_FORMATS:
         try:
-            return _dt.datetime.strptime(text, fmt), "collected", ""
+            return _dt.datetime.strptime(text, fmt).date(), "collected", ""
         except ValueError:
             continue
     if len(text) in (4, 7):
         return None, "unknown", (
-            f"{field} is a partial date ({text!r}); day-level arithmetic is not "
-            f"supported by it"
+            f"{variable} is a partial date ({text!r}); day-level arithmetic is "
+            f"not supported by it"
         )
-    return None, "unknown", f"{field} value {cell!r} is not a parsable date"
+    return None, "unknown", f"{variable} value {cell!r} is not a parsable date"
 
 
-def to_canonical_unit(
-    value: float, unit: str, conversions: dict[str, float]
-) -> float | None:
-    """Convert a reported value into the catalogue's canonical unit.
+def resolve_sponsor_value(
+    profile: StudyProfile, rows: list[dict[str, Any]], attribute: str,
+) -> tuple[str | None, Availability, str, str | None]:
+    """Resolve a sponsor-defined supplemental qualifier.
 
-    Not decoration: a threshold applied to an unconverted mmol/L value
-    misclassifies an entire study in silence.
+    Returns ``(value, availability, note, variable)``. The mapping is declared
+    in the profile; a code the mapping does not cover resolves to nothing,
+    because guessing which catalogue value a sponsor meant is exactly the silent
+    substitution this system exists to avoid.
     """
-    factor = conversions.get(unit)
-    if factor is None:
-        for known, known_factor in conversions.items():
-            if known.lower() == unit.lower():
-                factor = known_factor
-                break
-    return None if factor is None else round(value * factor, 4)
+    name = profile.sponsor_variable_name
+    if not name:
+        return None, profile.availability_for_blank(attribute), "", None
+    variable = f"SUPPAE.{name}"
+    matching = [r for r in rows if str(r.get("QNAM") or "") == name]
+    if not matching:
+        return None, profile.availability_for_blank(variable), "", variable
+    code = matching[0].get("QVAL")
+    if is_blank(code):
+        return None, "unknown", f"{variable} is present but empty", variable
+    value = profile.resolve_sponsor_code(str(code))
+    if value is None:
+        return None, "not_representable", (
+            f"{variable} holds {code!r}, which the declared mapping for "
+            f"{profile.profile_id} does not cover; the value is left unresolved "
+            f"rather than guessed"
+        ), variable
+    return value, "collected", (
+        f"{variable}={code!r} resolved through the sponsor codelist"
+    ), variable

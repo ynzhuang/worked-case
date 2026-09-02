@@ -2,12 +2,12 @@
 
 Order of work, and it does not vary:
 
-``ingest`` -> ``normalize`` (deterministic) -> ``extract`` (model path, unresolved
-fields only) -> ``reconcile`` (episodes) -> ``evaluate`` (phenotype).
+``ingest`` -> ``normalize`` (deterministic) -> ``extract`` (model path, on
+unresolved attributes only) -> ``reconcile`` (episodes) -> ``trajectory`` ->
+``evaluate`` (phenotype).
 
-Having a single path means the CLI and the API cannot disagree about which
-definition version, which normalizer or which extraction backend produced a
-number.
+One path means the CLI and the API cannot disagree about which definition
+version, which normalizer or which extraction backend produced a number.
 """
 
 from __future__ import annotations
@@ -17,14 +17,22 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import paths
+from .anchors import AnchorResolver
 from .catalog import Configs, load_configs
 from .episode import EpisodeReconciler, ReconciliationConfig
 from .extract.engine import ExtractionEngine
 from .ingest import TrialStore, load_store
-from .models import CanonicalAEEpisode, CanonicalAERecord, CaseAssignment, PhenotypeDefinition
+from .models import (
+    CanonicalAEEpisode,
+    CanonicalAERecord,
+    CaseAssignment,
+    PhenotypeDefinition,
+    Trajectory,
+)
 from .normalize import normalize_store
 from .phenotype.evaluator import PhenotypeEvaluator
 from .phenotype.loader import DefinitionCatalog
+from .trajectory import build_trajectories
 
 
 @dataclass
@@ -36,6 +44,7 @@ class Pipeline:
     store_path: Path | None = None
     _records: list[CanonicalAERecord] | None = _dc_field(default=None, repr=False)
     _episodes: list[CanonicalAEEpisode] | None = _dc_field(default=None, repr=False)
+    _trajectories: dict[str, Trajectory] | None = _dc_field(default=None, repr=False)
     _engine: ExtractionEngine | None = _dc_field(default=None, repr=False)
     _index: Any = _dc_field(default=None, repr=False)
 
@@ -48,12 +57,12 @@ class Pipeline:
         *,
         concepts_path: str | Path | None = None,
         extraction_path: str | Path | None = None,
-        semantics_path: str | Path | None = None,
+        profiles_path: str | Path | None = None,
         phenotype_dir: str | Path | None = None,
         store_path: str | Path | None = None,
         backend: str = "auto",
     ) -> "Pipeline":
-        configs = load_configs(concepts_path, extraction_path, semantics_path)
+        configs = load_configs(concepts_path, extraction_path, profiles_path)
         return cls(
             store=load_store(data_dir),
             configs=configs,
@@ -62,15 +71,15 @@ class Pipeline:
             store_path=Path(store_path) if store_path else None,
         )
 
-    # -- convenience accessors ---------------------------------------------
+    # -- accessors ----------------------------------------------------------
 
     @property
     def catalog(self):
         return self.configs.catalog
 
     @property
-    def semantics(self):
-        return self.configs.semantics
+    def profiles(self):
+        return self.configs.profiles
 
     @property
     def snapshot_id(self) -> str:
@@ -84,37 +93,63 @@ class Pipeline:
     def extractor_version(self) -> str:
         return self.configs.extractor_version
 
+    def anchor_resolver(self) -> AnchorResolver:
+        return self.store.anchor_resolver(self.configs.extraction.anchors)
+
     # -- the pipeline -------------------------------------------------------
 
     def engine(self) -> ExtractionEngine:
         if self._engine is None:
             self._engine = ExtractionEngine.build(
-                self.configs.catalog, self.configs.extraction,
-                self.configs.extractor_version, self.backend_preference,
+                self.configs, self.store, self.backend_preference
             )
         return self._engine
 
     def records(self, *, refresh: bool = False) -> list[CanonicalAERecord]:
-        """Normalized records, enriched from narrative where unresolved."""
+        """Normalized records, enriched from text where the study kept it there."""
         if self._records is not None and not refresh:
             return self._records
         records = normalize_store(self.store, self.configs)
-        self._records = self.engine().enrich_all(records, self.store.narratives)
+        self._records = self.engine().enrich_all(records)
         self._episodes = None
+        self._trajectories = None
         return self._records
+
+    def structured_only_records(self) -> list[CanonicalAERecord]:
+        """The same records with the model path never run.
+
+        This is the comparator for the value ablation: what the layer would
+        have without text recovery at all.
+        """
+        return normalize_store(self.store, self.configs)
 
     def episodes(self, *, refresh: bool = False) -> list[CanonicalAEEpisode]:
         if self._episodes is not None and not refresh:
             return self._episodes
-        extraction = self.configs.extraction
-        reconciler = EpisodeReconciler(
-            self.configs.catalog, self.configs.semantics,
-            ReconciliationConfig.from_catalog(self.configs.catalog),
-            anchor_resolver=self.store.anchor_resolver(extraction.anchors),
-            default_anchor=extraction.default_anchor,
-        )
-        self._episodes = reconciler.reconcile(self.records(refresh=refresh))
+        self._episodes = self.reconcile(self.records(refresh=refresh))
         return self._episodes
+
+    def reconcile(
+        self, records: Sequence[CanonicalAERecord]
+    ) -> list[CanonicalAEEpisode]:
+        reconciler = EpisodeReconciler(
+            self.configs.catalog, self.configs.profiles,
+            ReconciliationConfig.from_catalog(self.configs.catalog),
+            anchor_resolver=self.anchor_resolver(),
+            default_anchor=self.configs.extraction.default_anchor,
+        )
+        return reconciler.reconcile(records)
+
+    def trajectories(self, *, refresh: bool = False) -> dict[str, Trajectory]:
+        if self._trajectories is not None and not refresh:
+            return self._trajectories
+        self._trajectories = build_trajectories(
+            self.episodes(refresh=refresh), self.store, self.anchor_resolver(),
+            self.configs.extraction.default_anchor or "first_exposure",
+        )
+        return self._trajectories
+
+    # -- definitions and evaluation ----------------------------------------
 
     def definition(
         self, definition_id: str, version: int | None = None, *,
@@ -123,22 +158,18 @@ class Pipeline:
         return self.definitions.get(definition_id, version, allow_draft=allow_draft)
 
     def evaluator(self, definition: PhenotypeDefinition) -> PhenotypeEvaluator:
-        return PhenotypeEvaluator(
-            definition, self.configs.catalog,
-            self.store.anchor_resolver(self.configs.extraction.anchors),
-        )
+        return PhenotypeEvaluator(definition, self.configs.catalog)
 
     def evaluate(
-        self,
-        definition: PhenotypeDefinition,
+        self, definition: PhenotypeDefinition,
         studies: Sequence[str] | None = None,
         episodes: Sequence[CanonicalAEEpisode] | None = None,
     ) -> list[CaseAssignment]:
-        source = list(episodes) if episodes is not None else self.episodes()
+        pool = list(episodes if episodes is not None else self.episodes())
         if studies:
             allowed = set(studies)
-            source = [e for e in source if e.study_id in allowed]
-        return self.evaluator(definition).evaluate(source)
+            pool = [e for e in pool if e.study_id in allowed]
+        return self.evaluator(definition).evaluate(pool)
 
     def cohort(self, studies: Sequence[str] | None = None) -> list[tuple[str, str]]:
         pairs = [(s, self.store.study_of(s) or "") for s in self.store.subjects()]
@@ -163,47 +194,63 @@ class Pipeline:
         return self._index
 
     def mentions(self) -> list[dict[str, Any]]:
-        """Concept mentions in narrative text, each with its assertion.
+        """Modifier mentions in free text, for the discovery path.
 
-        Computed for the discovery path only. Episodes are built from records,
-        not from mentions; a mention is a place in a document where a concept
-        is named, which is a different thing from an event having occurred.
+        Episodes are built from records, not from mentions: a mention is a place
+        in a document where something is named, which is a different thing from
+        an event having occurred.
         """
-        from .extract.text import sentence_for, split_sentences
-
-        engine = self.engine()
-        backend = engine.backend
-        matcher = getattr(backend, "matcher", None)
-        classifier = getattr(backend, "assertions", None)
-        if matcher is None or classifier is None:
+        backend = self.engine().backend
+        extractor = getattr(backend, "modifiers", None)
+        if extractor is None:
             return []
         found: list[dict[str, Any]] = []
-        for narrative in sorted(self.store.narratives.values(), key=lambda n: n.doc_id):
-            text = narrative.full_text
-            sentences = split_sentences(text)
-            for mention in matcher.find_concepts(text, sentences):
-                verdict = classifier.classify(
-                    text, mention.start, mention.end, sentences
-                )
-                sentence = sentence_for(sentences, mention.start)
-                found.append(
-                    {
-                        "mention_id": (
-                            f"{narrative.doc_id}:{mention.start}:{mention.concept_id}"
-                        ),
-                        "doc_id": narrative.doc_id,
-                        "study_id": narrative.study_id,
-                        "subject_id": narrative.subject_id,
-                        "concept_id": mention.concept_id,
-                        "assertion": verdict.assertion,
-                        "match_kind": mention.kind,
-                        "start": mention.start,
-                        "end": mention.end,
-                        "surface": mention.surface,
-                        "sentence": sentence.text if sentence else "",
-                        "cue": verdict.cue,
-                    }
-                )
+        for record in self.records():
+            for doc_id, text, source_kind, variable in self.engine().sources_for(
+                record, self.configs.profiles.for_study(record.study_id)
+            ):
+                for attribute in ("location", "pattern"):
+                    for hit in extractor.find(
+                        text, attribute, record.standardized_concept, source_kind
+                    ):
+                        found.append({
+                            "mention_id": f"{doc_id}:{hit.start}:{hit.value}",
+                            "doc_id": doc_id,
+                            "study_id": record.study_id,
+                            "subject_id": record.subject_id,
+                            "source_record_id": record.source_record_id,
+                            "profile": record.profile,
+                            "attribute": attribute,
+                            "value": hit.value,
+                            "surface": hit.surface,
+                            "sentence": text,
+                            "source_kind": source_kind,
+                            "source_variable": variable,
+                            "confidence": hit.confidence,
+                            "rule": hit.rule,
+                            "normalized": True,
+                        })
+                for hit in extractor.qualities(text):
+                    found.append({
+                        "mention_id": f"{doc_id}:{hit.start}:{hit.value}",
+                        "doc_id": doc_id,
+                        "study_id": record.study_id,
+                        "subject_id": record.subject_id,
+                        "source_record_id": record.source_record_id,
+                        "profile": record.profile,
+                        "attribute": "quality",
+                        "value": hit.value,
+                        "surface": hit.surface,
+                        "sentence": text,
+                        "source_kind": source_kind,
+                        "source_variable": variable,
+                        "confidence": hit.confidence,
+                        "rule": hit.rule,
+                        # A quality descriptor is not in any catalogue value
+                        # space, which is exactly what makes it worth surfacing
+                        # on the discovery path.
+                        "normalized": False,
+                    })
         return found
 
     def retrieve(self, **kwargs: Any):
@@ -218,10 +265,9 @@ class Pipeline:
         return {
             "normalizer_version": self.configs.normalizer_version,
             "extractor_version": self.configs.extractor_version,
-            "extraction_backend": engine.backend.name,
-            "model_version": getattr(engine.backend, "model_version", None),
             "snapshot_id": self.snapshot_id,
             "terminology_versions": self.configs.terminology_versions(),
+            **engine.versions(),
         }
 
     def summary(self) -> dict[str, Any]:
@@ -230,6 +276,7 @@ class Pipeline:
             **self.versions(),
             "records": len(self.records()),
             "episodes": len(self.episodes()),
+            "profiles": self.configs.profiles.profile_ids(),
             "definitions": [d.key for d in self.definitions.all()],
             "backend_notes": list(self.engine().notes),
         }

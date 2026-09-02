@@ -1,10 +1,10 @@
 """Anchor resolution against the structured exposure record.
 
-The anchor comes from structured data; the offset comes from text.  A narrative
-says "six days after dose escalation"; the escalation date lives in the EX
-domain.  This module is the single place that decides which EX record *is* the
-escalation, so the extractor and the phenotype evaluator can never disagree
-about it.
+A phenotype window is measured from an event — first exposure, a dose
+escalation — and that event lives in the EX domain rather than being written
+anywhere as such. This module is the single place that decides which EX record
+*is* the anchor, so the episode reconciler and the phenotype evaluator can never
+disagree about it.
 """
 
 from __future__ import annotations

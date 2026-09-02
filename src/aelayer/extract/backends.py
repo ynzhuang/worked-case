@@ -1,11 +1,19 @@
-"""Backends for the model path, and the contract every one of them meets.
+"""Extraction backends, behind one interface.
 
-1. Output validates against the target schema, or it is rejected outright.
-2. Every populated value carries at least one span into the source text.
-3. **Abstention is a valid answer.** A field the text does not support comes
-   back null with ``collection_state: unknown``. A guess is a defect.
-4. ``model_version`` and ``prompt_version`` are stamped on everything the path
-   touches.
+The default backend is the deterministic lexicon-and-scope extractor, so
+everything runs offline. An LLM backend is optional and swappable; both meet the
+same contract:
+
+1. the output validates against the attribute schema, or it is rejected
+2. every extracted value carries a span into the source text
+3. **abstention is correct behaviour** — where the text does not support a
+   value, the answer is no value, and that is reported as a rate rather than
+   counted as a failure
+4. values normalize to the concept catalogue before they leave the backend
+5. the model and prompt versions are stamped on every record the path touches
+
+With no network, the LLM backend is unavailable and the engine degrades to the
+rules backend and says so in its notes.
 """
 
 from __future__ import annotations
@@ -16,418 +24,232 @@ from dataclasses import dataclass, field as _dc_field
 from typing import Any, Protocol
 
 from ..catalog import ConceptCatalog, ExtractionConfig
-from ..guards import ModelRequest
-from ..models import Span
-
-PROMPT_VERSION = "extract-prompt-1"
+from ..models import Attribute, Span
+from .modifiers import ModifierExtractor
 
 
-@dataclass
-class ExtractedValue:
-    """One value a backend proposes, with the span that supports it."""
+@dataclass(frozen=True)
+class ExtractionRequest:
+    """A question for the model path.
 
-    field: str
-    value: Any
-    spans: list[Span] = _dc_field(default_factory=list)
-    confidence: float | None = None
-    note: str = ""
+    It carries text and nothing else. A value the CRF already settled is not a
+    question, and ``guards.py`` refuses a request that names one.
+    """
 
-    def is_grounded(self) -> bool:
-        """A populated value without a span is rejected, not accepted warily."""
-        return self.value is None or bool(self.spans)
+    doc_id: str
+    text: str
+    attributes: tuple[str, ...]
+    concept_id: str | None = None
+    source_kind: str = "reported_term"
+    source_variable: str = "AETERM"
 
 
 @dataclass
 class ExtractionResult:
-    values: list[ExtractedValue] = _dc_field(default_factory=list)
+    values: dict[str, Attribute[str]] = _dc_field(default_factory=dict)
     abstained: list[str] = _dc_field(default_factory=list)
-    backend: str = ""
-    model_version: str | None = None
-    prompt_version: str = PROMPT_VERSION
+    qualities: list[str] = _dc_field(default_factory=list)
     notes: list[str] = _dc_field(default_factory=list)
-
-    def by_field(self) -> dict[str, ExtractedValue]:
-        return {v.field: v for v in self.values}
 
 
 class Backend(Protocol):
     name: str
     model_version: str | None
+    prompt_version: str | None
 
-    def available(self) -> bool: ...
-
-    def extract(self, request: ModelRequest) -> ExtractionResult: ...
-
-
-# --------------------------------------------------------------------------
-# Rules backend — a local clinical NLP baseline
-# --------------------------------------------------------------------------
+    def extract(self, request: ExtractionRequest) -> ExtractionResult: ...
 
 
 class RulesBackend:
-    """Lexicons, ConText-style assertion scoping and pattern matching.
-
-    A baseline, not a trained clinical NLP model, and described as such
-    everywhere it appears.  It runs offline, which is what makes the default
-    code path work with the network disconnected.
-    """
+    """Lexicon and scope rules. Deterministic, offline, and honest about it."""
 
     name = "rules"
     model_version = None
+    prompt_version = "rules-3.0.0"
 
-    def __init__(self, catalog: ConceptCatalog, config: ExtractionConfig):
-        from .assertion import AssertionClassifier
-        from .concepts import ConceptMatcher
-        from .temporal import TemporalExtractor
-        from .values import ValueExtractor
-
+    def __init__(
+        self, catalog: ConceptCatalog, config: ExtractionConfig,
+        extractor_version: str = "",
+    ):
         self.catalog = catalog
         self.config = config
-        self.matcher = ConceptMatcher(catalog, config)
-        self.assertions = AssertionClassifier(config)
-        self.values = ValueExtractor(catalog, config)
-        self.temporal = TemporalExtractor(config)
+        self.extractor_version = extractor_version
+        self.modifiers = ModifierExtractor(catalog, config)
 
-    def available(self) -> bool:
-        return True
-
-    def extract(self, request: ModelRequest) -> ExtractionResult:
-        from .text import split_sentences
-
-        text = request.text
-        sentences = split_sentences(text)
-        result = ExtractionResult(backend=self.name, prompt_version=request.prompt_version)
-        wanted = set(request.requested_fields)
-
-        def span(field: str, start: int, end: int, value: Any) -> Span:
-            return Span(
-                doc_id=request.doc_id, start=start, end=end, field=field,
-                extracted_value="" if value is None else str(value),
-                text=text[start:end], kind="text",
-            )
-
-        if "symptoms" in wanted:
-            found = []
-            for match in self.matcher.find_symptoms(text):
-                assertion = self.assertions.classify(
-                    text, match.start, match.end, sentences
+    def extract(self, request: ExtractionRequest) -> ExtractionResult:
+        result = ExtractionResult()
+        for attribute in request.attributes:
+            if attribute == "quality":
+                result.qualities = sorted(
+                    {h.value for h in self.modifiers.qualities(request.text)}
                 )
-                # A denied symptom is evidence against, not weak evidence for.
-                if assertion.assertion == "present":
-                    found.append(
-                        {
-                            "symptom": match.symptom,
-                            "span": span("symptoms", match.start, match.end,
-                                         match.symptom),
-                        }
-                    )
-            denial = self.values.rescue_treatment(text, field="symptoms_absent")
-            if found:
-                result.values.append(
-                    ExtractedValue(
-                        "symptoms", found,
-                        spans=[f["span"] for f in found],
-                        confidence=self.config.confidence_for("lexicon_exact", 0.95),
-                    )
-                )
-                result.values.append(
-                    ExtractedValue(
-                        "symptoms_assessed", True,
-                        spans=[f["span"] for f in found],
-                    )
-                )
-            elif denial is not None:
-                # The source looked for symptoms and found none. That is a
-                # finding; an unmentioned symptom list is not.
-                result.values.append(
-                    ExtractedValue(
-                        "symptoms", [],
-                        spans=[span("symptoms", denial.start, denial.end, "none")],
-                        note="symptoms were explicitly denied in the narrative",
-                    )
-                )
-                result.values.append(
-                    ExtractedValue(
-                        "symptoms_assessed", True,
-                        spans=[span("symptoms_assessed", denial.start, denial.end,
-                                    "true")],
-                    )
-                )
-            else:
-                result.abstained.append("symptoms")
-                result.abstained.append("symptoms_assessed")
-
-        if "labs" in wanted:
-            hits = [h for h in self.values.find_labs(text) if not h.implausible]
-            if hits:
-                result.values.append(
-                    ExtractedValue(
-                        "labs",
-                        [
-                            {
-                                "test": h.test, "value": h.value, "unit": h.unit,
-                                "canonical_value": h.canonical_value,
-                                "canonical_unit": h.canonical_unit,
-                                "span": span("labs", h.start, h.end,
-                                             f"{h.test}={h.value}{h.unit}"),
-                            }
-                            for h in hits
-                        ],
-                        spans=[span("labs", h.start, h.end, h.test) for h in hits],
-                        confidence=max(h.confidence for h in hits),
-                    )
-                )
-            else:
-                result.abstained.append("labs")
-
-        if "standardized_concept" in wanted:
-            # Only an asserted mention supports a concept. A narrative that
-            # mentions hypoglycemia in order to rule it out is evidence
-            # against, and standardizing on it would invert the finding.
-            proposed = None
-            for mention in self.matcher.find_concepts(text, sentences):
-                verdict = self.assertions.classify(
-                    text, mention.start, mention.end, sentences
-                )
-                if verdict.assertion == "present":
-                    proposed = (mention, verdict)
-                    break
-            if proposed is None:
-                result.abstained.append("standardized_concept")
-            else:
-                mention, _verdict = proposed
-                result.values.append(
-                    ExtractedValue(
-                        "standardized_concept", mention.concept_id,
-                        spans=[span("standardized_concept", mention.start,
-                                    mention.end, mention.concept_id)],
-                        confidence=mention.confidence,
-                        note=f"from an asserted verbatim mention ({mention.kind})",
-                    )
-                )
-
-        if "assertion" in wanted:
-            mentions = self.matcher.find_concepts(text, sentences)
-            if mentions:
-                first = mentions[0]
-                verdict = self.assertions.classify(
-                    text, first.start, first.end, sentences
-                )
-                anchor = (
-                    (verdict.cue_start, verdict.cue_end)
-                    if verdict.cue_start is not None
-                    else (first.start, first.end)
-                )
-                result.values.append(
-                    ExtractedValue(
-                        "assertion", verdict.assertion,
-                        spans=[span("assertion", anchor[0], anchor[1],
-                                    verdict.assertion)],
-                        confidence=verdict.confidence, note=verdict.rule,
-                    )
-                )
-            else:
-                result.abstained.append("assertion")
-
-        for field in ("severity", "relatedness", "action_taken", "outcome"):
-            if field not in wanted:
                 continue
-            hit = self.values.single_value(text, self._cue_field(field))
+            hit = self.modifiers.best(
+                request.text, attribute, request.concept_id, request.source_kind
+            )
             if hit is None:
-                result.abstained.append(field)
+                result.abstained.append(attribute)
                 continue
-            value = self._map_value(field, hit.value)
-            if value is None:
-                result.abstained.append(field)
-                continue
-            result.values.append(
-                ExtractedValue(
-                    field, value,
-                    spans=[span(field, hit.start, hit.end, value)],
-                    confidence=hit.confidence,
-                )
+            result.values[attribute] = Attribute[str].extracted(
+                hit.value,
+                request.source_variable,
+                [hit.span(request.doc_id, attribute)],
+                source=request.source_kind,  # type: ignore[arg-type]
+                confidence=hit.confidence,
+                extractor_version=self.extractor_version,
+                prompt_version=self.prompt_version,
+                note=f"{hit.surface!r} {hit.rule}",
             )
-
-        if "symptoms_assessed" in wanted and "symptoms" not in wanted:
-            result.abstained.append("symptoms_assessed")
-
-        if "coded_term" in wanted:
-            # The model path never invents a dictionary term. Where the study
-            # did not code the event, it stays uncoded; the narrative can
-            # support a concept, but not a coded value that was never assigned.
-            result.abstained.append("coded_term")
-
-        for field in ("onset_datetime", "end_datetime"):
-            if field in wanted:
-                result.abstained.append(field)
-
         return result
-
-    @staticmethod
-    def _cue_field(field: str) -> str:
-        return field
-
-    @staticmethod
-    def _map_value(field: str, value: str) -> str | None:
-        """Map an extraction-config cue value onto the canonical codelist."""
-        mapping = {
-            "action_taken": {
-                "dose_reduced": "dose_reduced",
-                "dose_interrupted": "drug_interrupted",
-                "drug_withdrawn": "drug_withdrawn",
-                "none": "dose_not_changed",
-                "not_applicable": "not_applicable",
-                "unknown": "unknown",
-            },
-            "outcome": {
-                "resolved": "recovered", "resolving": "recovering",
-                "not_resolved": "not_recovered", "fatal": "fatal",
-                "unknown": "unknown",
-            },
-        }
-        if field in mapping:
-            return mapping[field].get(value)
-        return value
-
-
-# --------------------------------------------------------------------------
-# LLM backend — optional
-# --------------------------------------------------------------------------
-
-_LLM_SYSTEM = """You extract clinical facts from an adverse event narrative.
-
-Return a single JSON object and nothing else. No prose, no markdown fence.
-
-For each requested field, return either a value with the exact character offsets
-in the source text that support it, or null.
-
-{{"fields": {{"<name>": {{"value": <value|null>,
-                          "spans": [{{"start": <int>, "end": <int>}}],
-                          "confidence": <0..1>}}}}}}
-
-Rules you must follow:
-- If the text does not support a field, return null for it. Abstaining is
-  correct; guessing is an error.
-- Every non-null value must have at least one span whose offsets locate the
-  supporting text.
-- Do not infer a value from clinical plausibility. Only report what the text
-  says.
-
-Requested fields: {fields}
-"""
 
 
 class LLMBackend:
-    """Optional. Used only when an API key is present.
+    """Optional. Same contract, and the same refusal to guess.
 
-    Its output is schema-validated and rejected on failure rather than
-    repaired: a repaired extraction is one nobody checked.
+    Kept deliberately small: the point of the interface is that a model can be
+    swapped in without any other module learning about it, and that its output
+    is validated exactly as strictly as the rules backend's.
     """
 
     name = "llm"
+    prompt_version = "extract-prompt-3"
 
-    def __init__(self, model: str | None = None):
-        self.model_version = model or os.environ.get(
-            "AELAYER_MODEL", "claude-sonnet-5"
-        )
+    SYSTEM = (
+        "You extract clinical modifiers from an adverse event record.\n\n"
+        "Return one JSON object and nothing else. For each requested attribute "
+        "return either a value with the exact character offsets of the text "
+        "that supports it, or null.\n\n"
+        "Returning null is correct whenever the text does not state the "
+        "attribute. Do not infer, do not guess, and do not use knowledge "
+        "outside the text provided.\n\n"
+        'Shape: {{"location": {{"value": "CHEST", "start": 12, "end": 17}}, '
+        '"pattern": null}}\n\n'
+        "Permitted values:\n{vocabulary}"
+    )
 
-    def available(self) -> bool:
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            return False
-        try:
-            import anthropic  # noqa: F401
-        except ImportError:
-            return False
-        return True
+    def __init__(
+        self, catalog: ConceptCatalog, config: ExtractionConfig,
+        extractor_version: str = "", model: str | None = None,
+    ):
+        self.catalog = catalog
+        self.config = config
+        self.extractor_version = extractor_version
+        self.model_version = model or os.environ.get("AELAYER_MODEL", "")
+        self._client = None
 
-    def extract(self, request: ModelRequest) -> ExtractionResult:  # pragma: no cover
-        import anthropic
+    @staticmethod
+    def available() -> bool:
+        """Only with a key present. Absent one, the engine degrades and says so."""
+        return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
-        client = anthropic.Anthropic()
-        response = client.messages.create(
-            model=self.model_version,
-            max_tokens=2048,
-            system=_LLM_SYSTEM.format(fields=list(request.requested_fields)),
-            messages=[{"role": "user", "content": request.text}],
-        )
-        raw = "".join(
-            block.text for block in response.content
-            if getattr(block, "type", "") == "text"
-        ).strip()
+    def vocabulary(self, attributes: tuple[str, ...]) -> str:
+        lines = []
+        for attribute in attributes:
+            if attribute in self.catalog.attributes:
+                catalogue = self.catalog.attribute(attribute)
+                lines.append(f"{attribute}: {', '.join(catalogue.value_ids())}")
+        return "\n".join(lines)
 
-        result = ExtractionResult(
-            backend=self.name, model_version=self.model_version,
-            prompt_version=request.prompt_version,
-        )
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
+    def extract(self, request: ExtractionRequest) -> ExtractionResult:
+        result = ExtractionResult()
+        payload = self._call(request)
+        if payload is None:
             result.notes.append(
-                f"model returned invalid JSON and was rejected: {exc}"
+                "the LLM backend returned nothing usable; no value was invented "
+                "and every requested attribute is reported as abstained"
             )
-            result.abstained.extend(request.requested_fields)
+            result.abstained.extend(request.attributes)
             return result
 
-        for field, body in (payload.get("fields") or {}).items():
-            if field not in request.requested_fields:
-                result.notes.append(
-                    f"model returned unrequested field {field!r}; discarded"
-                )
+        for attribute in request.attributes:
+            body = payload.get(attribute)
+            if not isinstance(body, dict) or body.get("value") in (None, ""):
+                result.abstained.append(attribute)
                 continue
-            value = body.get("value") if isinstance(body, dict) else None
+            value = self._validate(attribute, body, request)
             if value is None:
-                result.abstained.append(field)
-                continue
-            spans = []
-            for raw_span in (body.get("spans") or []):
-                try:
-                    start, end = int(raw_span["start"]), int(raw_span["end"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if 0 <= start < end <= len(request.text):
-                    spans.append(
-                        Span(
-                            doc_id=request.doc_id, start=start, end=end,
-                            field=field, extracted_value=str(value),
-                            text=request.text[start:end], kind="text",
-                        )
-                    )
-            if not spans:
-                # Ungrounded values are rejected, not accepted with a caveat.
+                result.abstained.append(attribute)
                 result.notes.append(
-                    f"model returned {field!r} with no resolvable span; rejected"
+                    f"{attribute}: the response did not validate against the "
+                    f"catalogue or its span did not match the text, so it was "
+                    f"discarded rather than accepted"
                 )
-                result.abstained.append(field)
                 continue
-            result.values.append(
-                ExtractedValue(field, value, spans=spans,
-                               confidence=body.get("confidence"))
-            )
+            result.values[attribute] = value
         return result
+
+    def _validate(
+        self, attribute: str, body: dict[str, Any], request: ExtractionRequest
+    ) -> Attribute[str] | None:
+        catalogue = self.catalog.attributes.get(attribute)
+        raw = str(body["value"]).strip()
+        value = raw if catalogue and raw in catalogue.values else (
+            catalogue.normalize(raw) if catalogue else None
+        )
+        if value is None:
+            return None
+        try:
+            start, end = int(body["start"]), int(body["end"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not (0 <= start < end <= len(request.text)):
+            return None
+        span = Span(
+            doc_id=request.doc_id, start=start, end=end, field=attribute,
+            extracted_value=value, text=request.text[start:end], kind="text",
+        )
+        return Attribute[str].extracted(
+            value, request.source_variable, [span],
+            source=request.source_kind,  # type: ignore[arg-type]
+            confidence=float(body.get("confidence") or 0.8),
+            extractor_version=self.extractor_version,
+            model_version=self.model_version or None,
+            prompt_version=self.prompt_version,
+            note="returned by the LLM backend and validated against the catalogue",
+        )
+
+    def _call(self, request: ExtractionRequest) -> dict[str, Any] | None:  # pragma: no cover
+        try:
+            if self._client is None:
+                import anthropic
+
+                self._client = anthropic.Anthropic()
+            response = self._client.messages.create(
+                model=self.model_version or "claude-sonnet-5",
+                max_tokens=512,
+                system=self.SYSTEM.format(
+                    vocabulary=self.vocabulary(request.attributes)
+                ),
+                messages=[{"role": "user", "content": request.text}],
+            )
+            return json.loads(response.content[0].text)
+        except Exception:
+            return None
 
 
 def select_backend(
-    catalog: ConceptCatalog, config: ExtractionConfig, prefer: str = "auto"
+    catalog: ConceptCatalog, config: ExtractionConfig, extractor_version: str,
+    preference: str = "auto",
 ) -> tuple[Backend, list[str]]:
-    """Pick a backend, and say plainly which one and why.
-
-    With no API key the LLM backend is unavailable and the rules baseline runs
-    instead.  The choice is stamped on every record and reported in the run
-    manifest, because "which system produced this value" is part of the value.
-    """
+    """Pick a backend and say plainly what was picked and why."""
     notes: list[str] = []
-    if prefer in ("llm", "auto"):
-        llm = LLMBackend()
-        if llm.available():
-            return llm, ["model path: LLM backend"]
-        if prefer == "llm":
-            notes.append(
-                "the LLM backend was requested but no API key is available; "
-                "the model path degraded to the offline rules baseline"
-            )
-        else:
-            notes.append(
-                "no LLM backend is configured; the model path is the offline "
-                "rules baseline (lexicons and cue scoping, not a trained model)"
-            )
-    return RulesBackend(catalog, config), notes
+    if preference == "llm":
+        if LLMBackend.available():
+            return LLMBackend(catalog, config, extractor_version), [
+                "the LLM backend is in use; extraction is not bit-reproducible "
+                "and the manifest records the model and prompt versions rather "
+                "than guaranteeing the output"
+            ]
+        notes.append(
+            "an LLM backend was requested but no credentials are present; the "
+            "model path degraded to the offline rules baseline"
+        )
+    elif preference == "auto" and LLMBackend.available():
+        return LLMBackend(catalog, config, extractor_version), [
+            "an LLM backend was available and selected automatically"
+        ]
+    notes.append(
+        "the model path is the offline rules baseline: lexicons and scope "
+        "rules from config/, not a trained clinical NLP model"
+    )
+    return RulesBackend(catalog, config, extractor_version), notes

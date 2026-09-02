@@ -1,417 +1,324 @@
-"""Build source-faithful canonical records from structured CRF data.
+"""The deterministic path: source rows into canonical records.
 
-One ``CanonicalAERecord`` per source record.  Nothing here merges rows, and
-nothing here interprets prose: this is the deterministic path, and the fields it
-resolves are the fields the model path is never asked about.
+This path reads structured variables only. Where a study put an attribute in a
+standard variable it is read ``direct``; where it put it in a sponsor variable
+it is read ``normalized`` through the declared mapping. Where the study put it
+in language, this path deliberately leaves the attribute unresolved and says so,
+because guessing at prose is not the deterministic path's job.
 
-The order of work for each field is fixed:
-
-1. Is the field gated behind a parent question that was answered No?
-2. Does the study collect the field at all?
-3. Is there a value, and does it map onto a canonical controlled value?
-4. If not, what does this study's blank mean?
-
-Only step 3 can produce ``collected``.  Every other outcome carries the reason.
+Nothing here consults a model, and nothing here reads the answer key.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
-from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
-from ..catalog import ConceptCatalog
+from ..catalog import ConceptCatalog, Configs
+from ..ingest import TrialStore
 from ..models import (
     SERIOUSNESS_CRITERIA,
+    Attribute,
     CanonicalAERecord,
-    CollectionState,
-    Field,
-    LabValue,
     Span,
 )
-from ..semantics import CollectionSemantics, StudySemantics
-from . import values as V
-
-#: AE table columns, and the canonical field each carries.
-COLUMN_FOR: dict[str, str] = {
-    "verbatim_term": "AETERM",
-    "coded_term": "AEDECOD",
-    "onset_datetime": "AESTDTC",
-    "end_datetime": "AEENDTC",
-    "severity": "AESEV",
-    "seriousness": "AESER",
-    "relatedness": "AEREL",
-    "action_taken": "AEACN",
-    "outcome": "AEOUT",
-}
+from ..profiles import AttributeHome, StudyProfile
+from .values import coerce_bool, coerce_date, coerce_enum, is_blank, resolve_sponsor_value
 
 
-def render_row(row: dict[str, Any]) -> str:
-    """A stable, checkable rendering of a source row, for span text."""
-    return " | ".join(
-        f"{column}={row.get(column) if row.get(column) not in (None, '') else ''}"
-        for column in sorted(row)
-        if column not in ("SYNTHETIC",)
+def structured_span(record_id: str, variable: str, value: Any, domain: str = "AE") -> Span:
+    """A pointer at the variable a value was read from.
+
+    Rendered so it resolves to something a person can check: the record, the
+    column, and what was in it.
+    """
+    text = f"{variable}={value}"
+    return Span(
+        doc_id=f"{domain}:{record_id}",
+        start=0,
+        end=len(text),
+        field=variable,
+        extracted_value=str(value),
+        text=text,
+        kind="structured",
     )
 
 
-@dataclass
 class RecordNormalizer:
-    """Deterministic normalization of one study's AE records."""
+    """One source row, read through its study's profile."""
 
-    catalog: ConceptCatalog
-    semantics: CollectionSemantics
-    normalizer_version: str
+    def __init__(self, configs: Configs, store: TrialStore):
+        self.configs = configs
+        self.catalog: ConceptCatalog = configs.catalog
+        self.profiles = configs.profiles
+        self.store = store
 
-    # -- field construction -------------------------------------------------
+    # -- one record ---------------------------------------------------------
 
-    def _span(self, row: dict[str, Any], field: str, value: Any) -> Span:
-        rendered = render_row(row)
-        return Span(
-            doc_id=f"AE:{row.get('AESPID') or row.get('USUBJID')}",
-            start=0,
-            end=len(rendered),
-            field=field,
-            extracted_value="" if value is None else str(value),
-            text=rendered,
-            kind="structured",
-        )
+    def normalize(self, row: dict[str, Any]) -> CanonicalAERecord:
+        study_id = str(row["STUDYID"])
+        profile = self.profiles.for_study(study_id)
+        record_id = str(row["AESPID"])
 
-    def _gated_state(
-        self, field: str, row: dict[str, Any], study: StudySemantics,
-        gate_inputs: dict[str, Any],
-    ) -> CollectionState | None:
-        """The state a parent gate forces on this field, if any."""
-        gate = study.gate_for(field)
-        if gate is None:
-            return None
-        answer = study.gate_answer(gate.gate, gate_inputs)
-        return gate.resolve(answer)
+        coded = self._enum_free(row, "AEDECOD", profile, record_id)
+        reported = self._enum_free(row, "AETERM", profile, record_id)
+        concept = self.catalog.concept_for_coded_term(coded.value)
 
-    def _enum_field(
-        self, field: str, row: dict[str, Any], study: StudySemantics,
-    ) -> Field[str]:
-        cell = row.get(COLUMN_FOR[field])
-        value, state, note = V.coerce_enum(field, cell, study)
-        if value is not None:
-            return Field[str](
-                value=value, collection_state="collected", source="structured",
-                spans=[self._span(row, field, value)],
-            )
-        return Field[str](
-            value=None, collection_state=state, source="structured",
-            spans=[self._span(row, field, None)], note=note,
-        )
-
-    # -- record -------------------------------------------------------------
-
-    def normalize_record(
-        self,
-        row: dict[str, Any],
-        *,
-        linked_rows: Iterable[dict[str, Any]] = (),
-        lab_rows: Iterable[dict[str, Any]] = (),
-    ) -> CanonicalAERecord:
-        study = self.semantics.for_study(str(row.get("STUDYID")))
-        source_record_id = str(row.get("AESPID") or f"{row.get('USUBJID')}-{row.get('AESEQ')}")
-
-        verbatim = self._text_field("verbatim_term", row, study)
-        coded = self._text_field("coded_term", row, study)
-        dictionary_version = (row.get("AEDICTVER") or None) or (
-            study.dictionary_version if coded.populated else None
-        )
-
-        # Gate answers are computed from the record itself, per the declared
-        # gate_values in collection semantics.
-        seriousness = self._boolean_field("seriousness", row, study)
-        outcome = self._enum_field("outcome", row, study)
-        gate_inputs = {
-            "seriousness": seriousness.value,
-            "outcome": outcome.value,
-        }
-
-        end_state = self._gated_state("end_datetime", row, study, gate_inputs)
         record = CanonicalAERecord(
-            record_id=source_record_id,
-            study_id=study.study_id,
-            subject_id=str(row.get("USUBJID")),
-            source_record_id=source_record_id,
-            source_form_id="AE",
-            verbatim_term=verbatim,
-            coded_term=coded,
-            dictionary=study.dictionary if coded.populated else None,
-            dictionary_version=dictionary_version if coded.populated else None,
-            standardized_concept=self.standardize(coded.value, dictionary_version),
-            concept_source="coded" if self.standardize(coded.value, dictionary_version) else None,
-            onset_datetime=self._datetime_field("onset_datetime", row, study),
-            end_datetime=self._datetime_field(
-                "end_datetime", row, study, forced_state=end_state
+            record_id=f"{study_id}:{record_id}",
+            study_id=study_id,
+            subject_id=str(row["USUBJID"]),
+            source_record_id=record_id,
+            profile=profile.profile_id,
+            coded_event=coded,
+            reported_term=reported,
+            dictionary=profile.dictionary or None,
+            dictionary_version=str(row.get("AEDICTVER") or "") or None,
+            standardized_concept=concept,
+            location=self._modifier(row, profile, record_id, "location"),
+            pattern=self._modifier(row, profile, record_id, "pattern"),
+            laterality=Attribute[str].unavailable(
+                "not_collected_by_protocol" if not profile.collects_variable("AELAT")
+                else "unknown",
+                note="no study in this corpus collects laterality structurally",
             ),
-            severity=self._enum_field("severity", row, study),
-            seriousness=seriousness,
-            seriousness_criteria=self._criteria(row, study, gate_inputs),
-            relatedness=self._enum_field("relatedness", row, study),
-            action_taken=self._action_field(row, study),
-            outcome=outcome,
-            linked_form_ids=[f for f in [row.get("AELNKID")] if f],
-            narrative_doc_id=(row.get("DOCID") or None),
-            continuation_of=(row.get("AECONTRP") or None),
-            normalizer_version=self.normalizer_version,
+            severity=self._enum(row, "AESEV", "severity", profile, record_id),
+            relatedness=self._enum(row, "AEREL", "relatedness", profile, record_id),
+            action_taken=self._enum(row, "AEACN", "action_taken", profile, record_id),
+            outcome=self._enum(row, "AEOUT", "outcome", profile, record_id),
+            seriousness=self._bool(row, "AESER", profile, record_id),
+            seriousness_criteria=self._criteria(row, profile, record_id),
+            onset=self._date(row, "AESTDTC", profile, record_id),
+            end=self._end(row, profile, record_id),
+            comment_doc_id=self._comment_doc(record_id),
+            continuation_of=str(row.get("AECONTRP") or "") or None,
+            normalizer_version=self.configs.normalizer_version,
         )
-        # Laboratory results are controlled values in a structured domain, so
-        # they are read here and never put to the model path.
-        record.labs = list(self._linked_labs(record, linked_rows)) + list(
-            self._domain_labs(record, lab_rows)
-        )
-        record.evidence = self._collect_spans(record)
         return record
 
-    def _text_field(
-        self, field: str, row: dict[str, Any], study: StudySemantics
-    ) -> Field[str]:
-        cell = row.get(COLUMN_FOR[field])
-        if V.is_blank(cell):
-            return Field[str](
-                value=None, collection_state=study.state_for_blank(field),
-                source="structured", spans=[self._span(row, field, None)],
+    # -- attributes ---------------------------------------------------------
+
+    def _enum_free(
+        self, row: dict[str, Any], variable: str, profile: StudyProfile,
+        record_id: str,
+    ) -> Attribute[str]:
+        """A free-text structured variable: the coded term, the reported term."""
+        cell = row.get(variable)
+        if is_blank(cell):
+            return Attribute[str].unavailable(
+                profile.availability_for_blank(variable),
+                variable=variable, source="structured_standard",
             )
-        return Field[str](
-            value=str(cell).strip(), collection_state="collected",
-            source="structured", spans=[self._span(row, field, cell)],
+        return Attribute[str].direct(
+            str(cell).strip(), variable, [structured_span(record_id, variable, cell)]
         )
 
-    def _boolean_field(
-        self, field: str, row: dict[str, Any], study: StudySemantics
-    ) -> Field[bool]:
-        value, state, note = V.coerce_bool(field, row.get(COLUMN_FOR[field]), study)
-        return Field[bool](
-            value=value,
-            collection_state="collected" if value is not None else state,
-            source="structured", spans=[self._span(row, field, value)], note=note,
+    def _enum(
+        self, row: dict[str, Any], variable: str, attribute: str,
+        profile: StudyProfile, record_id: str,
+    ) -> Attribute[str]:
+        value, availability, note = coerce_enum(
+            attribute, row.get(variable), profile, variable
+        )
+        if value is None:
+            return Attribute[str].unavailable(
+                availability, variable=variable, source="structured_standard",
+                note=note,
+            )
+        return Attribute[str].direct(
+            value, variable, [structured_span(record_id, variable, row[variable])]
         )
 
-    def _datetime_field(
-        self, field: str, row: dict[str, Any], study: StudySemantics,
-        forced_state: CollectionState | None = None,
-    ) -> Field[_dt.datetime]:
-        value, state, note = V.coerce_datetime(field, row.get(COLUMN_FOR[field]), study)
-        if value is None and forced_state is not None:
-            # A gate outranks the generic blank meaning: an event that has not
-            # ended has a pending end date, not an unknown one.
-            state = forced_state
-        return Field[_dt.datetime](
-            value=value,
-            collection_state="collected" if value is not None else state,
-            source="structured", spans=[self._span(row, field, value)], note=note,
+    def _bool(
+        self, row: dict[str, Any], variable: str, profile: StudyProfile,
+        record_id: str,
+    ) -> Attribute[bool]:
+        value, availability, note = coerce_bool(row.get(variable), profile, variable)
+        if value is None:
+            return Attribute[bool].unavailable(
+                availability, variable=variable, source="structured_standard",
+                note=note,
+            )
+        return Attribute[bool].direct(
+            value, variable, [structured_span(record_id, variable, row[variable])]
         )
 
-    def _action_field(
-        self, row: dict[str, Any], study: StudySemantics
-    ) -> Field[str]:
-        """Treatment action, including the case the codelist cannot express.
+    def _date(
+        self, row: dict[str, Any], variable: str, profile: StudyProfile,
+        record_id: str,
+    ) -> Attribute[_dt.date]:
+        value, availability, note = coerce_date(row.get(variable), profile, variable)
+        if value is None:
+            return Attribute[_dt.date].unavailable(
+                availability, variable=variable, source="structured_standard",
+                note=note,
+            )
+        return Attribute[_dt.date].direct(
+            value, variable, [structured_span(record_id, variable, row[variable])]
+        )
 
-        Where the study's permissible values have no code for what happened,
-        the field stays unresolved and says so. Choosing the nearest available
-        code would assert a stronger claim than the evidence supports.
+    def _end(
+        self, row: dict[str, Any], profile: StudyProfile, record_id: str
+    ) -> Attribute[_dt.date]:
+        """The end date, gated on the outcome as *recorded*.
+
+        An event whose recorded outcome is not terminal has no end date yet;
+        that is `pending_ongoing`, and it is a different fact from a date the
+        study failed to record.
         """
-        field = "action_taken"
-        cell = row.get(COLUMN_FOR[field])
-        value, state, note = V.coerce_enum(field, cell, study)
-        if value is not None:
-            return Field[str](
-                value=value, collection_state="collected", source="structured",
-                spans=[self._span(row, field, value)],
+        attribute = self._date(row, "AEENDTC", profile, record_id)
+        if attribute.populated:
+            return attribute
+        outcome = str(row.get("AEOUT") or "").strip().lower()
+        if outcome in ("not recovered", "not_recovered", "ongoing", "recovering",
+                       "resolving"):
+            return Attribute[_dt.date].unavailable(
+                "pending_ongoing", variable="AEENDTC", source="structured_standard",
+                note=f"the recorded outcome is {outcome!r}, so no end date exists yet",
             )
-        codelist = study.codelist_for(field)
-        if (
-            V.is_blank(cell)
-            and codelist is not None
-            and codelist.absent_concepts
-            and study.collects(field)
-        ):
-            # The study collects the field, the cell is empty, and this
-            # study's codelist is known to be missing concepts. The blank is
-            # therefore unresolved-from-this-field, not evidence of no action.
-            state = "not_representable"
-            note = (
-                f"{study.study_id} has no permissible {field} value for "
-                f"{list(codelist.absent_concepts)}; a blank here cannot be read "
-                f"as 'no action taken'"
-            )
-        return Field[str](
-            value=None, collection_state=state, source="structured",
-            spans=[self._span(row, field, None)], note=note,
-        )
+        return attribute
 
     def _criteria(
-        self, row: dict[str, Any], study: StudySemantics, gate_inputs: dict[str, Any]
-    ) -> dict[str, Field[bool]]:
+        self, row: dict[str, Any], profile: StudyProfile, record_id: str
+    ) -> dict[str, Attribute[bool]]:
         """The seriousness criteria vector, gated on the seriousness answer.
 
-        A criterion left blank because the gate was answered No is
-        ``not_applicable_gated``. Recording it as ``unknown``, or as False,
-        would invent a fact the CRF never asked for.
+        Where seriousness is No, the criteria are not unanswered — they do not
+        apply, and saying so is different from saying nobody filled them in.
         """
-        forced = self._gated_state("seriousness_criteria", row, study, gate_inputs)
+        answer = profile.gate_answer("seriousness", row)
+        gate = profile.gate_for("seriousness_criteria")
         recorded = {
-            part.strip()
-            for part in str(row.get("AESCAT") or "").split("|")
-            if part.strip()
+            c.strip() for c in str(row.get("AESCAT") or "").split("|") if c.strip()
         }
-        out: dict[str, Field[bool]] = {}
+        out: dict[str, Attribute[bool]] = {}
         for criterion in SERIOUSNESS_CRITERIA:
-            span = self._span(row, f"seriousness_criteria.{criterion}", None)
-            if not study.collects("seriousness"):
-                out[criterion] = Field[bool](
-                    value=None, collection_state=study.state_for_blank("seriousness"),
-                    source="structured", spans=[span],
-                )
-            elif forced is not None:
-                out[criterion] = Field[bool](
-                    value=None, collection_state=forced, source="structured",
-                    spans=[span],
+            if answer is False and gate is not None:
+                out[criterion] = Attribute[bool].unavailable(
+                    gate.when_gate_false, variable="AESCAT",
+                    source="structured_standard",
                     note="the seriousness gate was answered No, so this "
                          "criterion was never applicable",
                 )
+            elif answer is None:
+                out[criterion] = Attribute[bool].unavailable(
+                    profile.availability_for_blank("AESER"), variable="AESCAT",
+                    source="structured_standard",
+                    note="the seriousness gate itself is unanswered",
+                )
             else:
-                out[criterion] = Field[bool](
-                    value=criterion in recorded, collection_state="collected",
-                    source="structured", spans=[span],
+                out[criterion] = Attribute[bool].direct(
+                    criterion in recorded, "AESCAT",
+                    [structured_span(record_id, "AESCAT", row.get("AESCAT") or "")],
                 )
         return out
 
-    def _linked_labs(
-        self, record: CanonicalAERecord, linked_rows: Iterable[dict[str, Any]]
-    ) -> Iterable[LabValue]:
-        """Objective values carried on a linked event form.
+    # -- the attribute this prototype is about -----------------------------
 
-        Controlled fields on a linked form are structured data and are read
-        deterministically; the model path never sees them.
+    def _modifier(
+        self, row: dict[str, Any], profile: StudyProfile, record_id: str,
+        attribute: str,
+    ) -> Attribute[str]:
+        """Resolve ``location`` or ``pattern`` from wherever this study keeps it.
+
+        The deterministic path can settle a structured home. A text home is left
+        unresolved *with a note naming the home*, which is what tells the model
+        path there is a question worth asking.
         """
-        lab = self.catalog.lab_tests.get("GLUCOSE")
-        if lab is None:
-            return
-        for row in linked_rows:
-            raw = row.get("GLUCVAL")
-            if V.is_blank(raw):
-                continue
-            try:
-                value = float(raw)
-            except (TypeError, ValueError):
-                continue
-            unit = str(row.get("GLUCUNIT") or "").strip()
-            canonical = V.to_canonical_unit(value, unit, lab.conversions)
-            if canonical is None or not lab.plausible(canonical):
-                continue
-            rendered = render_row(row)
-            collected, _state, _note = V.coerce_datetime(
-                "linked_form_date", row.get("HEFDTC"),
-                self.semantics.for_study(record.study_id),
-            )
-            yield LabValue(
-                test="GLUCOSE", value=value, unit=unit,
-                canonical_value=canonical, canonical_unit=lab.canonical_unit,
-                collection_datetime=collected, source="structured",
-                span=Span(
-                    doc_id=f"FORM:{row.get('LNKID')}", start=0, end=len(rendered),
-                    field="labs", extracted_value=f"GLUCOSE={value}{unit}",
-                    text=rendered, kind="structured",
-                ),
+        homes = profile.homes_for(attribute)
+        if not homes or all(home.is_nowhere for home in homes):
+            return Attribute[str].unavailable(
+                "not_collected_by_protocol",
+                note=f"{profile.profile_id} records {attribute} nowhere: it is "
+                     f"not recoverable from this study",
             )
 
-    def _domain_labs(
-        self, record: CanonicalAERecord, lab_rows: Iterable[dict[str, Any]]
-    ) -> Iterable[LabValue]:
-        """Results from the LB domain collected on the day of the event.
+        for home in homes:
+            if home.kind == "structured_standard":
+                resolved = self._standard_home(row, home, profile, record_id, attribute)
+                if resolved is not None:
+                    return resolved
+            elif home.kind == "structured_sponsor":
+                resolved = self._sponsor_home(profile, record_id, attribute)
+                if resolved is not None:
+                    return resolved
 
-        Same day only: a wider window borrows a result belonging to a
-        neighbouring event on the same subject and offers it as corroboration
-        for this one.
-        """
-        onset = record.onset_datetime.value
-        lab = self.catalog.lab_tests.get("GLUCOSE")
-        if onset is None or lab is None:
-            return
-        study = self.semantics.for_study(record.study_id)
-        for row in lab_rows:
-            if str(row.get("LBTESTCD") or "").upper() != "GLUC":
-                continue
-            collected, state, _note = V.coerce_datetime("LBDTC", row.get("LBDTC"), study)
-            if collected is None or collected.date() != onset.date():
-                continue
-            try:
-                value = float(row.get("LBORRES"))
-            except (TypeError, ValueError):
-                continue
-            unit = str(row.get("LBORRESU") or "").strip()
-            canonical = V.to_canonical_unit(value, unit, lab.conversions)
-            if canonical is None or not lab.plausible(canonical):
-                continue
-            rendered = render_row(row)
-            yield LabValue(
-                test="GLUCOSE", value=value, unit=unit, canonical_value=canonical,
-                canonical_unit=lab.canonical_unit, collection_datetime=collected,
-                source="structured",
-                span=Span(
-                    doc_id=f"LB:{row.get('USUBJID')}:{row.get('LBSEQ')}",
-                    start=0, end=len(rendered), field="labs",
-                    extracted_value=f"GLUCOSE={value}{unit}", text=rendered,
-                    kind="structured",
-                ),
+        text_home = next((h for h in homes if h.is_text), None)
+        if text_home is not None:
+            return Attribute[str].unavailable(
+                "unknown", variable=text_home.variable, source=text_home.kind,
+                note=f"{attribute} lives in {text_home.variable} in "
+                     f"{profile.profile_id}; the deterministic path cannot read "
+                     f"prose, so the model path is asked",
             )
-
-    def standardize(
-        self, coded_term: str | None, dictionary_version: str | None
-    ) -> str | None:
-        """Which catalogue concept a coded term denotes.
-
-        Membership only: a term belongs to a concept because the catalogue
-        lists it, never because it sits beneath one in a hierarchy.
-        """
-        if not coded_term:
-            return None
-        key = coded_term.strip().casefold()
-        for concept_id in sorted(self.catalog.concepts):
-            concept = self.catalog.concepts[concept_id]
-            if any(term.strip().casefold() == key for term in concept.all_coded_terms()):
-                return concept_id
-        return None
-
-    @staticmethod
-    def _collect_spans(record: CanonicalAERecord) -> list[Span]:
-        spans: list[Span] = []
-        for field in record.fields().values():
-            spans.extend(field.spans)
-        spans.extend(lab.span for lab in record.labs)
-        seen: set[tuple] = set()
-        unique: list[Span] = []
-        for span in spans:
-            if span.key() not in seen:
-                seen.add(span.key())
-                unique.append(span)
-        return sorted(unique, key=lambda s: (s.field, s.doc_id, s.start))
-
-
-def normalize_store(store, configs) -> list[CanonicalAERecord]:
-    """Normalize every AE row in a snapshot, in a stable order."""
-    normalizer = RecordNormalizer(
-        catalog=configs.catalog,
-        semantics=configs.semantics,
-        normalizer_version=configs.normalizer_version,
-    )
-    linked_by_record: dict[str, list[dict[str, Any]]] = {}
-    for row in store.rows("linked_hypo_event"):
-        linked_by_record.setdefault(str(row.get("AESPID")), []).append(row)
-    labs_by_subject: dict[str, list[dict[str, Any]]] = {}
-    for row in store.rows("lb"):
-        labs_by_subject.setdefault(str(row.get("USUBJID")), []).append(row)
-
-    records = [
-        normalizer.normalize_record(
-            row,
-            linked_rows=linked_by_record.get(str(row.get("AESPID")), []),
-            lab_rows=labs_by_subject.get(str(row.get("USUBJID")), []),
+        # A structured home that this record left empty. The variable is named
+        # as the study names it — a sponsor qualifier is "SUPPAE.RASHSITE", not
+        # "SUPPAE" — or the blank would be read as a column the study does not
+        # have rather than one it left empty.
+        home = homes[0]
+        variable = home.variable or attribute
+        if home.kind == "structured_sponsor" and profile.sponsor_variable_name:
+            variable = f"SUPPAE.{profile.sponsor_variable_name}"
+        return Attribute[str].unavailable(
+            profile.availability_for_blank(variable),
+            variable=variable, source=home.kind,
+            note=f"{variable} is empty on this record",
         )
-        for row in store.rows("ae")
-    ]
-    return sorted(records, key=lambda r: (r.study_id, r.subject_id, r.source_record_id))
+
+    def _standard_home(
+        self, row: dict[str, Any], home: AttributeHome, profile: StudyProfile,
+        record_id: str, attribute: str,
+    ) -> Attribute[str] | None:
+        variable = home.variable or ""
+        cell = row.get(variable)
+        if is_blank(cell):
+            return None
+        raw = str(cell).strip()
+        catalogue = self.catalog.attribute(attribute)
+        if raw in catalogue.values:
+            return Attribute[str].direct(
+                raw, variable, [structured_span(record_id, variable, raw)]
+            )
+        normalized = catalogue.normalize(raw)
+        if normalized is None:
+            return Attribute[str].unavailable(
+                "not_representable", variable=variable, source=home.kind,
+                note=f"{variable} holds {raw!r}, which is not a value in the "
+                     f"{attribute} catalogue and was not coerced to one",
+            )
+        return Attribute[str].normalized(
+            normalized, variable, source="structured_standard",
+            evidence=[structured_span(record_id, variable, raw)],
+            note=f"{raw!r} normalized to {normalized}",
+        )
+
+    def _sponsor_home(
+        self, profile: StudyProfile, record_id: str, attribute: str
+    ) -> Attribute[str] | None:
+        rows = self.store.supplemental_for(record_id)
+        value, availability, note, variable = resolve_sponsor_value(
+            profile, rows, attribute
+        )
+        if value is None:
+            if availability == "unknown" and not rows:
+                return None
+            return Attribute[str].unavailable(
+                availability, variable=variable, source="structured_sponsor",
+                note=note,
+            )
+        return Attribute[str].normalized(
+            value, variable or "SUPPAE",
+            evidence=[structured_span(record_id, variable or "SUPPAE", value,
+                                      domain="SUPPAE")],
+            note=note,
+        )
+
+    def _comment_doc(self, record_id: str) -> str | None:
+        documents = self.store.documents_of(record_id)
+        return documents[0].doc_id if documents else None
+
+
+def normalize_store(store: TrialStore, configs: Configs) -> list[CanonicalAERecord]:
+    """Every AE row in the snapshot, in a stable order."""
+    normalizer = RecordNormalizer(configs, store)
+    return [normalizer.normalize(row) for row in store.ae_rows()]

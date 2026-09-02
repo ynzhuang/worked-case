@@ -1,244 +1,155 @@
-"""Orchestration for the model path.
+"""Orchestration of the model path.
 
-For each record: work out which fields the deterministic path left unresolved,
-ask the backend about those and no others, then accept only what comes back
-grounded in a span.
-
-Nothing here overwrites a value the deterministic path resolved.  Extracted
-values land on the record marked ``source="text"``, so a reader can always tell
-which system produced which field.
+The engine asks the backend about exactly the attributes a record left
+unresolved, in exactly the places the study's profile says they live. It never
+asks about a value the deterministic path already settled — ``guards.py``
+refuses that, and a test asserts it over the whole corpus.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field as _dc_field
 from typing import Any, Iterable, Sequence
 
-from ..catalog import ConceptCatalog, ExtractionConfig
-from ..guards import (
-    ControlledValueLeak,
-    ModelRequest,
-    assert_model_path_permitted,
-    assert_no_structured_payload,
-    unresolved_fields,
-)
-from ..ingest import Narrative
-from ..models import (
-    CanonicalAERecord,
-    Field,
-    LabValue,
-    Span,
-    SymptomMention,
-)
-from .backends import Backend, ExtractionResult, PROMPT_VERSION, select_backend
+from ..catalog import Configs
+from ..guards import assert_model_path_permitted, askable_attributes
+from ..ingest import TrialStore
+from ..models import Attribute, CanonicalAERecord, Modifier
+from ..profiles import StudyProfile
+from .backends import Backend, ExtractionRequest, select_backend
 
 
 @dataclass
 class ExtractionEngine:
-    catalog: ConceptCatalog
-    config: ExtractionConfig
+    configs: Configs
+    store: TrialStore
     backend: Backend
-    extractor_version: str
-    notes: tuple[str, ...] = ()
+    notes: list[str] = _dc_field(default_factory=list)
 
     @classmethod
     def build(
-        cls,
-        catalog: ConceptCatalog,
-        config: ExtractionConfig,
-        extractor_version: str,
-        prefer: str = "auto",
+        cls, configs: Configs, store: TrialStore, preference: str = "auto"
     ) -> "ExtractionEngine":
-        backend, notes = select_backend(catalog, config, prefer)
-        return cls(catalog, config, backend, extractor_version, tuple(notes))
+        backend, notes = select_backend(
+            configs.catalog, configs.extraction, configs.extractor_version,
+            preference,
+        )
+        return cls(configs=configs, store=store, backend=backend, notes=notes)
 
     # -- one record ---------------------------------------------------------
 
-    def enrich(
-        self, record: CanonicalAERecord, narrative: Narrative | None
-    ) -> CanonicalAERecord:
-        """Fill unresolved fields on a record from its narrative.
+    def sources_for(
+        self, record: CanonicalAERecord, profile: StudyProfile
+    ) -> list[tuple[str, str, str, str]]:
+        """Every readable text source for a record.
 
-        Returns the record, mutated in place for the unresolved fields only.
-        A field the deterministic path settled is never touched — the guard
-        raises rather than allowing it.
+        Returns ``(doc_id, text, source_kind, source_variable)``. Only sources
+        the extraction config declares readable appear here.
         """
-        record.extractor_version = self.extractor_version
-        record.model_version = getattr(self.backend, "model_version", None)
-        record.prompt_version = PROMPT_VERSION
+        readable = set(self.configs.extraction.readable_sources)
+        found: list[tuple[str, str, str, str]] = []
+        if "reported_term" in readable and record.reported_term.populated:
+            found.append((
+                f"AE:{record.source_record_id}:AETERM",
+                str(record.reported_term.value), "reported_term", "AETERM",
+            ))
+        if "comment" in readable:
+            for document in self.store.documents_of(record.source_record_id):
+                found.append((
+                    document.doc_id, document.full_text, "comment", "CO.COVAL",
+                ))
+        return found
 
-        if narrative is None:
-            record.assertion = Field[str].missing(
-                "not_collected_by_protocol", source="text",
-                note="no narrative is attached to this record",
-            )
-            return record
-
-        askable = unresolved_fields(record)
+    def enrich(self, record: CanonicalAERecord) -> CanonicalAERecord:
+        """Fill what the deterministic path left open, and nothing else."""
+        profile = self.configs.profiles.for_study(record.study_id)
+        askable = askable_attributes(record, profile, self.configs.extraction)
         if not askable:
             return record
 
-        request = ModelRequest(
-            doc_id=narrative.doc_id,
-            text=narrative.full_text,
-            requested_fields=askable,
-            schema_name="CanonicalAERecord",
-            prompt_version=PROMPT_VERSION,
-            record_id=record.source_record_id,
-        )
-        assert_no_structured_payload(request, where="ExtractionEngine.enrich")
-        assert_model_path_permitted(request, record)
+        for doc_id, text, source_kind, variable in self.sources_for(record, profile):
+            remaining = tuple(a for a in askable if not self._filled(record, a))
+            if not remaining:
+                break
+            request = ExtractionRequest(
+                doc_id=doc_id, text=text,
+                attributes=remaining + ("quality",),
+                concept_id=record.standardized_concept,
+                source_kind=source_kind, source_variable=variable,
+            )
+            # The boundary is enforced here, on every request, not asserted once
+            # in a test and trusted thereafter.
+            assert_model_path_permitted(request, record, profile)
+            result = self.backend.extract(request)
 
-        result = self.backend.extract(request)
-        self._apply(record, result, request)
+            for attribute, value in result.values.items():
+                current = record.attribute(attribute)
+                setattr(record, attribute, value.model_copy(update={
+                    "prior_availability": current.availability if current else None,
+                }))
+            for attribute in result.abstained:
+                current = record.attribute(attribute)
+                if current is not None and not current.populated:
+                    # Both facts survive: what the structured side already said
+                    # about this attribute, and that the text was read and
+                    # supported nothing. Replacing the first with the second
+                    # would make an availability and its explanation contradict
+                    # each other on the same row.
+                    setattr(record, attribute, current.model_copy(update={
+                        "note": (
+                            f"{attribute} is {current.availability}"
+                            + (f" ({current.note})" if current.note else "")
+                            + f"; the model path was then asked about it in "
+                              f"{variable} and abstained — nothing in the text "
+                              f"supports a value"
+                        ),
+                    }))
+            record.modifiers.extend(
+                Modifier(
+                    kind="quality", value=quality, surface=quality,
+                    span=self._quality_span(doc_id, text, quality),
+                )
+                for quality in result.qualities
+            )
+            self.notes.extend(n for n in result.notes if n not in self.notes)
+
+        record.extractor_version = self.configs.extractor_version
         return record
 
-    def _apply(
-        self, record: CanonicalAERecord, result: ExtractionResult,
-        request: ModelRequest,
-    ) -> None:
-        extracted = result.by_field()
+    @staticmethod
+    def _filled(record: CanonicalAERecord, attribute: str) -> bool:
+        current = record.attribute(attribute)
+        return bool(current and current.populated)
 
-        for name, value in extracted.items():
-            if not value.is_grounded():
-                # A populated value with no span is rejected. Accepting it
-                # would put a number in a report that traces to nothing.
-                result.abstained.append(name)
-                continue
+    @staticmethod
+    def _quality_span(doc_id: str, text: str, quality: str):
+        from ..models import Span
 
-        if "symptoms" in extracted and extracted["symptoms"].is_grounded():
-            record.symptoms = [
-                SymptomMention(
-                    symptom=item["symptom"], span=item["span"], assertion="present"
-                )
-                for item in extracted["symptoms"].value
-            ]
-        if "symptoms_assessed" in extracted:
-            value = extracted["symptoms_assessed"]
-            record.symptoms_assessed = Field[bool](
-                value=True, collection_state="collected", source="text",
-                spans=list(value.spans),
-                note="the source addressed symptoms",
-            )
-        else:
-            record.symptoms_assessed = Field[bool].missing(
-                "unknown", source="text",
-                note="the source does not address symptoms, so an empty symptom "
-                     "list cannot be read as asymptomatic",
-            )
-        if "labs" in extracted and extracted["labs"].is_grounded():
-            # Narrative values supplement, never replace, structured results;
-            # a value already read from LB or a linked form stays as it is.
-            existing = {
-                (l.test, round(l.canonical_value or -1.0, 2)) for l in record.labs
-            }
-            for item in extracted["labs"].value:
-                key = (item["test"], round(item["canonical_value"] or -1.0, 2))
-                if key in existing:
-                    continue
-                existing.add(key)
-                record.labs.append(
-                    LabValue(
-                        test=item["test"], value=item["value"], unit=item["unit"],
-                        canonical_value=item["canonical_value"],
-                        canonical_unit=item["canonical_unit"],
-                        source="text", span=item["span"],
-                    )
-                )
-
-        if (
-            "standardized_concept" in extracted
-            and extracted["standardized_concept"].is_grounded()
-            and record.standardized_concept is None
-        ):
-            value = extracted["standardized_concept"]
-            record.standardized_concept = value.value
-            record.concept_source = "text"
-            record.evidence = list(record.evidence) + list(value.spans)
-
-        if "assertion" in extracted and extracted["assertion"].is_grounded():
-            value = extracted["assertion"]
-            record.assertion = Field[str](
-                value=value.value, collection_state="collected", source="text",
-                spans=list(value.spans), confidence=value.confidence,
-                note=value.note,
-            )
-        else:
-            record.assertion = Field[str].missing(
-                "unknown", source="text",
-                note="no concept mention was found in the narrative",
-            )
-
-        for name in ("severity", "relatedness", "action_taken", "outcome"):
-            if name not in extracted:
-                continue
-            value = extracted[name]
-            if not value.is_grounded():
-                continue
-            current: Field[Any] = getattr(record, name)
-            if current.collection_state == "collected":  # pragma: no cover - guarded
-                raise ControlledValueLeak(
-                    f"model path returned {name!r} for a record that already "
-                    f"has it collected"
-                )
-            setattr(
-                record, name,
-                Field[str](
-                    value=value.value, collection_state="collected", source="text",
-                    spans=list(value.spans), confidence=value.confidence,
-                    prior_state=current.collection_state,
-                    note=(
-                        f"recovered from narrative; the structured field was "
-                        f"{current.collection_state}"
-                    ),
-                ),
-            )
-
-        # Abstention is recorded, not silently dropped: knowing the model
-        # declined is different from never having asked.
-        for name in sorted(set(result.abstained)):
-            field: Field[Any] | None = record.fields().get(name)
-            if field is not None and field.collection_state not in ("collected",):
-                field.note = (
-                    f"{field.note + '; ' if field.note else ''}"
-                    f"the model path was asked and abstained"
-                )
-
-        record.evidence = _merge_spans(record)
-
-    # -- corpus -------------------------------------------------------------
+        lowered = text.lower()
+        start = lowered.find(quality.lower())
+        if start < 0:
+            start = 0
+        return Span(
+            doc_id=doc_id, start=start, end=start + len(quality), field="quality",
+            extracted_value=quality, text=text[start:start + len(quality)],
+            kind="text",
+        )
 
     def enrich_all(
-        self, records: Sequence[CanonicalAERecord],
-        narratives: dict[str, Narrative],
+        self, records: Iterable[CanonicalAERecord]
     ) -> list[CanonicalAERecord]:
-        for record in records:
-            self.enrich(record, narratives.get(record.narrative_doc_id or ""))
-        return list(records)
+        return [self.enrich(record) for record in records]
+
+    def versions(self) -> dict[str, Any]:
+        return {
+            "extraction_backend": self.backend.name,
+            "model_version": getattr(self.backend, "model_version", None),
+            "prompt_version": getattr(self.backend, "prompt_version", None),
+        }
 
 
-def _merge_spans(record: CanonicalAERecord) -> list[Span]:
-    spans: list[Span] = list(record.evidence)
-    for field in record.fields().values():
-        spans.extend(field.spans)
-    spans.extend(s.span for s in record.symptoms)
-    spans.extend(l.span for l in record.labs)
-    seen: set[tuple] = set()
-    unique: list[Span] = []
-    for span in spans:
-        if span.key() not in seen:
-            seen.add(span.key())
-            unique.append(span)
-    return sorted(unique, key=lambda s: (s.field, s.doc_id, s.start, s.end))
-
-
-def extract_records(
-    records: Sequence[CanonicalAERecord],
-    store,
-    configs,
-    prefer: str = "auto",
-) -> tuple[list[CanonicalAERecord], ExtractionEngine]:
-    engine = ExtractionEngine.build(
-        configs.catalog, configs.extraction, configs.extractor_version, prefer
-    )
-    return engine.enrich_all(records, store.narratives), engine
+def enrich_records(
+    records: Sequence[CanonicalAERecord], configs: Configs, store: TrialStore,
+    preference: str = "auto",
+) -> list[CanonicalAERecord]:
+    return ExtractionEngine.build(configs, store, preference).enrich_all(records)

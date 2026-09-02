@@ -1,23 +1,22 @@
 """Traceability.
 
-A reported number is only as good as the chain behind it.  ``trace`` walks that
-chain end to end:
+A reported number is only as good as the chain behind it, so ``trace_number``
+walks that chain end to end:
 
-    number -> analysis run -> cohort -> phenotype definition and version ->
-    contributing episodes -> source records -> text spans
+    number -> analysis run -> cohort -> definition version -> episodes ->
+    source records -> spans
 
-**This replaces the approval gate, deliberately.**  Approving a specification
-you cannot independently evaluate is ceremony: the reviewer sees a plan, not a
-result, and clicking approve does not make the result checkable.  A number you
-can follow back to the sentence a site wrote is checkable, by someone who was
-not in the room when it was compiled.
+Every hop names the route the attribute came by, because in this layer "where
+did this number come from" and "which variable was it read from" are the same
+question.
 
-A number that cannot be traced end to end is a failing test, not a caveat.
+A number that cannot be traced end to end is a failing test, not a caveat:
+``complete`` is false and ``broken_at`` names the level where the chain stops.
 """
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Sequence
 
 from ..models import (
     CanonicalAEEpisode,
@@ -40,185 +39,127 @@ def trace_number(
     verdict: str = "case",
     max_examples: int = 3,
 ) -> Trace:
-    """Build the full chain behind one reported number.
-
-    ``complete`` is false, with ``broken_at`` naming the level, the moment any
-    hop cannot be made. It is not softened into a warning: the guarantee is
-    that a number either traces to source text or is reported as untraceable.
-    """
     links: list[TraceLink] = [
         TraceLink(
-            level="number",
-            identifier=label,
-            detail=f"{label} = {number}",
+            level="number", identifier=label, detail=f"{label} = {number}",
             payload={"value": number, "verdict": verdict},
-        )
-    ]
-
-    links.append(
+        ),
         TraceLink(
-            level="analysis",
-            identifier=manifest.manifest_id,
+            level="analysis", identifier=manifest.manifest_id,
             detail=(
                 f"{manifest.analysis_method} run at {manifest.created_at} by "
-                f"{manifest.actor}"
+                f"{manifest.actor}; normalizer {manifest.normalizer_version}, "
+                f"extractor {manifest.extractor_version}, snapshot "
+                f"{manifest.data_snapshot_id}"
             ),
             payload={
                 "results_hash": manifest.results_hash,
                 "output_pointer": manifest.output_pointer,
-                "normalizer_version": manifest.normalizer_version,
-                "extractor_version": manifest.extractor_version,
-                "model_version": manifest.model_version,
-                "snapshot_id": manifest.data_snapshot_id,
-                "terminology_versions": manifest.terminology_versions,
+                "attribute_methods": manifest.attribute_methods,
             },
-        )
-    )
+        ),
+    ]
 
-    contributing = [a for a in assignments if a.verdict == verdict]
-    links.append(
-        TraceLink(
-            level="cohort",
-            identifier="|".join(manifest.specification.get("studies", [])) or "all",
-            detail=(
-                f"{len(contributing)} episode(s) with verdict {verdict!r} across "
-                f"{len(manifest.specification.get('studies', []))} study/studies"
-            ),
-            payload={
-                "cohort_specification": manifest.cohort_specification,
-                "episode_ids": [a.episode_id for a in contributing][:50],
-            },
-        )
-    )
+    matching = [a for a in assignments if a.verdict == verdict]
+    studies = sorted({a.study_id for a in matching})
+    links.append(TraceLink(
+        level="cohort", identifier="|".join(studies) or "(empty)",
+        detail=(
+            f"{len(matching)} episode(s) with verdict {verdict!r} across "
+            f"{len(studies)} study/studies"
+        ),
+        payload={"episode_ids": [a.episode_id for a in matching[:max_examples]]},
+    ))
+    links.append(TraceLink(
+        level="definition",
+        identifier=(
+            f"{manifest.phenotype_definition_id}."
+            f"v{manifest.phenotype_definition_version}"
+        ),
+        detail=(
+            f"status {manifest.definition_status}, content hash "
+            f"{manifest.definition_hash}"
+        ),
+    ))
 
-    links.append(
-        TraceLink(
-            level="definition",
-            identifier=(
-                f"{manifest.phenotype_definition_id}."
-                f"v{manifest.phenotype_definition_version}"
-            ),
-            detail=(
-                f"status {manifest.definition_status}, content hash "
-                f"{manifest.definition_hash}"
-            ),
-            payload={"definition_hash": manifest.definition_hash},
-        )
-    )
-
-    if not contributing:
+    if not matching:
         return Trace(
             number=number, label=label, complete=False, broken_at="episode",
             links=links,
         )
 
-    episode_index = {e.episode_id: e for e in episodes}
-    record_index = {r.source_record_id: r for r in records}
+    by_id = {e.episode_id: e for e in episodes}
+    records_by_id = {r.source_record_id: r for r in records}
     broken_at: str | None = None
 
-    for assignment in contributing[:max_examples]:
-        episode = episode_index.get(assignment.episode_id)
+    for assignment in matching[:max_examples]:
+        episode = by_id.get(assignment.episode_id)
         if episode is None:
             broken_at = "episode"
             break
-        links.append(
-            TraceLink(
-                level="episode",
-                identifier=episode.episode_id,
-                detail=(
-                    f"{assignment.reason[:200]} "
-                    f"(linkage {episode.linkage_rule}, confidence "
-                    f"{episode.linkage_confidence:.2f})"
-                ),
-                payload={
-                    "subject_id": episode.subject_id,
-                    "study_id": episode.study_id,
-                    "matched_rule_id": assignment.matched_rule_id,
-                    "evidence_state": assignment.evidence_state,
-                    "source_record_ids": episode.source_record_ids,
-                    "linkage_review_required": episode.linkage_review_required,
-                },
-            )
-        )
+        satisfied = [f for f in assignment.findings if f.satisfied]
+        links.append(TraceLink(
+            level="episode", identifier=episode.episode_id,
+            detail="; ".join(f.reason for f in satisfied) or assignment.reason,
+            payload={
+                "attribute_sources": assignment.attribute_sources,
+                "attribute_methods": assignment.attribute_methods,
+                "linkage_rule": episode.linkage_rule,
+            },
+        ))
+
         for record_id in episode.source_record_ids:
-            record = record_index.get(record_id)
+            record = records_by_id.get(record_id)
             if record is None:
                 broken_at = "record"
                 break
-            links.append(
-                TraceLink(
-                    level="record",
-                    identifier=record.source_record_id,
-                    detail=(
-                        f"{record.source_form_id} record in {record.study_id}, "
-                        f"normalized by {record.normalizer_version}"
-                        + (
-                            f", enriched by {record.extractor_version}"
-                            if record.extractor_version else ""
-                        )
-                    ),
-                    payload={
-                        "verbatim_term": record.verbatim_term.value,
-                        "coded_term": record.coded_term.value,
-                        "dictionary_version": record.dictionary_version,
-                        "concept_source": record.concept_source,
-                        "collection_states": record.collection_states(),
-                    },
-                )
-            )
-            spans = sorted(
-                record.evidence, key=lambda s: (s.field, s.doc_id, s.start)
-            )
+            links.append(TraceLink(
+                level="record", identifier=record_id,
+                detail=(
+                    f"{record.source_form_id} record in {record.study_id} "
+                    f"({record.profile}), normalized by "
+                    f"{record.normalizer_version}"
+                    + (f", enriched by {record.extractor_version}"
+                       if record.extractor_version else "")
+                ),
+            ))
+            spans = [
+                span for attribute in record.attributes().values()
+                for span in attribute.evidence
+            ]
             if not spans:
                 broken_at = "span"
                 break
-            for span in spans[:6]:
-                links.append(
-                    TraceLink(
-                        level="span",
-                        identifier=f"{span.doc_id}:{span.start}-{span.end}",
-                        detail=f"{span.field} = {span.extracted_value!r}",
-                        payload={
-                            "doc_id": span.doc_id, "field": span.field,
-                            "start": span.start, "end": span.end,
-                            "text": span.text[:200], "kind": span.kind,
-                        },
-                    )
-                )
+            for span in sorted(spans, key=lambda s: (s.field, s.start))[:6]:
+                links.append(TraceLink(
+                    level="span", identifier=f"{span.doc_id}:{span.start}-{span.end}",
+                    detail=f"{span.field} = {span.extracted_value!r}",
+                    payload={"text": span.text, "kind": span.kind},
+                ))
         if broken_at:
             break
 
-    levels = {link.level for link in links}
-    required = {"number", "analysis", "cohort", "definition", "episode", "record", "span"}
-    missing = sorted(required - levels)
-    if missing and not broken_at:
-        broken_at = missing[0]
-
     return Trace(
-        number=number,
-        label=label,
-        complete=broken_at is None,
-        broken_at=broken_at,
-        links=links,
+        number=number, label=label, complete=broken_at is None,
+        broken_at=broken_at, links=links,
     )
 
 
 def render_trace(trace: Trace) -> str:
-    """The chain as an indented outline, for a terminal."""
     indent = {
         "number": 0, "analysis": 1, "cohort": 2, "definition": 3,
         "episode": 4, "record": 5, "span": 6,
     }
-    lines = []
+    lines: list[str] = []
     for link in trace.links:
-        pad = "  " * indent.get(link.level, 0)
+        pad = "  " * indent[link.level]
         lines.append(f"{pad}{link.level:<10} {link.identifier}")
         if link.detail:
-            lines.append(f"{pad}           {link.detail}")
+            lines.append(f"{pad}{'':<10} {link.detail}")
     if not trace.complete:
         lines.append("")
         lines.append(
-            f"  INCOMPLETE: the chain breaks at {trace.broken_at!r}. A number "
-            f"that cannot be traced to source text is not reportable."
+            f"INCOMPLETE: the chain breaks at {trace.broken_at!r}. A number that "
+            f"cannot be traced to source is not reportable."
         )
     return "\n".join(lines)

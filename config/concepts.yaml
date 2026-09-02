@@ -1,62 +1,60 @@
 # Concept catalogue.
 #
-# Coded terms below are ILLUSTRATIVE PLACEHOLDERS shaped to look like real
-# dictionary terms. This repository holds no MedDRA licence and ships no MedDRA
-# content. Replace this file with a licensed extract before any real use.
+# ILLUSTRATIVE PLACEHOLDERS. This repository holds no terminology licence and
+# ships no licensed dictionary content. The coded terms below are stand-ins with
+# the right *shape* — a preferred term, lower-level terms, and different sets
+# under different dictionary versions — so that dictionary-version bridging can
+# be exercised. Replace them with a licensed extract before any real use.
 #
-# Grouping above the term level is an explicit, named list (`concept_groups`).
-# No hierarchy is walked as though it implied subsumption.
+# The catalogue is also where surface forms are declared. Extraction recall is
+# exactly the surface forms written here, and no more.
+
+terminology:
+  dictionary: PLACEHOLDER-MedDRA-like
+  versions: ["24.0", "25.1", "26.0"]
+  notice: >
+    Illustrative placeholder terms. Not licensed dictionary content.
 
 concepts:
-  HYPOGLYCEMIA:
-    label: Hypoglycemia
-    # Two hypoglycemia records three days apart are plausibly two episodes, not
-    # one evolving episode. Where recurrence is expected, adjacent records stay
-    # separate unless a record explicitly declares continuation.
+  RASH:
+    label: Rash
     recurrence_expected: true
     coded_terms:
-      pt: ["Hypoglycaemia", "Blood glucose decreased"]
-      llt: ["Hypoglycemia", "Low blood sugar", "Hypoglycaemic episode",
-            "Blood sugar low"]
-      # Terminology moves between dictionary versions. Bridging is an explicit
-      # union across the versions listed here, enabled per definition by
-      # `bridge_dictionary_versions`; it is never inferred.
+      pt: ["Rash"]
+      llt: ["Rash", "Skin rash", "Eruption"]
+      # Terminology moves between versions. A study coded under 24.0 carries a
+      # different set from one coded under 26.0, which is what makes
+      # `bridge_dictionary_versions` a measurable choice rather than a default.
       by_dictionary_version:
-        "MedDRA 21.1":
-          pt: ["Hypoglycaemic episode"]
-          llt: ["Low blood sugar episode", "Sugar low"]
-        "MedDRA 23.0":
-          pt: ["Hypoglycaemia", "Hypoglycaemic episode"]
-          llt: ["Low blood sugar"]
-    lexicon:
-      - hypoglycemia
-      - hypoglycaemia
-      - hypoglycemic episode
-      - hypoglycaemic episode
-      - low blood sugar
-      - low blood glucose
-    abbreviations: ["hypo", "hypos"]
-    context_required: [abbreviations]
-    context_gate:
-      lab_tests: [GLUCOSE]
-      symptom_sets: [neuroglycopenic, autonomic]
-      scope: sentence
-    candidate_evidence:
-      symptom_sets: [neuroglycopenic, autonomic]
-      min_symptoms: 1
-      lab_tests:
-        # Wider than any case threshold a definition uses, so the extractor
-        # narrows the field without pre-empting the definition's decision.
-        - {test: GLUCOSE, below: 80, unit: mg/dL}
+        "24.0": ["Rash", "Skin rash"]
+        "25.1": ["Rash", "Skin rash", "Eruption"]
+        "26.0": ["Rash", "Skin rash", "Eruption", "Rash generalised"]
+    lexicon: [rash, eruption, skin rash, exanthem]
+    abbreviations: []
+    # None of the coded terms above carries a body site. That is the point of
+    # the worked example: where no available term includes both the event and
+    # the site, the event term is selected and the site survives elsewhere.
+    carries_body_site: false
 
-  HYPERGLYCEMIA:
-    label: Hyperglycemia
+  URTICARIA:
+    label: Urticaria
     recurrence_expected: true
     coded_terms:
-      pt: ["Hyperglycaemia", "Blood glucose increased"]
-      llt: ["Hyperglycemia", "High blood sugar"]
-    lexicon: [hyperglycemia, hyperglycaemia, high blood sugar, elevated blood glucose]
+      pt: ["Urticaria"]
+      llt: ["Urticaria", "Hives"]
+    lexicon: [urticaria, hives, weals, wheals]
     abbreviations: []
+    carries_body_site: false
+
+  PRURITUS:
+    label: Pruritus
+    recurrence_expected: true
+    coded_terms:
+      pt: ["Pruritus"]
+      llt: ["Pruritus", "Itching"]
+    lexicon: [pruritus, itching, itch]
+    abbreviations: []
+    carries_body_site: false
 
   NAUSEA:
     label: Nausea
@@ -66,6 +64,7 @@ concepts:
       llt: ["Nausea", "Feeling sick"]
     lexicon: [nausea, nauseated, feeling sick]
     abbreviations: []
+    carries_body_site: false
 
   HEADACHE:
     label: Headache
@@ -75,99 +74,121 @@ concepts:
       llt: ["Headache", "Cephalgia"]
     lexicon: [headache, cephalgia]
     abbreviations: []
+    carries_body_site: false
 
   ANAEMIA:
     label: Anaemia
-    # A chronic, evolving condition: successive records are the same episode
-    # changing grade, not separate occurrences.
+    # Within a study window an anaemia is one condition changing grade, not a
+    # series of separate events. The episode reconciler reads this.
     recurrence_expected: false
     coded_terms:
       pt: ["Anaemia"]
-      llt: ["Anemia", "Low haemoglobin"]
-    lexicon: [anaemia, anemia, low haemoglobin, low hemoglobin]
+      llt: ["Anaemia", "Anemia", "Low haemoglobin"]
+    lexicon: [anaemia, anemia, low haemoglobin]
     abbreviations: []
-
-# How source records are grouped into episodes.
-#
-# The default rule is deterministic and it is wrong for recurrent conditions:
-# two hypoglycemia records three days apart are plausibly two episodes, not one.
-# So the rule is stated here, per concept `recurrence_expected` decides which
-# way the default falls, and anything ambiguous is flagged rather than resolved.
-episode_reconciliation:
-  gap_days: 1                  # records this close, or overlapping, are one episode
-  ambiguous_gap_days: 4        # beyond gap_days but this close: decided, and flagged
-  confidence:
-    explicit_continuation: 1.0     # the CRF says this record continues that one
-    temporal_overlap: 0.95         # intervals actually overlap
-    gap_within_tolerance: 0.85     # close enough, for a concept that does not recur
-    declared_convention: 0.9       # the study declares it splits on severity change
-    recurrence_split: 0.9          # kept apart because the concept recurs
-    model_proposed: 0.5            # proposed where deterministic evidence ran out
-    single_record: 1.0
+    carries_body_site: false
 
 concept_groups:
-  GLYCEMIC_EVENTS:
-    label: Glycaemic events (illustrative narrow grouping)
-    members: [HYPOGLYCEMIA, HYPERGLYCEMIA]
+  SKIN_EVENTS:
+    label: Skin and subcutaneous tissue events
+    members: [RASH, URTICARIA, PRURITUS]
 
-symptom_sets:
-  neuroglycopenic:
-    - confusion
-    - dizziness
-    - lightheadedness
-    - blurred vision
-    - difficulty concentrating
-    - drowsiness
-    - slurred speech
-  autonomic:
-    - shakiness
-    - tremor
-    - diaphoresis
-    - sweating
-    - palpitations
-    - pallor
-    - clamminess
-    - hunger
-    - anxiety
-  gastrointestinal:
-    - nausea
-    - vomiting
-    - abdominal pain
+# --------------------------------------------------------------------------
+# Attribute catalogues
+#
+# These are the normalized value spaces a phenotype rule is written against.
+# Every route — a standard variable, a sponsor codelist, the reported term, a
+# comment — resolves into the same space, which is what makes a route-agnostic
+# rule possible at all.
+# --------------------------------------------------------------------------
+
+attribute_catalogues:
+  location:
+    label: Anatomical location
+    values:
+      CHEST:
+        label: Chest
+        region: trunk
+        # Surface forms are the site itself, never a connector plus the site:
+        # "on the chest" would swallow the connector the anchoring rule needs
+        # to see, and score a well-connected mention as a merely adjacent one.
+        surface_forms: ["chest", "anterior chest", "chest wall", "sternal",
+                        "presternal", "thorax", "thoracic"]
+      ABDOMEN:
+        label: Abdomen
+        region: trunk
+        surface_forms: ["abdomen", "abdominal", "belly", "periumbilical",
+                        "periumbilical area", "flank"]
+      BACK:
+        label: Back
+        region: trunk
+        surface_forms: ["back", "upper back", "lower back", "lumbar",
+                        "scapular", "interscapular"]
+      ARM:
+        label: Arm
+        region: limb
+        surface_forms: ["arm", "arms", "forearm", "upper arm", "elbow",
+                        "antecubital"]
+      LEG:
+        label: Leg
+        region: limb
+        surface_forms: ["leg", "legs", "thigh", "shin", "calf", "knee"]
+      FACE:
+        label: Face
+        region: head
+        surface_forms: ["face", "facial", "cheek", "forehead", "perioral"]
+      GENERALISED:
+        label: Generalised
+        region: whole_body
+        surface_forms: ["generalised", "generalized", "widespread", "diffuse",
+                        "all over", "whole body", "systemic"]
+    regions:
+      trunk: [CHEST, ABDOMEN, BACK]
+      limb: [ARM, LEG]
+      head: [FACE]
+      whole_body: [GENERALISED]
+
+  laterality:
+    label: Laterality
+    values:
+      LEFT: {label: Left, surface_forms: ["left", "left-sided", "left sided"]}
+      RIGHT: {label: Right, surface_forms: ["right", "right-sided", "right sided"]}
+      BILATERAL:
+        label: Bilateral
+        surface_forms: ["bilateral", "both sides", "bilaterally"]
+
+  pattern:
+    label: Morphological pattern
+    values:
+      MACULAR:
+        label: Macular
+        surface_forms: ["macular", "macules", "flat red patches"]
+      PAPULAR:
+        label: Papular
+        surface_forms: ["papular", "papules", "raised bumps"]
+      MACULOPAPULAR:
+        label: Maculopapular
+        surface_forms: ["maculopapular", "maculo-papular", "morbilliform"]
+      URTICARIAL:
+        label: Urticarial
+        surface_forms: ["urticarial", "hives", "weals", "wheals"]
+      VESICULAR:
+        label: Vesicular
+        surface_forms: ["vesicular", "vesicles", "blistering", "bullous"]
 
 symptom_lexicon:
-  diaphoresis: ["diaphoresis", "diaphoretic", "profuse sweating"]
-  sweating: ["sweating", "sweaty"]
-  shakiness: ["shakiness", "shaky", "the shakes"]
-  tremor: ["tremor", "tremulous", "trembling"]
-  palpitations: ["palpitations", "racing heart", "pounding heart"]
-  pallor: ["pallor", "pale", "pale appearance"]
-  clamminess: ["clamminess", "clammy"]
-  hunger: ["hunger", "hungry", "ravenous"]
-  anxiety: ["anxiety", "anxious"]
-  confusion: ["confusion", "confused", "disoriented", "disorientation"]
-  dizziness: ["dizziness", "dizzy", "giddiness"]
-  lightheadedness: ["lightheadedness", "light-headedness", "lightheaded", "light-headed"]
-  blurred vision: ["blurred vision", "blurry vision", "vision blurring"]
-  difficulty concentrating: ["difficulty concentrating", "poor concentration"]
-  drowsiness: ["drowsiness", "drowsy", "somnolence"]
-  slurred speech: ["slurred speech", "dysarthria"]
-  nausea: ["nausea", "nauseated", "nauseous"]
-  vomiting: ["vomiting", "vomited", "emesis"]
-  abdominal pain: ["abdominal pain", "stomach pain", "epigastric pain"]
+  itching: [itching, pruritus, itchy]
+  burning: [burning, stinging]
+  swelling: [swelling, oedema, edema]
 
-lab_tests:
-  GLUCOSE:
-    label: Blood glucose
-    names: ["glucose", "blood glucose", "capillary glucose", "plasma glucose",
-            "fingerstick glucose", "BG", "CBG"]
-    canonical_unit: mg/dL
-    conversions:
-      mmol/L: 18.0182
-      mg/dL: 1.0
-    plausible_range: [20, 900]
-  HBA1C:
-    label: Haemoglobin A1c
-    names: ["hba1c", "haemoglobin a1c", "hemoglobin a1c", "a1c"]
-    canonical_unit: "%"
-    conversions: {"%": 1.0}
-    plausible_range: [3, 20]
+# How records are grouped into episodes. Declared, not discovered.
+episode_reconciliation:
+  overlap_tolerance_days: 3
+  recurrence_gap_days: 7
+  confidence:
+    explicit_continuation: 1.0
+    declared_convention: 0.95
+    temporal_overlap: 0.9
+    gap_within_tolerance: 0.75
+    recurrence_split: 0.9
+    single_record: 1.0
