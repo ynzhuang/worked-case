@@ -1,13 +1,13 @@
 id: cutaneous_mucosal
 version: 1
 status: frozen
-label: Cutaneous event with mucosal involvement within 30 days of first exposure
+label: Cutaneous event with mucosal involvement, structured evidence only
 description: >
-  A cutaneous event, coded under any of the concepts in the set, with mucosal
-  involvement asserted present, first recorded within 30 days of first
-  exposure. The claim is about representation: the same rule runs across
-  studies that record the modifier in a structured qualifier, in a linked form,
-  in the investigator's own words, in a comment, or not at all.
+  The conservative first cut: a cutaneous event with mucosal involvement
+  recorded in a structured route, within 30 days of first exposure. It says
+  the study's own coded qualifier is the only acceptable evidence of mucosal
+  involvement — a narrower scientific claim than v2, deliberately, and the
+  version a team would write before it had measured what reading prose costs.
 supersedes: null
 authors: ["clinical-evidence-prototype"]
 created: 2026-09-03
@@ -29,7 +29,7 @@ modifiers:
     # Route-agnostic by design: the rule does not know or care which study
     # field supplied the evidence, only that it is present and points at
     # something a reader can check.
-    accept_methods: [direct, extracted]
+    accept_methods: [direct]
     on_unavailable: not_ascertainable
     description: >
       An observed absence is a non_case; silence is not. The two are different

@@ -32,8 +32,12 @@ STANDING_LIMITATIONS = [
     "configured; the manifest records which one ran.",
     "Counts are per the named definition version only. A different version can "
     "reach different verdicts on the same episodes.",
-    "Episodes counted as not_ascertainable are reported separately and are "
-    "neither cases nor negatives: nobody can evaluate the rule on them.",
+    "Records counted as not_ascertainable are reported separately and are "
+    "neither cases nor negatives: nobody can evaluate the rule on them. "
+    "Incidence is computed within the ascertainable population and the "
+    "ascertainable fraction is reported beside it.",
+    "Verdicts are assigned at the source-record grain. Episode grouping is a "
+    "derived view and nothing is evaluated at that grain.",
     "Where an attribute was recovered from text, the extractor carries a "
     "measured error rate from the silver-standard harness, not an assumed one.",
     "Coded terms in the concept catalogue are illustrative placeholders, not "
@@ -64,7 +68,7 @@ def results_payload(assignments: Sequence[CaseAssignment]) -> list[dict[str, Any
     """The canonical representation a results hash is taken over."""
     return [
         a.model_dump(mode="json")
-        for a in sorted(assignments, key=lambda a: a.episode_id)
+        for a in sorted(assignments, key=lambda a: a.record_id)
     ]
 
 
@@ -186,17 +190,16 @@ def execute(
     save: bool = True,
 ) -> tuple[Manifest, list[CaseAssignment]]:
     """Run a definition and record the governed execution."""
-    assignments = pipeline.evaluate(definition, studies)
+    result = pipeline.evaluate(definition, studies)
+    assignments = result.assignments
     versions = pipeline.versions()
 
     spec: dict[str, Any] = {
         "definition_id": definition.id,
         "definition_version": definition.version,
-        "operates_on": definition.operates_on,
-        "concept": definition.concept.primary,
-        "accept_methods": sorted(
-            {m for r in definition.required_attributes for m in r.accept_methods}
-        ),
+        "concept_set": sorted(definition.concept_set.include),
+        "dictionary_target": definition.concept_set.dictionary_target,
+        "accept_methods": definition.accepted_methods(),
         "studies": sorted(studies) if studies else sorted(pipeline.store.studies()),
     }
     if specification:
@@ -224,27 +227,35 @@ def execute(
         actor=actor,
         question=question,
         specification=spec,
-        phenotype_definition_id=definition.id,
-        phenotype_definition_version=definition.version,
+        definition_id=definition.id,
+        definition_version=definition.version,
         definition_hash=definition.definition_hash,
         definition_status=definition.status,
         cohort_specification={
             "studies": spec["studies"],
             "subjects": len(pipeline.cohort(studies)),
-            "episodes": len(assignments),
+            "records": len(assignments),
+            "grain": "source_record",
         },
         data_snapshot_id=pipeline.snapshot_id,
-        terminology_versions=versions["terminology_versions"],
+        dictionary_versions=versions["dictionary_versions"],
         normalizer_version=versions["normalizer_version"],
         extractor_version=versions["extractor_version"],
         model_version=versions.get("model_version"),
-        prompt_version="extract-prompt-1",
-        analysis_method="phenotype_evaluation",
-        parameters={"backend": versions.get("extraction_backend")},
+        prompt_version=versions.get("prompt_version"),
+        method_parameters={
+            "analysis": "phenotype_evaluation",
+            "backend": versions.get("extraction_backend"),
+            "grain": "source_record",
+        },
         validation_status="unvalidated",
         output_pointer=pointer,
         results_hash=hash_payload(payload, length=32),
         counts_by_verdict=_counts(assignments, "verdict"),
+        # Per study, because the ascertainable fraction is a property of a
+        # study's collection convention and averaging it away is the quiet way
+        # a rate becomes a comparison of CRFs.
+        denominators=[d.to_dict() for d in result.denominators()],
         # Which routes supplied the evidence behind this cohort, so a later
         # reader can see it depended on text extraction without re-deriving it.
         attribute_sources=_counted(
@@ -317,8 +328,8 @@ def replay(
             )
 
     definition = pipeline.definitions.get(
-        original.phenotype_definition_id,
-        original.phenotype_definition_version,
+        original.definition_id,
+        original.definition_version,
         allow_draft=True,
     )
     if definition.definition_hash != original.definition_hash:
@@ -335,7 +346,7 @@ def replay(
         specification={
             k: v for k, v in original.specification.items()
             if k not in ("definition_id", "definition_version", "studies",
-                         "concept", "operates_on")
+                         "concept_set", "dictionary_target", "accept_methods")
         },
         save=False,
     )
