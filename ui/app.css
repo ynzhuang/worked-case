@@ -149,3 +149,43 @@ table.grid th, table.grid td { text-align: left; padding: 5px 8px; border-bottom
 table.grid th { color: var(--muted); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; }
 table.grid td.reason { font-size: 12px; color: var(--muted); }
 .err { color: var(--bad); font-size: 13px; }
+
+/* ---- v4 additions ------------------------------------------------------
+ * Tone classes are deliberately literal. `warn` on a not-ascertainable count
+ * or on a silver caveat is not decoration: it marks the numbers a reader is
+ * most likely to misuse.
+ */
+.stat.good .n { color: var(--good); }
+.stat.warn .n { color: var(--warn); }
+
+.notice.warn {
+  background: var(--warn-soft);
+  border-color: var(--warn);
+}
+
+.rec {
+  display: block;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.rec:hover { background: var(--accent-soft); border-color: var(--accent); }
+.rec .rec-id { font: 600 12px var(--mono); }
+.rec .rec-meta {
+  font: 11.5px var(--mono);
+  color: var(--muted);
+  margin-top: 3px;
+}
+
+.doc-item .doc-head {
+  font: 600 11px var(--mono);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 4px;
+}
+
+.list { min-width: 260px; }
+.evt .pill { display: inline-block; margin-top: 6px; white-space: normal; }
+table.grid td.reason { font-size: 12px; color: var(--muted); }

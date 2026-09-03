@@ -3,6 +3,14 @@
  * Every panel reads the same API the CLI drives, so the two cannot disagree
  * about which definition version produced a number. Nothing is computed here:
  * the browser renders what the server says and never derives a count of its own.
+ *
+ * Two things this page refuses to do, because doing them would misrepresent the
+ * system it is showing:
+ *
+ *   - it never offers a single "missing" filter. Assertion and availability are
+ *     separate controls everywhere they appear.
+ *   - it never renders a silver number without its two caveats, and never
+ *     renders the ablation's stage table without the decision above it.
  */
 'use strict';
 
@@ -46,6 +54,7 @@ function query(params) {
 }
 
 const selected = (node) => Array.from(node.selectedOptions).map((o) => o.value);
+const fixed = (n, d) => (n === null || n === undefined ? '—' : Number(n).toFixed(d));
 
 function stat(container, value, label, tone) {
   const box = el('div', 'stat' + (tone ? ' ' + tone : ''));
@@ -56,11 +65,9 @@ function stat(container, value, label, tone) {
 
 function table(container, headers, rows) {
   const node = el('table', 'grid');
-  node.appendChild(el('tr'));
-  headers.forEach((h) => {
-    const th = el('th', null, h);
-    node.firstChild.appendChild(th);
-  });
+  const head = el('tr');
+  headers.forEach((h) => head.appendChild(el('th', null, h)));
+  node.appendChild(head);
   rows.forEach((row) => {
     const tr = el('tr');
     row.forEach((cell, index) => {
@@ -74,10 +81,20 @@ function table(container, headers, rows) {
   container.appendChild(node);
 }
 
+function section(container, title, headers, rows) {
+  container.innerHTML = '';
+  if (title) container.appendChild(el('h2', null, title));
+  const holder = el('div');
+  container.appendChild(holder);
+  table(holder, headers, rows);
+}
+
 function fail(node, error) {
   node.innerHTML = '';
   node.appendChild(el('p', 'err', error.message || String(error)));
 }
+
+/* ---------------------------------------------------------------- tabs --- */
 
 document.querySelectorAll('.tab').forEach((tab) => {
   tab.addEventListener('click', () => {
@@ -88,486 +105,566 @@ document.querySelectorAll('.tab').forEach((tab) => {
   });
 });
 
-/* ------------------------------------------------------------- summary */
+/* ------------------------------------------------------------- summary --- */
 
 let SUMMARY = null;
 
 async function loadSummary() {
   SUMMARY = await api('/api/summary');
   $('corpus-line').textContent =
-    `${Object.keys(SUMMARY.profiles).length} profiles · ${SUMMARY.subjects} subjects · ` +
-    `${SUMMARY.records} records · ${SUMMARY.episodes} episodes · ` +
-    `normalizer ${SUMMARY.normalizer_version} · extractor ${SUMMARY.extractor_version} ` +
-    `(${SUMMARY.extraction_backend}) · snapshot ${SUMMARY.snapshot_id}`;
+    `${SUMMARY.studies} studies · ${SUMMARY.subjects} subjects · ` +
+    `${SUMMARY.records} source records · normalizer ${SUMMARY.normalizer_version} · ` +
+    `extractor ${SUMMARY.extractor_version} (${SUMMARY.extraction_backend}) · ` +
+    `snapshot ${SUMMARY.snapshot_id}`;
 
-  const box = $('route-summary');
-  box.innerHTML = '';
-  for (const [route, count] of Object.entries(SUMMARY.location_routes)) {
-    const tone = ['direct', 'normalized', 'extracted'].includes(route) ? 'ok' : null;
-    stat(box, count, route.replace(/_/g, ' '), tone);
-  }
+  const routes = $('route-summary');
+  routes.innerHTML = '';
+  const assertions = SUMMARY.assertions || {};
+  stat(routes, assertions.present || 0, 'present');
+  stat(routes, assertions.absent || 0, 'absent — documented negatives', 'good');
+  stat(routes, assertions.uncertain || 0, 'uncertain');
+  stat(routes, assertions.silent || 0, 'silent — nobody said anything', 'warn');
+  const extraction = SUMMARY.extraction || {};
+  stat(routes, extraction.recovered || 0, 'recovered from text');
+  stat(routes, `${((extraction.abstention_rate || 0) * 100).toFixed(0)}%`,
+    'abstention rate — a valid answer');
 
+  const profiles = Object.entries(SUMMARY.profiles || {}).sort();
   table($('profile-table'),
-    ['profile', 'term style', 'location home', 'pattern home', 'dictionary',
-     'both routes?'],
-    Object.entries(SUMMARY.profiles).map(([id, body]) => [
-      id, body.reported_term_style, body.location_home.join(', '),
-      body.pattern_home.join(', '), body.dictionary_version,
-      body.carries_both_location ? 'yes — silver standard' : 'no',
+    ['profile', 'study', 'term style', 'modifier home', 'dictionary',
+     'supportability', 'note'],
+    profiles.map(([name, body]) => [
+      name, body.study_id, body.reported_term_style,
+      (body.modifier_homes || []).join(', '),
+      body.dictionary_version, body.supportability, body.note,
     ]));
 
-  const select = $('rec-profile');
-  Object.keys(SUMMARY.profiles).forEach((id) => {
-    const option = el('option', null, id);
-    option.value = id;
-    select.appendChild(option);
+  section($('reconciliation-table'),
+    'Dictionary version reconciliation — mechanical, never a model',
+    ['outcome', 'records', 'what it means'],
+    [
+      ['unchanged', (SUMMARY.reconciliation || {}).unchanged || 0,
+       'the code is identical under the target version'],
+      ['remapped_mechanically',
+       (SUMMARY.reconciliation || {}).remapped_mechanically || 0,
+       'the concept persists across versions, so a 1:1 map applies; the ' +
+       'original code is preserved beside it'],
+      ['flagged_for_review',
+       (SUMMARY.reconciliation || {}).flagged_for_review || 0,
+       'the concept has no code under the target version. A human decides ' +
+       'what it becomes — no model ever recodes it'],
+    ]);
+
+  const profileSelect = $('rec-profile');
+  profiles.forEach(([name]) => {
+    const option = el('option', null, name);
+    option.value = name;
+    profileSelect.appendChild(option);
+  });
+
+  const defs = await api('/definitions');
+  ['def-select', 'abl-select'].forEach((id) => {
+    const select = $(id);
+    select.innerHTML = '';
+    defs.definitions.forEach((d) => {
+      const option = el('option', null, `${d.key} — ${d.label}`);
+      option.value = `${d.id}:${d.version}`;
+      select.appendChild(option);
+    });
+    const latest = defs.definitions.filter((d) => d.id === 'cutaneous_mucosal');
+    if (latest.length) {
+      select.value = `${latest[latest.length - 1].id}:${latest[latest.length - 1].version}`;
+    }
   });
 }
 
-/* ------------------------------------------------------- 1. records */
+/* --------------------------------------------------- 1. records & routes --- */
 
 async function loadRecords() {
-  const list = $('rec-list');
-  list.innerHTML = 'loading…';
-  const body = await api('/api/records?' + query({
+  const params = {
     profile: $('rec-profile').value,
+    assertion: $('rec-assertion').value,
+    availability: $('rec-availability').value,
     method: $('rec-method').value,
     limit: 200,
-  }));
+  };
+  const body = await api('/api/records?' + query(params));
+  const list = $('rec-list');
   list.innerHTML = '';
   if (!body.records.length) {
-    list.appendChild(el('p', 'hint', 'No records match.'));
+    list.appendChild(el('p', 'hint', 'No record matches those two filters.'));
     return;
   }
-  body.records.forEach((record) => {
-    const item = el('div', 'doc-item');
-    item.textContent =
-      `${record.source_record_id}\n${record.profile} · ` +
-      `${record.location || '—'} (${record.location_method || record.location_availability})`;
-    item.addEventListener('click', () => {
-      list.querySelectorAll('.doc-item').forEach((n) => n.classList.remove('sel'));
-      item.classList.add('sel');
-      showRecord(record.source_record_id);
-    });
+  body.records.forEach((row) => {
+    const item = el('button', 'rec');
+    item.appendChild(el('div', 'rec-id', row.source_record_id));
+    const assertion = row.modifier_assertion || 'silent';
+    item.appendChild(el('div', 'rec-meta',
+      `${row.profile} · ${assertion} · ${row.modifier_availability}` +
+      (row.modifier_method ? ` · ${row.modifier_method}` : '')));
+    item.addEventListener('click', () => showRecord(row.record_id));
     list.appendChild(item);
   });
-  list.firstChild.classList.add('sel');
-  showRecord(body.records[0].source_record_id);
 }
 
 function highlight(text, spans) {
-  const marks = spans
-    .filter((s) => typeof s.start === 'number' && s.end > s.start)
-    .sort((a, b) => a.start - b.start);
+  if (!spans.length) return esc(text);
+  const ordered = spans.slice().sort((a, b) => a.start - b.start);
   let out = '';
   let cursor = 0;
-  marks.forEach((span) => {
+  ordered.forEach((span) => {
     if (span.start < cursor) return;
     out += esc(text.slice(cursor, span.start));
-    out += `<mark title="${esc(span.field)}: ${esc(span.extracted_value)}">` +
-           `${esc(text.slice(span.start, span.end))}</mark>`;
+    out += `<mark class="f-assertion">${esc(text.slice(span.start, span.end))}</mark>`;
     cursor = span.end;
   });
   return out + esc(text.slice(cursor));
 }
 
 async function showRecord(recordId) {
-  const view = $('rec-view');
+  const body = await api('/api/records/' + encodeURIComponent(recordId));
+  const badge = $('rec-badge');
+  badge.textContent = body.profile;
+  badge.className = 'badge';
+
   const source = $('rec-source');
-  view.innerHTML = 'loading…';
-  let body;
-  try { body = await api(`/api/records/${encodeURIComponent(recordId)}`); }
-  catch (error) { fail(view, error); return; }
-
-  $('rec-badge').textContent = body.provenance_complete
-    ? 'every populated attribute has a span' : 'PROVENANCE DEFECT';
-
   source.innerHTML = '';
-  const term = body.record.reported_term.value || '';
-  const termSpans = Object.values(body.attributes)
-    .flatMap((a) => a.evidence)
-    .filter((s) => s.kind === 'text' && s.doc_id.endsWith(':AETERM'));
-  const termBlock = el('div');
-  termBlock.appendChild(el('div', 'hint', 'AETERM — the investigator\'s own words'));
+  const modifier = body.attributes.mucosal_involvement || {};
+  const spans = (modifier.evidence || []).filter((s) => s.kind === 'text');
+
+  const term = body.attributes.reported_term || {};
+  const termBlock = el('div', 'doc-item');
+  termBlock.appendChild(el('div', 'doc-head', 'AETERM — the investigator’s own words'));
   const termText = el('div');
-  termText.innerHTML = highlight(term, termSpans);
+  termText.innerHTML = highlight(String(term.value || ''),
+    spans.filter((s) => s.doc_id.endsWith('AETERM')));
   termBlock.appendChild(termText);
   source.appendChild(termBlock);
 
-  (body.supplemental || []).forEach((row) => {
-    const block = el('div');
-    block.appendChild(el('div', 'hint',
-      `SUPPAE.${row.QNAM} — a sponsor-defined qualifier`));
-    block.appendChild(el('div', null, `${row.QVAL}  (${row.QLABEL})`));
-    source.appendChild(block);
-  });
-
-  (body.documents || []).forEach((document_) => {
-    const spans = Object.values(body.attributes)
-      .flatMap((a) => a.evidence)
-      .filter((s) => s.doc_id === document_.doc_id);
-    const block = el('div');
-    block.appendChild(el('div', 'hint', `${document_.doc_id} — a linked comment`));
+  (body.documents || []).forEach((doc) => {
+    const block = el('div', 'doc-item');
+    block.appendChild(el('div', 'doc-head', `${doc.kind} — ${doc.doc_id}`));
     const text = el('div');
-    text.innerHTML = highlight(document_.text, spans);
+    text.innerHTML = highlight(doc.text, spans.filter((s) => s.doc_id === doc.doc_id));
     block.appendChild(text);
     source.appendChild(block);
   });
 
-  view.innerHTML = '';
-  const card = el('div', 'evt');
-  card.appendChild(el('div', 'evt-head',
-    `${body.record.source_record_id} · ${body.record.profile}`));
-  const grid = el('table');
-  Object.entries(body.attributes).forEach(([name, attribute]) => {
-    const row = el('tr');
-    if (attribute.value === null) row.className = 'null';
-    row.appendChild(el('td', 'k', name));
-    const value = el('td', 'v');
-    value.appendChild(document.createTextNode(
-      (attribute.value === null ? '—' : String(attribute.value)) + '  '));
-    value.appendChild(el('span',
-      'pill ' + (attribute.availability === 'collected' ? 'present' : 'uncertain'),
-      attribute.availability));
-    if (attribute.method) {
-      value.appendChild(document.createTextNode(' '));
-      value.appendChild(el('span', 'pill', attribute.method));
-    }
-    if (attribute.source_variable) {
-      value.appendChild(document.createTextNode(' '));
-      value.appendChild(el('span', 'pill', attribute.source_variable));
-    }
-    if (attribute.prior_availability
-        && attribute.prior_availability !== attribute.availability) {
-      value.appendChild(document.createTextNode(' '));
-      value.appendChild(el('span', 'pill', `CRF: ${attribute.prior_availability}`));
-    }
-    if (attribute.note) value.appendChild(el('div', 'hint', attribute.note));
-    if (attribute.value !== null && !attribute.evidence.length) {
-      value.appendChild(el('div', 'nospan', 'no span — defect'));
-    }
-    row.appendChild(value);
-    grid.appendChild(row);
-  });
-  card.appendChild(grid);
-  view.appendChild(card);
+  const coded = body.coded_event;
+  if (coded) {
+    const block = el('div', 'doc-item');
+    block.appendChild(el('div', 'doc-head', 'AEDECOD — the coded term, never rewritten'));
+    block.appendChild(el('div', null,
+      `${coded.code} (${coded.dictionary_version}) → ` +
+      `${coded.reconciliation}` +
+      (coded.reconciled_to && coded.reconciled_to !== coded.code
+        ? ` → ${coded.reconciled_to}` : '')));
+    if (coded.note) block.appendChild(el('div', 'hint', coded.note));
+    source.appendChild(block);
+  }
+
+  const rows = Object.entries(body.attributes).map(([name, a]) => [
+    name,
+    a.value === null || a.value === undefined ? '—' : String(a.value),
+    a.assertion || '—',
+    a.availability,
+    a.method || '—',
+    a.source_variable || '—',
+    a.confidence === null || a.confidence === undefined ? '—' : fixed(a.confidence, 2),
+    a.note || '',
+  ]);
+  section($('rec-view'), null,
+    ['attribute', 'value', 'assertion', 'availability', 'method', 'variable',
+     'conf', 'note'],
+    rows);
 }
 
-/* -------------------------------------------------------- 2. silver */
+['rec-profile', 'rec-assertion', 'rec-availability', 'rec-method'].forEach((id) => {
+  $(id).addEventListener('change', () => loadRecords().catch((e) => fail($('rec-list'), e)));
+});
+
+/* ------------------------------------------------------ 2. the decision --- */
+
+async function runAblation() {
+  const [id, version] = $('abl-select').value.split(':');
+  const decision = $('ablation-decision');
+  decision.textContent = 'running…';
+  try {
+    const body = await api(`/eval/ablation?${query({definition_id: id, version})}`);
+    decision.innerHTML = '';
+    decision.appendChild(el('strong', null, 'DECISION: '));
+    decision.appendChild(document.createTextNode(body.decision));
+
+    section($('ablation-stages'), 'Stages, cumulative',
+      ['stage', 'evaluated', 'ascertained', 'asc. fraction', 'cases',
+       'correct', 'wrong', 'precision', 'recall'],
+      body.stages.map((s) => [
+        s.stage, s.n_evaluated, s.n_ascertained, fixed(s.ascertainable_fraction, 3),
+        s.n_case, s.n_case_correct, s.n_case_incorrect,
+        fixed(s.precision, 3), fixed(s.recall, 3),
+      ]));
+
+    const increments = $('ablation-increments');
+    increments.innerHTML = '';
+    increments.appendChild(el('h2', null, 'What each stage bought'));
+    body.increments.forEach((inc) => {
+      const pane = el('div', 'pane');
+      pane.appendChild(el('h2', null, `${inc.from_stage} → ${inc.to_stage}`));
+      const list = el('ul', 'hint');
+      inc.reasons.forEach((reason) => list.appendChild(el('li', null, reason)));
+      pane.appendChild(list);
+      const verdict = el('div', 'notice' + (inc.material ? '' : ' warn'));
+      verdict.textContent = inc.decision;
+      pane.appendChild(verdict);
+      increments.appendChild(pane);
+    });
+    increments.appendChild(el('p', 'hint', body.note));
+
+    table($('ablation-criteria'), ['criterion', 'threshold'],
+      Object.entries(body.materiality_criteria).sort());
+  } catch (error) {
+    fail(decision, error);
+  }
+}
+
+$('btn-ablation').addEventListener('click', runAblation);
+
+/* ------------------------------------------------------ 3. silver ------- */
 
 async function loadSilver() {
-  const box = $('silver-summary');
-  box.innerHTML = 'loading…';
-  let body;
-  try { body = await api('/eval/silver?limit=40'); }
-  catch (error) { fail(box, error); return; }
-  const overall = body.overall;
-  box.innerHTML = '';
-  stat(box, overall.precision.toFixed(3), 'precision');
-  stat(box, overall.recall.toFixed(3), 'recall');
-  stat(box, overall.coverage.toFixed(3), 'coverage');
-  stat(box, overall.abstention_rate.toFixed(3), 'abstention rate');
-  stat(box, overall.normalized_agreement.toFixed(3), 'normalized agreement');
-  stat(box, overall.disagreements, 'disagreements',
-    overall.disagreements ? 'alert' : 'ok');
+  const caveats = await api('/eval/caveats');
+  const holder = $('silver-caveats');
+  holder.innerHTML = '';
+  caveats.silver.forEach((text) => {
+    const box = el('div', 'notice warn');
+    box.textContent = text;
+    holder.appendChild(box);
+  });
 
-  table($('silver-style'),
-    ['style', 'precision', 'recall', 'coverage', 'abstention', 'answered'],
-    Object.entries(body.by_reported_term_style).map(([style, m]) => [
-      style, m.precision.toFixed(3), m.recall.toFixed(3), m.coverage.toFixed(3),
-      m.abstention_rate.toFixed(3), m.answered,
+  const body = await api('/eval/silver');
+  const summary = $('silver-summary');
+  summary.innerHTML = '';
+  const overall = body.overall;
+  stat(summary, overall.eligible_records, 'eligible records');
+  stat(summary, fixed(overall.precision, 3), 'precision');
+  stat(summary, fixed(overall.recall, 3), 'recall');
+  stat(summary, fixed(overall.coverage, 3), 'coverage');
+  stat(summary, fixed(overall.abstention_rate, 3), 'abstention rate');
+  stat(summary, overall.disagreements, 'disagreements',
+    overall.disagreements ? 'warn' : 'good');
+
+  table($('silver-assertion'),
+    ['assertion', 'n', 'answered', 'correct', 'recall', 'precision'],
+    Object.entries(body.by_assertion).map(([name, row]) => [
+      name, row.n, row.answered, row.correct,
+      fixed(row.recall, 3), fixed(row.precision, 3),
     ]));
 
-  const queue = $('silver-queue');
-  queue.innerHTML = '';
-  $('queue-badge').textContent = `${body.adjudication_queue.length} shown`;
-  body.adjudication_queue.forEach((row) => {
-    const card = el('div', 'rec');
-    const meta = el('div', 'meta');
-    meta.appendChild(el('span', null, row.source_record_id));
-    meta.appendChild(el('span', 'pill ' +
-      (row.agreement === 'agree' ? 'present' : 'absent'), row.agreement));
-    meta.appendChild(el('span', null, `structured: ${row.structured_value ?? '—'}`));
-    meta.appendChild(el('span', null, `extracted: ${row.extracted_value ?? '—'}`));
-    card.appendChild(meta);
-    card.appendChild(el('div', 'snip', row.text));
-    card.appendChild(el('div', 'hint', row.queue_reason));
-    queue.appendChild(card);
+  const calibration = $('silver-calibration');
+  calibration.innerHTML = '';
+  const head = el('div', 'summary');
+  stat(head, fixed(body.calibration.brier_score, 4), 'Brier score');
+  stat(head, fixed(body.calibration.expected_calibration_error, 4),
+    'expected calibration error');
+  calibration.appendChild(head);
+  const grid = el('div');
+  calibration.appendChild(grid);
+  table(grid, ['confidence bin', 'n', 'mean confidence', 'observed', 'gap'],
+    body.calibration.reliability.map((r) => [
+      r.bin, r.n, fixed(r.mean_confidence, 3),
+      fixed(r.observed_accuracy, 3), fixed(r.gap, 3),
+    ]));
+  calibration.appendChild(el('p', 'hint', body.calibration.note));
+
+  const queue = body.adjudication_queue || [];
+  $('queue-badge').textContent = `${queue.length} rows`;
+  const list = $('silver-queue');
+  list.innerHTML = '';
+  queue.forEach((row) => {
+    const item = el('div', 'evt');
+    item.appendChild(el('div', 'evt-head',
+      `${row.source_record_id} · ${row.profile}`));
+    item.appendChild(el('div', null,
+      `structured says ${row.structured_assertion || '—'}; ` +
+      `extraction says ${row.extracted_assertion || 'abstained'}` +
+      (row.extracted_confidence !== null && row.extracted_confidence !== undefined
+        ? ` at ${fixed(row.extracted_confidence, 2)}` : '')));
+    if (row.text) item.appendChild(el('div', 'hint', row.text));
+    item.appendChild(el('div', 'pill', row.queue_reason));
+    list.appendChild(item);
   });
 }
 
-/* ----------------------------------------------------- 3. phenotype */
+/* --------------------------------------------- 4. verdicts & denominators --- */
 
-let DEFINITIONS = [];
-
-async function loadDefinitions() {
-  const body = await api('/definitions');
-  DEFINITIONS = body.definitions;
-  const select = $('def-select');
-  select.innerHTML = '';
-  DEFINITIONS.forEach((definition) => {
-    const option = el('option', null,
-      `${definition.key} (${definition.status}) — accepts ${definition.accept_methods.join(', ')}`);
-    option.value = definition.key;
-    select.appendChild(option);
-  });
-  select.value = DEFINITIONS[0].key;
-}
-
-const currentDefinition = () =>
-  DEFINITIONS.find((d) => d.key === $('def-select').value);
-
-async function evaluateDefinition() {
-  const definition = currentDefinition();
+async function evaluate() {
+  const [id, version] = $('def-select').value.split(':');
   const summary = $('verdict-summary');
   summary.innerHTML = 'evaluating…';
-  let body;
   try {
-    body = await post('/evaluate', {
-      definition_id: definition.id, version: definition.version,
-      allow_draft: definition.status === 'draft',
+    const body = await post('/evaluate', {
+      definition_id: id, version: Number(version), save: true,
     });
-  } catch (error) { fail(summary, error); return; }
+    const counts = body.manifest.counts_by_verdict;
+    summary.innerHTML = '';
+    stat(summary, counts.case || 0, 'case', 'good');
+    stat(summary, counts.non_case || 0, 'non_case — evaluated negatives');
+    stat(summary, counts.review || 0, 'review');
+    stat(summary, counts.not_ascertainable || 0, 'not ascertainable', 'warn');
 
-  const manifest = body.manifest;
-  summary.innerHTML = '';
-  Object.entries(manifest.counts_by_verdict).forEach(([verdict, count]) => {
-    stat(summary, count, verdict,
-      verdict === 'case' ? 'ok' : (verdict === 'not_ascertainable' ? 'alert' : null));
-  });
-  Object.entries(manifest.attribute_methods).forEach(([method, count]) => {
-    stat(summary, count, `via ${method}`);
-  });
+    table($('denominator-table'),
+      ['study', 'profile', 'total', 'case', 'non_case', 'review', 'not asc.',
+       'asc. fraction', 'incidence'],
+      body.denominators.map((d) => [
+        d.study_id, d.profile, d.n_total, d.n_case, d.n_non_case, d.n_review,
+        d.n_not_ascertainable, fixed(d.ascertainable_fraction, 3),
+        d.incidence_within_ascertainable === null
+          ? '—' : fixed(d.incidence_within_ascertainable, 3),
+      ]));
+    $('denominator-note').textContent = body.denominator_note;
 
-  table($('verdict-table'),
-    ['episode', 'verdict', 'location', 'route', 'why'],
-    body.assignments
-      .filter((a) => a.verdict !== 'not_case')
-      .slice(0, 30)
-      .map((a) => [
-        a.episode_id, a.verdict,
-        (a.findings.find((f) => f.name === 'location') || {}).value ?? '—',
-        Object.entries(a.attribute_sources).map(([k, v]) => `${k}=${v}`).join(' ') || '—',
+    table($('verdict-table'),
+      ['record', 'verdict', 'route', 'reason'],
+      body.assignments.slice(0, 40).map((a) => [
+        a.record_id, a.verdict,
+        Object.values(a.attribute_methods || {}).join(', '),
         a.reason,
       ]));
+  } catch (error) {
+    fail(summary, error);
+  }
 }
 
-async function loadAblation() {
-  const view = $('ablation-view');
-  view.innerHTML = 'running…';
-  let body;
-  try { body = await api('/eval/ablation'); }
-  catch (error) { fail(view, error); return; }
-  view.innerHTML = '';
-  const box = el('div', 'summary');
-  stat(box, body.cases_structured_only, 'cases, structured only');
-  stat(box, body.cases_with_text, 'cases, with text', 'ok');
-  stat(box, body.cases_only_findable_through_text, 'only findable through text', 'ok');
-  stat(box, `${(body.fraction_only_findable_through_text * 100).toFixed(1)}%`,
-    'of all cases');
-  stat(box, body.not_ascertainable_resolved_by_text, 'unascertainable resolved by text');
-  view.appendChild(box);
-  view.appendChild(el('p', 'hint', body.note));
-}
-
-async function compareDefinitions() {
-  const definition = currentDefinition();
+async function compareVersions() {
+  const [id] = $('def-select').value.split(':');
   const view = $('compare-view');
   view.innerHTML = 'comparing…';
-  let body;
   try {
-    body = await api(`/definitions/${definition.id}/compare?` + query({
-      left: $('cmp-left').value, right: $('cmp-right').value,
+    const body = await api(`/definitions/${id}/compare?` + query({
+      left: $('cmp-left').value,
+      right: $('cmp-right').value,
       scope: $('cmp-scope').value,
     }));
-  } catch (error) { fail(view, error); return; }
-  view.innerHTML = '';
-  view.appendChild(el('p', 'hint', body.summary));
-  table(view, ['episode', 'left', 'right', 'why it moved'],
-    body.discordant.slice(0, 15).map((entry) => [
-      entry.episode_id, entry.verdict_a, entry.verdict_b, entry.reason_b,
-    ]));
+    view.innerHTML = '';
+    view.appendChild(el('p', null, body.summary));
+    const grid = el('div');
+    view.appendChild(grid);
+    table(grid, ['record', 'left', 'right', 'why it moved'],
+      body.discordant.slice(0, 20).map((d) => [
+        d.record_id, d.verdict_a, d.verdict_b, d.reason_b,
+      ]));
+  } catch (error) {
+    fail(view, error);
+  }
 }
 
-/* ----------------------------------------------------- 4. retrieval */
+$('btn-evaluate').addEventListener('click', evaluate);
+$('btn-compare').addEventListener('click', compareVersions);
+
+/* ------------------------------------------------- 5. retrieval ---------- */
 
 async function search() {
   const summary = $('r-summary');
   const results = $('r-results');
-  summary.innerHTML = '';
-  results.innerHTML = 'searching…';
-  const precise = $('r-path').value === 'precise';
-  let body;
-  try {
-    body = precise
-      ? await api('/retrieve?' + query({
-          concept: 'RASH', region: $('r-region').value,
-          method: selected($('r-method')), verdict: selected($('r-verdict')),
-          top_k: $('r-topk').value,
-        }))
-      : await api('/discover?' + query({
-          unnormalized_only: $('r-unnormalized').checked,
-          mode: 'hybrid', top_k: $('r-topk').value,
-        }));
-  } catch (error) { fail(results, error); return; }
-
-  stat(summary, body.count, precise ? 'episodes' : 'mentions');
-  stat(summary, body.usable_as_cohort ? 'yes' : 'no', 'usable as a cohort',
-    body.usable_as_cohort ? 'ok' : 'alert');
-  if (!precise) {
-    stat(summary, body.unnormalized_count, 'not covered by any catalogue value');
-  }
-
+  summary.innerHTML = 'searching…';
   results.innerHTML = '';
-  if (body.cohort_note) results.appendChild(el('p', 'hint', body.cohort_note));
-  (body.notes || []).forEach((note) => results.appendChild(el('p', 'hint', note)));
-
-  (precise ? body.episodes : body.mentions).forEach((row) => {
-    const card = el('div', 'rec');
-    const meta = el('div', 'meta');
-    if (precise) {
-      meta.appendChild(el('span', null, row.episode_id));
-      meta.appendChild(el('span', 'pill', String(row.verdict)));
-      meta.appendChild(el('span', null, `${row.location} via ${row.location_method}`));
-      meta.appendChild(el('span', null, row.location_source || ''));
-      meta.appendChild(el('span', null, `offset ${row.onset_offset_days}`));
-      card.appendChild(meta);
-      card.appendChild(el('div', 'snip', row.reported_terms));
-    } else {
-      meta.appendChild(el('span', null, row.subject_id));
-      meta.appendChild(el('span', 'pill', row.attribute));
-      meta.appendChild(el('span', 'pill ' + (row.normalized ? 'present' : 'absent'),
-        row.normalized ? 'normalized' : 'not in any catalogue'));
-      meta.appendChild(el('span', null, row.source_variable || ''));
-      meta.appendChild(el('span', 'pill', 'candidate'));
-      card.appendChild(meta);
-      card.appendChild(el('div', 'snip', `${row.surface} — ${row.sentence}`));
+  try {
+    if ($('r-path').value === 'discovery') {
+      const body = await api('/discover?' + query({
+        text: $('r-text').value, top_k: $('r-topk').value,
+      }));
+      summary.innerHTML = '';
+      stat(summary, body.count, 'mentions');
+      stat(summary, 'all candidates', 'not cohort-eligible', 'warn');
+      const holder = el('div');
+      results.innerHTML = '';
+      results.appendChild(el('p', 'hint', body.cohort_note));
+      results.appendChild(holder);
+      table(holder, ['subject', 'assertion', 'value', 'surface', 'rule'],
+        body.mentions.map((m) => [
+          m.subject_id, m.assertion, m.value, m.surface, m.rule,
+        ]));
+      return;
     }
-    results.appendChild(card);
-  });
+    const body = await api('/retrieve?' + query({
+      assertion: selected($('r-assertion')),
+      availability: selected($('r-availability')),
+      method: selected($('r-method')),
+      verdict: selected($('r-verdict')),
+      top_k: $('r-topk').value,
+    }));
+    summary.innerHTML = '';
+    stat(summary, body.count, 'records');
+    stat(summary, body.usable_as_cohort ? 'yes' : 'no', 'usable as a cohort',
+      body.usable_as_cohort ? 'good' : 'warn');
+    results.innerHTML = '';
+    (body.notes || []).forEach((note) => results.appendChild(el('p', 'hint', note)));
+    const holder = el('div');
+    results.appendChild(holder);
+    table(holder,
+      ['record', 'verdict', 'assertion', 'availability', 'method', 'variable',
+       'code'],
+      body.records.map((r) => [
+        r.record_id, r.verdict, r.assertion, r.availability, r.method,
+        r.source_variable, r.code,
+      ]));
+  } catch (error) {
+    fail(summary, error);
+  }
 }
 
-/* --------------------------------------------------------- 5. agent */
+$('btn-search').addEventListener('click', search);
 
-function renderClarification(clarification) {
+/* ------------------------------------------------------ 6. ask & trace --- */
+
+function renderConflict(conflict) {
   const box = $('a-clarification');
   box.classList.remove('hidden');
   box.innerHTML = '';
-  box.appendChild(el('h3', null, 'Clarification needed before anything is run'));
-  box.appendChild(el('p', null, clarification.ambiguity));
-  box.appendChild(el('p', null, clarification.effect));
+  box.appendChild(el('h2', null, 'Not run — the question conflicts with the definition it names'));
+  box.appendChild(el('p', null, conflict.conflict));
+  if (conflict.bound_definition) {
+    box.appendChild(el('p', 'hint', `bound to ${conflict.bound_definition}`));
+  }
+  box.appendChild(el('p', null, conflict.effect));
   const list = el('ul');
-  clarification.options.forEach((o) => list.appendChild(el('li', null, o)));
+  (conflict.options || []).forEach((option) => list.appendChild(el('li', null, option)));
   box.appendChild(list);
   box.appendChild(el('p', 'hint',
-    'No specification was compiled and no number was produced.'));
+    'The agent does not override a bound definition to accommodate a question. ' +
+    'A different rule is a new version, not a parameter. Nothing was computed.'));
 }
 
-async function compileOnly() {
+function renderSupport(support) {
+  const holder = $('a-support');
+  holder.innerHTML = '';
+  Object.entries(support || {}).forEach(([modifier, screen]) => {
+    const pane = el('div', 'pane');
+    pane.appendChild(el('h2', null, `Supportability screen — ${modifier}`));
+    pane.appendChild(el('p', 'hint', screen.note));
+    const grid = el('div');
+    pane.appendChild(grid);
+    table(grid, ['study', 'profile', 'status', 'reason'],
+      (screen.studies || []).map((s) => [
+        s.study_id, s.profile, s.status, s.reason,
+      ]));
+    holder.appendChild(pane);
+  });
+}
+
+async function ask(executeIt) {
+  const question = $('a-question').value;
   $('a-clarification').classList.add('hidden');
+  $('a-spec-wrap').classList.add('hidden');
   $('a-result').innerHTML = '';
-  let body;
-  try { body = await post('/agent/compile', {question: $('a-question').value}); }
-  catch (error) {
-    if (error.body && error.body.clarification) {
-      $('a-spec-wrap').classList.add('hidden');
-      renderClarification(error.body.clarification);
+  $('a-support').innerHTML = '';
+  $('a-trace').textContent = 'running…';
+  try {
+    const body = await post(executeIt ? '/agent/ask' : '/agent/compile',
+      {question, save: executeIt});
+    if (!executeIt) {
+      $('a-spec-wrap').classList.remove('hidden');
+      $('a-spec-badge').textContent = 'not executed';
+      $('a-spec').textContent = JSON.stringify(body.spec, null, 2);
+      $('a-trace').textContent = 'Compiled only — nothing was executed.';
+      return;
+    }
+    $('a-spec-wrap').classList.remove('hidden');
+    $('a-spec-badge').textContent = 'executed';
+    $('a-spec-badge').className = 'badge';
+    $('a-spec').textContent = JSON.stringify(body.spec, null, 2);
+    renderSupport(body.supportability);
+
+    const result = $('a-result');
+    const summary = el('div', 'summary');
+    const counts = body.cohort.counts_by_verdict;
+    stat(summary, counts.case || 0, 'case', 'good');
+    stat(summary, counts.non_case || 0, 'non_case');
+    stat(summary, counts.review || 0, 'review');
+    stat(summary, counts.not_ascertainable || 0, 'not ascertainable', 'warn');
+    stat(summary, fixed(body.cohort.overall.ascertainable_fraction, 3),
+      'ascertainable fraction');
+    stat(summary, body.cohort.overall.incidence_within_ascertainable === null
+      ? '—' : fixed(body.cohort.overall.incidence_within_ascertainable, 3),
+      'incidence within ascertainable');
+    result.appendChild(summary);
+    result.appendChild(el('p', 'hint', body.cohort.denominator_note));
+    result.appendChild(el('p', 'hint',
+      `tools called: ${(body.tools_called || []).join(', ')} · manifest ` +
+      `${body.manifest_id} · results ${body.results_hash}`));
+    const limits = el('ul', 'hint');
+    (body.limitations || []).forEach((limit) => limits.appendChild(el('li', null, limit)));
+    result.appendChild(limits);
+
+    $('a-trace').textContent = body.trace
+      ? renderTraceText(body.trace)
+      : 'no trace was produced';
+  } catch (error) {
+    if (error.status === 409 && error.body && error.body.conflict) {
+      renderConflict(error.body.conflict);
+      $('a-trace').textContent =
+        'Nothing was executed, so there is no number and no trace.';
       return;
     }
     fail($('a-result'), error);
-    return;
+    $('a-trace').textContent = '';
   }
-  $('a-spec-badge').textContent = 'not executed';
-  $('a-spec-wrap').classList.remove('hidden');
-  $('a-spec').textContent = JSON.stringify(body.spec, null, 2);
 }
 
-async function ask() {
-  const result = $('a-result');
-  $('a-clarification').classList.add('hidden');
-  result.innerHTML = 'running…';
-  let body;
-  try { body = await post('/agent/ask', {question: $('a-question').value}); }
-  catch (error) {
-    result.innerHTML = '';
-    if (error.body && error.body.clarification) {
-      $('a-spec-wrap').classList.add('hidden');
-      renderClarification(error.body.clarification);
-      return;
-    }
-    fail(result, error);
-    return;
-  }
+const INDENT = {
+  result: 0, analysis: 1, cohort: 2, definition: 3, attribute: 4,
+  record: 5, span: 6,
+};
 
-  $('a-spec-badge').textContent = 'executed';
-  $('a-spec-wrap').classList.remove('hidden');
-  $('a-spec').textContent = JSON.stringify(body.spec, null, 2);
-
-  result.innerHTML = '';
-  const box = el('div', 'summary');
-  Object.entries(body.cohort.counts_by_verdict).forEach(([verdict, count]) => {
-    stat(box, count, verdict,
-      verdict === 'case' ? 'ok' : (verdict === 'not_ascertainable' ? 'alert' : null));
+function renderTraceText(trace) {
+  const lines = [];
+  trace.links.forEach((link) => {
+    const pad = '  '.repeat(INDENT[link.level] ?? 0);
+    lines.push(`${pad}${link.level.padEnd(10)} ${link.identifier}`);
+    if (link.detail) lines.push(`${pad}${''.padEnd(10)} ${link.detail}`);
   });
-  Object.entries(body.cohort.attribute_methods).forEach(([method, count]) => {
-    stat(box, count, `via ${method}`);
-  });
-  result.appendChild(box);
-  result.appendChild(el('p', 'hint', body.cohort.not_ascertainable_note));
-  result.appendChild(el('p', 'hint',
-    `definition ${body.definition.id}.v${body.definition.version} ` +
-    `(${body.definition.status}) hash ${body.definition.hash} · ` +
-    `manifest ${body.manifest_id} · results ${body.results_hash} · ` +
-    `tools: ${body.tools_called.join(', ')}`));
-  const limits = el('ul');
-  body.limitations.forEach((l) => limits.appendChild(el('li', 'hint', l)));
-  result.appendChild(el('h2', null, 'Limitations'));
-  result.appendChild(limits);
-
-  try {
-    const trace = await api(`/trace/${body.manifest_id}`);
-    $('a-trace').textContent = trace.rendered;
-  } catch (error) {
-    $('a-trace').textContent = `trace unavailable: ${error.message}`;
+  if (!trace.complete) {
+    lines.push('');
+    lines.push(`INCOMPLETE: the chain breaks at ${trace.broken_at}. ` +
+      'A number that cannot be traced to source is not reportable.');
   }
+  return lines.join('\n');
 }
 
-async function loadTools() {
-  const body = await api('/agent/tools');
-  table($('tool-table'), ['tool', 'permission', 'writes source records', 'what it does'],
-    body.tools.map((t) => [
-      t.name, t.permission, t.writes_source_records ? 'yes' : 'no', t.description,
-    ]));
-}
-
-/* ------------------------------------------------------------- wiring */
-
-$('rec-profile').addEventListener('change', loadRecords);
-$('rec-method').addEventListener('change', loadRecords);
-$('btn-evaluate').addEventListener('click', evaluateDefinition);
-$('btn-ablation').addEventListener('click', loadAblation);
-$('btn-compare').addEventListener('click', compareDefinitions);
-$('btn-search').addEventListener('click', search);
-$('btn-compile').addEventListener('click', compileOnly);
-$('btn-ask').addEventListener('click', ask);
+$('btn-ask').addEventListener('click', () => ask(true));
+$('btn-compile').addEventListener('click', () => ask(false));
 document.querySelectorAll('.examples .link').forEach((button) => {
   button.addEventListener('click', () => {
     $('a-question').value = button.dataset.q;
-    compileOnly();
+    ask(true);
   });
 });
+
+async function loadTools() {
+  const body = await api('/agent/tools');
+  const holder = $('tool-table');
+  holder.innerHTML = '';
+  holder.appendChild(el('p', 'hint', body.note));
+  const grid = el('div');
+  holder.appendChild(grid);
+  table(grid, ['tool', 'permission', 'writes source records', 'description'],
+    body.tools.map((t) => [
+      t.name, t.permission, t.writes_source_records ? 'YES' : 'no',
+      t.description,
+    ]));
+}
+
+/* -------------------------------------------------------------- start --- */
 
 (async function start() {
   try {
     await loadSummary();
     await loadRecords();
-    await loadDefinitions();
     await loadSilver();
     await loadTools();
-    await search();
+    await runAblation();
   } catch (error) {
     $('corpus-line').textContent =
-      'Could not load: ' + (error.message || error) +
-      ' — run `make demo` first, then reload.';
+      `could not load: ${error.message}. Run \`aelayer generate\` first.`;
   }
 })();
