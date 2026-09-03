@@ -237,6 +237,31 @@ class Pipeline:
                     })
         return found
 
+    # -- retrieval ----------------------------------------------------------
+
+    def index(self, *, refresh: bool = False, persist: bool = True):
+        from .retrieval.index import build_index
+
+        if self._index is not None and not refresh:
+            return self._index
+        self._index = build_index(
+            self.store_path if persist else None,
+            self.store, self.records(refresh=refresh),
+            self.configs.extractor_version, self.configs.normalizer_version,
+            self.mentions(),
+        )
+        return self._index
+
+    def retrieve(self, **kwargs: Any):
+        from .retrieval.query import retrieve
+
+        return retrieve(self.index(), self.configs.catalog, **kwargs)
+
+    def discover(self, **kwargs: Any):
+        from .retrieval.query import discover
+
+        return discover(self.index(), self.configs.catalog, **kwargs)
+
     # -- provenance ---------------------------------------------------------
 
     def versions(self) -> dict[str, Any]:

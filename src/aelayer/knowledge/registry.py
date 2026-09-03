@@ -61,7 +61,7 @@ class KnowledgeRegistry:
                 f"was explicitly backfilled."
             ),
             "definitions_used": sorted(
-                {f"{m.phenotype_definition_id}.v{m.phenotype_definition_version}"
+                {f"{m.definition_id}.v{m.definition_version}"
                  for m in recorded}
             ),
             "snapshots": sorted({m.data_snapshot_id for m in recorded}),
@@ -76,7 +76,7 @@ class KnowledgeRegistry:
     ) -> list[Manifest]:
         results = self.all_manifests()
         if definition_id:
-            results = [m for m in results if m.phenotype_definition_id == definition_id]
+            results = [m for m in results if m.definition_id == definition_id]
         if snapshot_id:
             results = [m for m in results if m.data_snapshot_id == snapshot_id]
         if actor:

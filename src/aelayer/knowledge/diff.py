@@ -1,9 +1,9 @@
 """Executable comparison of two phenotype definitions.
 
 Not a search over descriptions.  Both definitions are evaluated against the same
-data snapshot, and the answer is the set of episodes each one claims, with the
+data snapshot, and the answer is the set of records each one claims, with the
 reasons attached.  "These two definitions differ" is a sentence; "these 14
-episodes are cases under v1 and not under v2, and here is the rule that decided
+records are cases under v1 and not under v2, and here is the rule that decided
 each" is a finding.
 
 A scope is mandatory.  See ``KnowledgeRegistry.require_scope``.
@@ -19,8 +19,8 @@ from .registry import ScopeRequired
 
 
 @dataclass
-class DiscordantEpisode:
-    episode_id: str
+class DiscordantRecord:
+    record_id: str
     subject_id: str
     study_id: str
     verdict_a: str
@@ -32,7 +32,7 @@ class DiscordantEpisode:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "episode_id": self.episode_id,
+            "record_id": self.record_id,
             "subject_id": self.subject_id,
             "study_id": self.study_id,
             "verdict_a": self.verdict_a,
@@ -53,7 +53,7 @@ class DefinitionComparison:
     shared: list[str] = _dc_field(default_factory=list)
     gained: list[str] = _dc_field(default_factory=list)
     lost: list[str] = _dc_field(default_factory=list)
-    discordant: list[DiscordantEpisode] = _dc_field(default_factory=list)
+    discordant: list[DiscordantRecord] = _dc_field(default_factory=list)
 
     @property
     def summary_line(self) -> str:
@@ -94,25 +94,25 @@ def diff_definitions(
             "auditing colleagues' past choices."
         )
 
-    by_a = {a.episode_id: a for a in assignments_a}
-    by_b = {a.episode_id: a for a in assignments_b}
+    by_a = {a.record_id: a for a in assignments_a}
+    by_b = {a.record_id: a for a in assignments_b}
     cases_a = {i for i, a in by_a.items() if a.verdict == "case"}
     cases_b = {i for i, a in by_b.items() if a.verdict == "case"}
 
     discordant = [
-        DiscordantEpisode(
-            episode_id=episode_id,
-            subject_id=by_a[episode_id].subject_id,
-            study_id=by_a[episode_id].study_id,
-            verdict_a=by_a[episode_id].verdict,
-            verdict_b=by_b[episode_id].verdict,
-            deciding_a=by_a[episode_id].deciding_attribute,
-            deciding_b=by_b[episode_id].deciding_attribute,
-            reason_a=by_a[episode_id].reason,
-            reason_b=by_b[episode_id].reason,
+        DiscordantRecord(
+            record_id=record_id,
+            subject_id=by_a[record_id].subject_id,
+            study_id=by_a[record_id].study_id,
+            verdict_a=by_a[record_id].verdict,
+            verdict_b=by_b[record_id].verdict,
+            deciding_a=by_a[record_id].deciding_criterion,
+            deciding_b=by_b[record_id].deciding_criterion,
+            reason_a=by_a[record_id].reason,
+            reason_b=by_b[record_id].reason,
         )
-        for episode_id in sorted(set(by_a) & set(by_b))
-        if by_a[episode_id].verdict != by_b[episode_id].verdict
+        for record_id in sorted(set(by_a) & set(by_b))
+        if by_a[record_id].verdict != by_b[record_id].verdict
     ]
 
     return DefinitionComparison(

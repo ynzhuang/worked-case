@@ -3,12 +3,18 @@
 SQLite with FTS5 over free text, plus structured columns for every attribute a
 cohort query filters on. Two tables, and the separation is the point:
 
-``episodes``
-    adjudicated units. A precise query runs here, over normalized attribute
-    values, and never consults an embedding for cohort membership.
+``records``
+    adjudicated units at the source-record grain. A precise query runs here,
+    over normalized values, and never consults an embedding to decide cohort
+    membership.
 ``mentions``
     places in a document where something was named. Discovery runs here, and
     everything it returns is a candidate.
+
+A mention is not a record. Somewhere in a narrative saying "mucosal
+involvement" is not the same claim as an adjudicated attribute on an event, and
+merging the two tables would make that difference disappear at exactly the
+moment it matters.
 
 The index records the extractor and normalizer versions it was built with, so a
 query can tell whether it is reading a stale index rather than silently
@@ -24,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from ..models import CanonicalAEEpisode, CaseAssignment
+from ..models import CanonicalAERecord, CaseAssignment
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -32,29 +38,32 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT
 );
 
-CREATE TABLE IF NOT EXISTS episodes (
-    episode_id            TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS records (
+    record_id             TEXT PRIMARY KEY,
+    source_record_id      TEXT,
     study_id              TEXT,
     subject_id            TEXT,
     profile               TEXT,
     concept               TEXT,
-    location              TEXT,
-    location_method       TEXT,
-    location_source       TEXT,
-    location_confidence   REAL,
-    pattern               TEXT,
+    code                  TEXT,
+    dictionary_version    TEXT,
+    reconciliation        TEXT,
+    modifier              TEXT,
+    modifier_assertion    TEXT,
+    modifier_availability TEXT,
+    modifier_value        TEXT,
+    modifier_method       TEXT,
+    modifier_source       TEXT,
+    modifier_confidence   REAL,
     severity              TEXT,
-    onset_offset_days     INTEGER,
-    episode_start         TEXT,
-    record_count          INTEGER,
-    linkage_rule          TEXT,
-    linkage_confidence    REAL,
-    linkage_review        INTEGER,
+    grade                 INTEGER,
+    exposure_offset_days  INTEGER,
+    onset                 TEXT,
     candidate             INTEGER,
     verdict               TEXT,
     definition_id         TEXT,
     definition_version    INTEGER,
-    reported_terms        TEXT,
+    reported_term         TEXT,
     payload               TEXT
 );
 
@@ -65,89 +74,94 @@ CREATE TABLE IF NOT EXISTS mentions (
     subject_id       TEXT,
     source_record_id TEXT,
     profile          TEXT,
-    attribute        TEXT,
+    modifier         TEXT,
+    assertion        TEXT,
     value            TEXT,
     surface          TEXT,
+    sentence         TEXT,
     source_kind      TEXT,
     source_variable  TEXT,
     confidence       REAL,
-    normalized       INTEGER,
-    sentence         TEXT
+    rule             TEXT
 );
 
-CREATE VIRTUAL TABLE IF NOT EXISTS text_index USING fts5(
-    mention_id UNINDEXED,
-    surface,
-    sentence,
-    tokenize = 'porter'
-);
+CREATE VIRTUAL TABLE IF NOT EXISTS text_index
+    USING fts5(doc_id UNINDEXED, kind UNINDEXED, body);
 
-CREATE INDEX IF NOT EXISTS episodes_by_concept ON episodes(concept);
-CREATE INDEX IF NOT EXISTS episodes_by_profile ON episodes(profile);
-CREATE INDEX IF NOT EXISTS mentions_by_attribute ON mentions(attribute);
+CREATE INDEX IF NOT EXISTS records_by_concept ON records(concept);
+CREATE INDEX IF NOT EXISTS records_by_profile ON records(profile);
+CREATE INDEX IF NOT EXISTS records_by_assertion ON records(modifier_assertion);
+CREATE INDEX IF NOT EXISTS mentions_by_modifier ON mentions(modifier);
 """
 
 
-@dataclass(frozen=True)
+@dataclass
 class IndexMeta:
     extractor_version: str
     normalizer_version: str
-    snapshot_id: str
-    episode_count: int
+    record_count: int
     mention_count: int
 
-
-class EpisodeIndex:
-    """Read/write access to one index."""
-
-    def __init__(self, path: Path | None):
-        self.path = Path(path) if path else None
-        self._local = threading.local()
-        if self.path is not None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection.executescript(SCHEMA)
-        self.connection.commit()
-
-    @property
-    def connection(self) -> sqlite3.Connection:
-        """One connection per thread: SQLite objects are not shareable."""
-        existing = getattr(self._local, "connection", None)
-        if existing is None:
-            existing = sqlite3.connect(
-                str(self.path) if self.path else ":memory:",
-                check_same_thread=False,
+    def stale_against(self, extractor: str, normalizer: str) -> list[str]:
+        drift: list[str] = []
+        if self.extractor_version != extractor:
+            drift.append(
+                f"index built with extractor {self.extractor_version!r}, now "
+                f"{extractor!r}"
             )
-            existing.row_factory = sqlite3.Row
-            self._local.connection = existing
-        return existing
+        if self.normalizer_version != normalizer:
+            drift.append(
+                f"index built with normalizer {self.normalizer_version!r}, now "
+                f"{normalizer!r}"
+            )
+        return drift
 
-    # -- writing ------------------------------------------------------------
+
+class RecordIndex:
+    """The queryable index. Thread-safe enough for a single-process server."""
+
+    def __init__(self, path: str | Path | None = None,
+                 modifier: str = "mucosal_involvement"):
+        self.path = Path(path) if path else None
+        self.modifier = modifier
+        self._lock = threading.RLock()
+        self.connection = sqlite3.connect(
+            str(self.path) if self.path else ":memory:",
+            check_same_thread=False,
+        )
+        self.connection.row_factory = sqlite3.Row
+        with self._lock:
+            self.connection.executescript(SCHEMA)
+            self.connection.commit()
+
+    # -- lifecycle ----------------------------------------------------------
 
     def clear(self) -> None:
-        connection = self.connection
-        for table in ("episodes", "mentions", "text_index", "meta"):
-            connection.execute(f"DELETE FROM {table}")
-        connection.commit()
+        with self._lock:
+            for table in ("records", "mentions", "text_index", "meta"):
+                self.connection.execute(f"DELETE FROM {table}")
+            self.connection.commit()
 
     def set_meta(self, **values: Any) -> None:
-        connection = self.connection
-        for key, value in values.items():
-            connection.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-                (key, json.dumps(value, default=str)),
-            )
-        connection.commit()
+        with self._lock:
+            for key, value in values.items():
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                    (key, json.dumps(value)),
+                )
+            self.connection.commit()
+
+    def get_meta(self, key: str, default: Any = None) -> Any:
+        row = self.connection.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,)
+        ).fetchone()
+        return default if row is None else json.loads(row["value"])
 
     def meta(self) -> IndexMeta:
-        rows = {
-            row["key"]: json.loads(row["value"])
-            for row in self.connection.execute("SELECT key, value FROM meta")
-        }
         return IndexMeta(
-            extractor_version=rows.get("extractor_version", ""),
-            normalizer_version=rows.get("normalizer_version", ""),
-            snapshot_id=rows.get("snapshot_id", ""),
-            episode_count=self._count("episodes"),
+            extractor_version=self.get_meta("extractor_version", ""),
+            normalizer_version=self.get_meta("normalizer_version", ""),
+            record_count=self._count("records"),
             mention_count=self._count("mentions"),
         )
 
@@ -156,122 +170,137 @@ class EpisodeIndex:
             self.connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
         )
 
-    def add_episodes(self, episodes: Iterable[CanonicalAEEpisode]) -> int:
-        connection = self.connection
-        count = 0
-        for episode in episodes:
-            location = episode.location
-            connection.execute(
-                """
-                INSERT OR REPLACE INTO episodes VALUES
-                (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    episode.episode_id, episode.study_id, episode.subject_id,
-                    episode.profile, episode.standardized_concept,
-                    location.value, location.method, location.source_variable,
-                    location.confidence,
-                    episode.pattern.value, episode.severity.value,
-                    episode.onset_offset_days.value,
-                    episode.episode_start.value.isoformat()
-                    if episode.episode_start.value else None,
-                    len(episode.source_record_ids),
-                    episode.linkage_rule, episode.linkage_confidence,
-                    int(episode.linkage_review_required), int(episode.candidate),
-                    None, None, None,
-                    " | ".join(episode.reported_terms),
-                    episode.model_dump_json(),
-                ),
-            )
-            count += 1
-        connection.commit()
-        return count
+    # -- loading ------------------------------------------------------------
 
-    def record_assignments(self, assignments: Sequence[CaseAssignment]) -> int:
-        """Attach verdicts to indexed episodes.
+    def add_records(self, records: Iterable[CanonicalAERecord]) -> int:
+        added = 0
+        with self._lock:
+            for record in records:
+                modifier = record.modifiers.get(self.modifier)
+                coded = record.coded_event
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO records VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        record.record_id, record.source_record_id, record.study_id,
+                        record.subject_id, record.profile, record.concept_id,
+                        coded.code if coded else None,
+                        coded.dictionary_version if coded else None,
+                        coded.reconciliation if coded else None,
+                        self.modifier,
+                        modifier.assertion if modifier else None,
+                        modifier.availability if modifier else "unresolved",
+                        modifier.value if modifier else None,
+                        modifier.method if modifier else None,
+                        modifier.source_variable if modifier else None,
+                        modifier.confidence if modifier else None,
+                        record.severity.value, record.grade.value,
+                        record.exposure_relation.value,
+                        record.onset.value.isoformat() if record.onset.value else None,
+                        0, None, None, None,
+                        record.reported_term.value or "",
+                        record.model_dump_json(),
+                    ),
+                )
+                added += 1
+            self.connection.commit()
+        return added
 
-        A verdict is a property of (episode, definition version); the index
-        stores the most recent one written and names the version, so a filter on
-        `verdict` can never silently mean a different definition.
+    def add_verdicts(self, assignments: Sequence[CaseAssignment]) -> int:
+        """Attach verdicts to indexed records.
+
+        A verdict is a property of (record, definition version); the index
+        holds the most recent one written, and the columns name which.
         """
-        connection = self.connection
-        for assignment in assignments:
-            connection.execute(
-                "UPDATE episodes SET verdict = ?, definition_id = ?, "
-                "definition_version = ? WHERE episode_id = ?",
-                (assignment.verdict, assignment.definition_id,
-                 assignment.definition_version, assignment.episode_id),
-            )
-        connection.commit()
+        with self._lock:
+            for assignment in assignments:
+                self.connection.execute(
+                    "UPDATE records SET verdict = ?, definition_id = ?, "
+                    "definition_version = ? WHERE record_id = ?",
+                    (assignment.verdict, assignment.definition_id,
+                     assignment.definition_version, assignment.record_id),
+                )
+            self.connection.commit()
         return len(assignments)
 
     def add_mentions(self, mentions: Iterable[dict[str, Any]]) -> int:
-        connection = self.connection
-        count = 0
-        for mention in mentions:
-            connection.execute(
-                "INSERT OR REPLACE INTO mentions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    mention["mention_id"], mention["doc_id"], mention["study_id"],
-                    mention["subject_id"], mention.get("source_record_id"),
-                    mention.get("profile"), mention["attribute"], mention["value"],
-                    mention["surface"], mention.get("source_kind"),
-                    mention.get("source_variable"), mention.get("confidence"),
-                    int(bool(mention.get("normalized", True))),
-                    mention.get("sentence", ""),
-                ),
-            )
-            connection.execute(
-                "INSERT INTO text_index(mention_id, surface, sentence) VALUES (?,?,?)",
-                (mention["mention_id"], mention["surface"],
-                 mention.get("sentence", "")),
-            )
-            count += 1
-        connection.commit()
-        return count
+        added = 0
+        with self._lock:
+            for mention in mentions:
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO mentions VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        mention["mention_id"], mention["doc_id"],
+                        mention["study_id"], mention["subject_id"],
+                        mention["source_record_id"], mention["profile"],
+                        mention["modifier"], mention["assertion"],
+                        mention.get("value"), mention["surface"],
+                        mention["sentence"], mention["source_kind"],
+                        mention["source_variable"], mention["confidence"],
+                        mention["rule"],
+                    ),
+                )
+                added += 1
+            self.connection.commit()
+        return added
+
+    def add_documents(self, documents: Iterable[Any]) -> int:
+        added = 0
+        with self._lock:
+            for document in documents:
+                self.connection.execute(
+                    "INSERT INTO text_index (doc_id, kind, body) VALUES (?, ?, ?)",
+                    (document.doc_id, document.kind, document.full_text),
+                )
+                added += 1
+            self.connection.commit()
+        return added
 
     # -- reading ------------------------------------------------------------
 
-    def query(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
-        return list(self.connection.execute(sql, tuple(params)))
+    def query(self, sql: str, parameters: Sequence[Any] = ()) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self.connection.execute(sql, parameters).fetchall())
 
-    def episodes(self) -> list[CanonicalAEEpisode]:
+    def records(self) -> list[CanonicalAERecord]:
         return [
-            CanonicalAEEpisode.model_validate_json(row["payload"])
-            for row in self.query("SELECT payload FROM episodes ORDER BY episode_id")
+            CanonicalAERecord.model_validate_json(row["payload"])
+            for row in self.query(
+                "SELECT payload FROM records ORDER BY record_id"
+            )
         ]
 
     def studies(self) -> list[str]:
         return [
-            row["study_id"]
-            for row in self.query(
-                "SELECT DISTINCT study_id FROM episodes ORDER BY study_id"
+            row["study_id"] for row in self.query(
+                "SELECT DISTINCT study_id FROM records ORDER BY study_id"
             )
         ]
 
-    def is_stale(self, extractor_version: str, normalizer_version: str) -> bool:
-        meta = self.meta()
-        return (
-            meta.extractor_version != extractor_version
-            or meta.normalizer_version != normalizer_version
-        )
-
 
 def build_index(
-    path: Path | None,
+    path: str | Path | None,
     store: Any,
-    episodes: Sequence[CanonicalAEEpisode],
+    records: Sequence[CanonicalAERecord],
     extractor_version: str,
     normalizer_version: str,
-    mentions: Sequence[dict[str, Any]] = (),
-) -> EpisodeIndex:
-    index = EpisodeIndex(path)
+    mentions: Sequence[dict[str, Any]] | None = None,
+    modifier: str = "mucosal_involvement",
+) -> RecordIndex:
+    index = RecordIndex(path, modifier=modifier)
     index.clear()
-    index.add_episodes(episodes)
-    index.add_mentions(mentions)
+    index.add_records(records)
+    index.add_documents(store.documents.values())
+    index.add_mentions(mentions or [])
     index.set_meta(
         extractor_version=extractor_version,
         normalizer_version=normalizer_version,
-        snapshot_id=getattr(store, "snapshot_id", ""),
+        snapshot_id=store.snapshot_id,
+        modifier=modifier,
     )
     return index
+
+
+#: Kept so existing imports keep working while the grain changed underneath.
+EpisodeIndex = RecordIndex

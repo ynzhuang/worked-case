@@ -50,9 +50,9 @@ def rerank(records: list, query: str, index: Any) -> list:  # pragma: no cover
     import numpy as np
 
     query_vector = model.encode([query], normalize_embeddings=True)[0]
-    snippets = [r.snippet or "" for r in records]
+    snippets = [r.sentence or "" for r in records]
     matrix = model.encode(snippets, normalize_embeddings=True)
     scores = np.asarray(matrix) @ np.asarray(query_vector)
     for record, score in zip(records, scores):
         record.score = float(score)
-    return sorted(records, key=lambda r: (-r.score, r.event_id))
+    return sorted(records, key=lambda r: (-r.score, r.mention_id))
