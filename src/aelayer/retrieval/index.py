@@ -32,6 +32,10 @@ from typing import Any, Iterable, Sequence
 
 from ..models import CanonicalAERecord, CaseAssignment
 
+#: Bumped whenever the columns change. An index built under an older version is
+#: dropped and rebuilt rather than queried against the wrong grain.
+SCHEMA_VERSION = 4
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -131,7 +135,30 @@ class RecordIndex:
         )
         self.connection.row_factory = sqlite3.Row
         with self._lock:
+            self._migrate()
             self.connection.executescript(SCHEMA)
+            self.connection.commit()
+
+    def _migrate(self) -> None:
+        """Drop an index built under a different schema rather than limp on.
+
+        A stale index that half-answers is worse than no index: the query
+        surface would silently return columns from a grain that no longer
+        exists. Rebuilding is cheap; a wrong cohort is not.
+        """
+        existing = {
+            row["name"] for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+            )
+        }
+        current = self.connection.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone() if "meta" in existing else None
+        if existing and (
+            current is None or json.loads(current["value"]) != SCHEMA_VERSION
+        ):
+            for name in existing:
+                self.connection.execute(f"DROP TABLE IF EXISTS {name}")
             self.connection.commit()
 
     # -- lifecycle ----------------------------------------------------------
@@ -294,6 +321,7 @@ def build_index(
     index.add_documents(store.documents.values())
     index.add_mentions(mentions or [])
     index.set_meta(
+        schema_version=SCHEMA_VERSION,
         extractor_version=extractor_version,
         normalizer_version=normalizer_version,
         snapshot_id=store.snapshot_id,

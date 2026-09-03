@@ -244,9 +244,12 @@ class Pipeline:
 
         if self._index is not None and not refresh:
             return self._index
+        # Deliberately does not refresh the records: rebuilding the index is
+        # not a reason to re-run the model path, and doing so would double
+        # every counter the extraction stats report.
         self._index = build_index(
             self.store_path if persist else None,
-            self.store, self.records(refresh=refresh),
+            self.store, self.records(),
             self.configs.extractor_version, self.configs.normalizer_version,
             self.mentions(),
         )
