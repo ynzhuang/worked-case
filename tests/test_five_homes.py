@@ -1,150 +1,162 @@
-"""The claim the prototype exists to demonstrate.
+"""One modifier, five collection homes, one rule.
 
-One clinically relevant attribute lives in any of five places, and which one
-applies is a per-study collection decision. One frozen rule runs across all
-five, returning the same verdict where the evidence supports it and
-`not_ascertainable` where it does not.
+The claim under test: the same phenotype definition runs across studies that
+record mucosal involvement in a structured qualifier, in a linked form, in the
+investigator's own words, in a comment, or nowhere — and the fifth case is
+`not_ascertainable`, not a negative.
 """
 
 from __future__ import annotations
 
-import collections
+from collections import Counter
 
 import pytest
 
-
-def rash_records(records, profile):
-    return [
-        r for r in records
-        if r.profile == profile and r.standardized_concept == "RASH"
-    ]
+MODIFIER = "mucosal_involvement"
 
 
-# -- the five homes --------------------------------------------------------
+def _by_profile(records, profile):
+    return [r for r in records if r.profile == profile]
 
 
-def test_every_home_is_exercised_by_some_profile(profiles):
-    homes = {
-        home for profile in profiles.profiles.values()
-        for home in profile.home_kinds("location")
-    }
-    assert homes == {
-        "AELOC", "reported_term", "sponsor_variable", "comment", "none",
+def test_every_declared_home_is_exercised(profiles):
+    kinds = set()
+    for profile in profiles.profiles.values():
+        for home in profile.homes_for(MODIFIER):
+            kinds.add(home.kind)
+    assert kinds == {
+        "structured_standard", "linked_form", "reported_term", "comment", None
     }
 
 
-@pytest.mark.parametrize(
-    "profile,method,variable",
-    [
-        ("P1_structured", "direct", "AELOC"),
-        ("P2_text", "extracted", "AETERM"),
-        ("P4_sponsor", "normalized", "SUPPAE.RASHSITE"),
-        ("P5_comment", "extracted", "CO.COVAL"),
-        ("P6_both", "direct", "AELOC"),
-    ],
-)
-def test_each_home_resolves_by_the_route_it_implies(records, profile, method, variable):
-    resolved = [
-        r for r in rash_records(records, profile) if r.location.populated
+def test_structured_qualifier_arrives_by_the_direct_route(structured_records):
+    rows = [
+        r.modifiers[MODIFIER] for r in _by_profile(structured_records, "P_structured")
+        if r.modifiers[MODIFIER].observed
     ]
-    assert resolved, f"{profile} resolved no location at all"
-    assert {r.location.method for r in resolved} == {method}
-    assert {r.location.source_variable for r in resolved} == {variable}
-
-
-def test_the_study_that_records_it_nowhere_resolves_nothing(records):
-    """Not a bug, and not a negative: the site was never collected."""
-    rows = rash_records(records, "P3_prespecified")
     assert rows
-    assert all(not r.location.populated for r in rows)
-    assert {r.location.availability for r in rows} == {"not_collected_by_protocol"}
-    assert all("not recoverable" in r.location.note for r in rows)
+    assert all(a.method == "direct" and a.source_variable == "AEMUCOS" for a in rows)
 
 
-def test_the_sponsor_code_is_resolved_through_a_declared_mapping(records, profiles):
-    profile = profiles.profile("P4_sponsor")
-    resolved = [r for r in rash_records(records, "P4_sponsor") if r.location.populated]
-    assert resolved
-    for record in resolved:
-        assert record.location.value in profile.sponsor_codelist
-        assert "sponsor codelist" in record.location.note
-
-
-def test_an_unmapped_sponsor_code_is_not_representable_rather_than_guessed(profiles):
-    from aelayer.normalize.values import resolve_sponsor_value
-
-    profile = profiles.profile("P4_sponsor")
-    value, availability, note, variable = resolve_sponsor_value(
-        profile, [{"QNAM": "RASHSITE", "QVAL": "ZZ"}], "location"
+def test_linked_form_arrives_by_the_direct_route(structured_records):
+    rows = [
+        r.modifiers[MODIFIER] for r in _by_profile(structured_records, "P_version")
+        if r.modifiers[MODIFIER].observed
+    ]
+    assert rows
+    assert all(
+        a.method == "direct" and a.source_variable == "SC.MUCOSAL" for a in rows
     )
-    assert (value, availability) == (None, "not_representable")
-    assert "does not cover" in note
-    assert variable == "SUPPAE.RASHSITE"
 
 
-# -- one rule, five homes ---------------------------------------------------
+def test_reported_term_needs_the_model_path(structured_records, records):
+    """Before extraction the modifier is unresolved; after it, it is observed."""
+    before = _by_profile(structured_records, "P_text")
+    after = _by_profile(records, "P_text")
+    assert all(not r.modifiers[MODIFIER].observed for r in before)
+    recovered = [r for r in after if r.modifiers[MODIFIER].observed]
+    assert recovered
+    assert all(
+        r.modifiers[MODIFIER].method == "extracted"
+        and r.modifiers[MODIFIER].source_variable == "AETERM"
+        for r in recovered
+    )
 
 
-def test_one_definition_runs_across_every_profile(assignments):
-    profiles_seen = {a.profile for a in assignments}
-    assert len(profiles_seen) == 6
+def test_comment_records_are_read_as_a_separate_home(records):
+    rows = [
+        r.modifiers[MODIFIER] for r in _by_profile(records, "P_concept_variant")
+        if r.modifiers[MODIFIER].observed
+    ]
+    assert rows
+    assert all(a.source_variable == "CO.COVAL" for a in rows)
 
 
-def test_the_verdict_is_the_same_where_the_evidence_supports_it(pipeline, assignments):
-    """The invariance claim, checked directly rather than through the harness."""
-    gold = {}
-    for entry in pipeline.store.gold_episodes():
-        for record_id in entry["source_record_ids"]:
-            gold[record_id] = entry
+def test_no_home_means_not_collected_and_never_a_negative(records, pipeline,
+                                                          definition_v2):
+    rows = _by_profile(records, "P_absent")
+    assert rows
+    for record in rows:
+        attribute = record.modifiers[MODIFIER]
+        assert attribute.availability == "not_collected"
+        assert attribute.assertion is None
 
-    by_truth: dict[str, dict[str, str]] = collections.defaultdict(dict)
-    for assignment in assignments:
-        truth = next(
-            (gold[r] for r in assignment.source_record_ids if r in gold), None
-        )
-        if truth is None or truth["cohort"] != "shared":
-            continue
-        if truth["location_available"]:
-            by_truth[truth["truth_id"]][assignment.profile] = assignment.verdict
-
-    compared = {t: b for t, b in by_truth.items() if len(b) >= 2}
-    assert compared, "no truth was rendered with evidence under two profiles"
-    disagreeing = {t: b for t, b in compared.items() if len(set(b.values())) > 1}
-    assert not disagreeing, disagreeing
-
-
-def test_the_study_that_cannot_record_it_returns_not_ascertainable(assignments):
-    verdicts = collections.Counter(
-        a.verdict for a in assignments if a.profile == "P3_prespecified"
+    verdicts = Counter(
+        a.verdict for a in pipeline.assignments(definition_v2)
+        if a.profile == "P_absent"
     )
     assert verdicts["not_ascertainable"] > 0
     assert verdicts["case"] == 0
+    assert verdicts["non_case"] == 0, (
+        "a study that never asked cannot produce an evaluated negative"
+    )
 
 
-def test_not_ascertainable_is_counted_apart_from_not_case(assignments):
-    """The distinction is the point: one is a finding, the other is a gap."""
-    counts = collections.Counter(a.verdict for a in assignments)
-    assert counts["not_ascertainable"] > 0
-    assert counts["not_case"] > 0
-    for assignment in assignments:
-        if assignment.verdict == "not_ascertainable":
-            assert assignment.deciding_attribute
-            assert "cannot be evaluated" in assignment.reason \
-                or "not recoverable" in assignment.reason
+def test_the_negated_profile_produces_documented_negatives(records):
+    """The only way to prove an observed negative is told from silence."""
+    rows = [
+        r.modifiers[MODIFIER] for r in _by_profile(records, "P_negated")
+        if r.modifiers[MODIFIER].documented_negative
+    ]
+    assert rows, "P_negated produced no documented negative"
+    for attribute in rows:
+        assert attribute.method == "extracted"
+        assert attribute.evidence
+        assert attribute.availability == "observed"
 
 
-def test_a_case_names_the_route_its_evidence_came_by(assignments):
-    cases = [a for a in assignments if a.verdict == "case"]
+def test_documented_negatives_become_non_cases(pipeline, definition_v2):
+    """And therefore enter the denominator."""
+    assignments = [
+        a for a in pipeline.assignments(definition_v2)
+        if a.profile == "P_negated" and a.verdict == "non_case"
+    ]
+    assert assignments
+    assert any(
+        "documented negative" in a.reason for a in assignments
+    )
+
+
+def test_one_rule_runs_across_every_profile(pipeline, definition_v2, profiles):
+    """No branch in the definition names a study, a variable or a route."""
+    seen = {a.profile for a in pipeline.assignments(definition_v2)}
+    assert seen == set(profiles.profile_ids())
+    text = (definition_v2.model_dump_json())
+    for variable in ("AEMUCOS", "SC.MUCOSAL", "AETERM", "CO.COVAL"):
+        assert variable not in text, (
+            f"the definition names {variable}; the rule must be route-agnostic"
+        )
+
+
+def test_the_route_travels_with_every_case(pipeline, definition_v2):
+    cases = [a for a in pipeline.assignments(definition_v2) if a.verdict == "case"]
     assert cases
     for assignment in cases:
         assert assignment.attribute_methods
         assert assignment.attribute_sources
-        assert set(assignment.attribute_methods) <= {"location", "onset"}
+        assert assignment.evidence_spans
 
 
-def test_cases_arrive_by_all_three_routes(assignments):
-    methods = {
-        m for a in assignments if a.verdict == "case"
-        for m in a.attribute_methods.values()
-    }
-    assert methods == {"direct", "normalized", "extracted"}
+@pytest.mark.parametrize("method", ["direct", "extracted"])
+def test_both_accepted_methods_actually_produce_cases(pipeline, definition_v2,
+                                                      method):
+    """`accept_methods: [direct, extracted]` is the demonstration."""
+    cases = [a for a in pipeline.assignments(definition_v2) if a.verdict == "case"]
+    assert any(
+        a.attribute_methods.get(MODIFIER) == method for a in cases
+    ), f"no case was decided by a {method} reading of the modifier"
+
+
+def test_exposure_relation_is_derived_across_domains(records):
+    resolved = [r.exposure_relation for r in records if r.exposure_relation.observed]
+    assert resolved
+    for attribute in resolved:
+        assert attribute.method == "derived"
+        assert attribute.source == "cross_domain"
+        assert attribute.source_variable == "AE+EX"
+        assert attribute.evidence
+
+
+def test_every_observed_attribute_traces_to_a_span(records):
+    defects = [r.record_id for r in records if not r.has_full_provenance()]
+    assert defects == []

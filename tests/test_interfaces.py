@@ -1,387 +1,220 @@
-"""The CLI and the HTTP API, over the same pipeline."""
+"""The CLI, the API and the agent — the three surfaces, on one pipeline."""
 
 from __future__ import annotations
 
-import json
-
 import pytest
-from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from aelayer import api, paths
+from aelayer.agent import AgentServices, AgentSession, ConflictUnresolved, ToolError
 from aelayer.cli import app
+from aelayer.retrieval import CandidateInCohort
+
+runner = CliRunner()
 
 
-@pytest.fixture(scope="module")
-def monkeypatch_module():
-    from _pytest.monkeypatch import MonkeyPatch
-
-    patch = MonkeyPatch()
-    yield patch
-    patch.undo()
+# -- the agent binds a definition ---------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def runs_dir(tmp_path_factory, monkeypatch_module):
-    directory = tmp_path_factory.mktemp("runs")
-    monkeypatch_module.setattr(paths, "RUNS_DIR", directory)
-    return directory
-
-
-@pytest.fixture(scope="module")
-def client(pipeline, index, runs_dir, monkeypatch_module):
-    monkeypatch_module.setattr(api, "_pipeline_singleton", lambda: pipeline)
-    monkeypatch_module.setattr(api, "_runs_dir", lambda: runs_dir)
-    with TestClient(api.app) as test_client:
-        yield test_client
-
-
-def ok(response):
-    assert response.status_code == 200, response.text
-    return response.json()
-
-
-# --------------------------------------------------------------------- API
-
-
-def test_the_summary_says_what_the_data_and_the_extractor_are(client):
-    body = ok(client.get("/api/summary"))
-    assert "synthetic" in body["notice"]
-    assert "not a trained clinical NLP model" in body["notice"]
-    assert "illustrative placeholders" in body["notice"]
-
-
-def test_the_summary_shows_where_each_profile_keeps_the_attribute(client):
-    body = ok(client.get("/api/summary"))
-    assert len(body["profiles"]) == 6
-    homes = {tuple(p["location_home"]) for p in body["profiles"].values()}
-    assert len(homes) == 6
-    both = [p for p in body["profiles"].values() if p["carries_both_location"]]
-    assert len(both) == 1
-
-
-def test_records_can_be_filtered_by_route(client):
-    body = ok(client.get("/api/records", params={"method": "extracted", "limit": 5}))
-    assert body["count"]
-    assert {r["location_method"] for r in body["records"]} == {"extracted"}
-
-
-def test_one_record_exposes_every_attribute_with_its_route(client):
-    listing = ok(client.get("/api/records", params={"limit": 1}))
-    record_id = listing["records"][0]["source_record_id"]
-    body = ok(client.get(f"/api/records/{record_id}"))
-    assert body["provenance_complete"]
-    for attribute in body["attributes"].values():
-        if attribute["value"] is not None:
-            assert attribute["evidence"]
-            assert attribute["method"]
-            assert attribute["source_variable"]
-
-
-def test_an_unknown_record_is_a_404(client):
-    assert client.get("/api/records/NOPE").status_code == 404
-
-
-def test_an_episode_shows_the_records_it_was_derived_from(client):
-    listing = ok(client.get("/api/episodes", params={"limit": 1}))
-    episode_id = listing["episodes"][0]["episode_id"]
-    body = ok(client.get(f"/api/episodes/{episode_id}"))
-    assert body["records"]
-    assert len(body["records"]) == len(body["episode"]["source_record_ids"])
-
-
-def test_a_trajectory_is_served_per_subject(client):
-    listing = ok(client.get("/api/episodes", params={"limit": 1}))
-    subject = listing["episodes"][0]["subject_id"]
-    body = ok(client.get(f"/api/trajectories/{subject}"))
-    assert body["events"]
-    assert {e["kind"] for e in body["events"]} <= {"exposure", "episode"}
-
-
-def test_evaluating_reports_the_unascertainable_separately(client):
-    body = ok(client.post("/evaluate", json={
-        "definition_id": "te_truncal_rash", "version": 1,
-    }))
-    manifest = body["manifest"]
-    assert manifest["counts_by_verdict"]["not_ascertainable"] == len(
-        body["not_ascertainable"]
+def test_the_agent_binds_a_version_and_stamps_its_hash(pipeline):
+    session = AgentSession(pipeline, "cutaneous events with mucosal involvement")
+    result = session.compile()
+    assert result.conflict is None
+    assert result.spec.definition_id == "cutaneous_mucosal"
+    assert result.spec.definition_hash
+    definition = pipeline.definition(
+        result.spec.definition_id, result.spec.definition_version
     )
-    assert manifest["attribute_methods"]
+    assert result.spec.definition_hash == definition.definition_hash
 
 
-def test_the_silver_endpoint_labels_itself_and_carries_a_queue(client):
-    body = ok(client.get("/eval/silver"))
-    assert body["standard"] == "silver"
-    assert "not ground truth" in body["caveat"]
-    assert body["adjudication_queue"]
-    assert any(
-        r["queue_reason"].startswith("sampled agreement")
-        for r in body["adjudication_queue"]
+def test_the_spec_carries_no_parameters_of_its_own(pipeline):
+    """It names a version. Windows and thresholds live in the frozen file."""
+    session = AgentSession(pipeline, "cutaneous events with mucosal involvement")
+    body = session.compile().spec.model_dump()
+    for invented in ("window", "min_confidence", "require_assertion", "grade"):
+        assert invented not in body
+
+
+@pytest.mark.parametrize(
+    "question, expected",
+    [
+        ("cutaneous events with mucosal involvement within 14 days", "14-day window"),
+        ("cutaneous events without mucosal involvement", "two readings"),
+        ("severe cutaneous events requiring hospitalisation", "seriousness language"),
+        ("how many patients had a stroke?", "does not name a phenotype"),
+    ],
+)
+def test_a_question_that_conflicts_is_refused_not_accommodated(pipeline, question,
+                                                               expected):
+    session = AgentSession(pipeline, question)
+    result = session.compile()
+    assert result.conflict is not None, f"{question!r} was silently accommodated"
+    assert expected in result.conflict.conflict
+    assert result.conflict.options
+    with pytest.raises(ConflictUnresolved):
+        session.execute(save=False)
+
+
+def test_the_window_conflict_offers_a_new_version_not_an_override(pipeline):
+    session = AgentSession(
+        pipeline, "cutaneous events with mucosal involvement within 14 days"
     )
+    conflict = session.compile().conflict
+    assert any("Create v" in option for option in conflict.options)
+    assert any("as written" in option for option in conflict.options)
+    assert "new definition version" in conflict.effect
 
 
-def test_the_ablation_endpoint_names_the_business_case(client):
-    body = ok(client.get("/eval/ablation"))
-    assert body["cases_only_findable_through_text"] > 0
-    assert body["cases_with_text"] > body["cases_structured_only"]
+def test_the_negative_conflict_names_both_populations(pipeline):
+    session = AgentSession(pipeline, "cutaneous events without mucosal involvement")
+    conflict = session.compile().conflict
+    joined = " ".join(conflict.options)
+    assert "assertion=absent" in joined
+    assert "not_collected" in joined
+    assert "denominator" in conflict.effect
 
 
-def test_the_transport_endpoint_holds_out_whole_studies(client):
-    body = ok(client.get("/eval/transport"))
-    assert body["split"] == "whole_study"
-    assert not set(body["development_profiles"]) & set(body["held_out_profiles"])
+# -- the supportability screen ------------------------------------------------
 
 
-def test_holding_out_an_unknown_profile_is_a_400(client):
-    assert client.get(
-        "/eval/transport", params={"holdout": "P9_imaginary"}
-    ).status_code == 400
+def test_supportability_runs_before_any_patient_level_query(pipeline):
+    session = AgentSession(pipeline, "cutaneous events with mucosal involvement")
+    package, _manifest = session.execute(save=False)
+    calls = package.tools_called
+    assert "study.supportability" in calls
+    assert calls.index("study.supportability") < calls.index("cohort.run")
+    screen = package.supportability["mucosal_involvement"]
+    assert screen["cannot_ascertain"]
 
 
-def test_the_precise_path_is_a_cohort_and_discovery_is_not(client):
-    precise = ok(client.get("/retrieve", params={"concept": "RASH"}))
-    assert precise["usable_as_cohort"]
-    discovery = ok(client.get("/discover", params={"attribute": "location"}))
-    assert discovery["usable_as_cohort"] is False
-    assert discovery["all_candidates"]
-    assert "never directly" in discovery["cohort_note"]
+# -- the tool surface ---------------------------------------------------------
 
 
-def test_discovery_can_be_asked_for_what_the_catalogue_misses(client):
-    body = ok(client.get("/discover", params={"unnormalized_only": True}))
-    assert body["unnormalized_count"] == body["count"]
-    assert body["count"] > 0
+def test_no_tool_takes_a_query_string_or_writes(pipeline):
+    for spec in AgentServices(pipeline).catalogue():
+        assert spec["writes_source_records"] is False
+        properties = spec["input_schema"].get("properties", {})
+        for name in properties:
+            assert name not in ("sql", "query", "where", "raw"), (
+                f"{spec['name']} exposes a query surface"
+            )
 
 
-def test_comparing_versions_without_a_scope_is_refused(client):
-    response = client.get(
-        "/definitions/te_truncal_rash/compare", params={"left": 1, "right": 2}
+def test_a_tool_outside_the_grant_is_refused(pipeline):
+    services = AgentServices(pipeline, permissions={"read_cohort"})
+    with pytest.raises(ToolError) as exc:
+        services.call("stats.compare", definition_id="cutaneous_mucosal",
+                      left=1, right=2, scope="x")
+    assert "requires the 'analyse' permission" in str(exc.value)
+
+
+def test_arguments_are_validated_before_a_tool_runs(pipeline):
+    services = AgentServices(pipeline)
+    with pytest.raises(ToolError) as exc:
+        services.call("cohort.run", definition_id="cutaneous_mucosal", nonsense=1)
+    assert "do not validate" in str(exc.value)
+
+
+def test_an_unscoped_comparison_is_refused(pipeline):
+    services = AgentServices(pipeline)
+    with pytest.raises(Exception) as exc:
+        services.call("stats.compare", definition_id="cutaneous_mucosal",
+                      left=1, right=2, scope=None)
+    assert "scope" in str(exc.value).lower()
+
+
+def test_the_export_leaves_unascertained_subjects_null(pipeline):
+    body = AgentServices(pipeline).call(
+        "cohort.export", definition_id="cutaneous_mucosal", version=2
     )
-    assert response.status_code == 400
-    assert "requires an explicit scope" in response.json()["detail"]
+    statuses = {row["status"] for row in body["rows"]}
+    assert None in statuses
+    for row in body["rows"]:
+        if row["verdict"] in ("review", "not_ascertainable"):
+            assert row["status"] is None
+    assert "unadjudicated judgement" in body["note"]
 
 
-def test_a_scoped_comparison_shows_what_the_route_change_costs(client):
-    body = ok(client.get("/definitions/te_truncal_rash/compare", params={
-        "left": 1, "right": 2, "scope": "truncal rash incidence",
-    }))
-    assert body["lost"]
-    assert any("does not accept" in d["reason_b"] for d in body["discordant"])
+# -- traceability -------------------------------------------------------------
 
 
-def test_a_candidate_is_rendered_and_nothing_on_disk_changes(client, pipeline):
-    before = pipeline.definition("te_truncal_rash", 1).definition_hash
-    body = ok(client.post("/definitions/candidate", json={
-        "definition_id": "te_truncal_rash", "base_version": 1,
-        "changes": {"required_attributes.location.min_confidence": 0.9},
-    }))
-    assert body["applied_changes"] == [
-        "required_attributes.location.min_confidence = 0.9"
-    ]
-    assert "has not been modified" in body["note"]
-    assert pipeline.definitions.get(
-        "te_truncal_rash", 1
-    ).definition_hash == before
+def test_every_reported_number_traces_to_source(pipeline):
+    session = AgentSession(pipeline, "cutaneous events with mucosal involvement")
+    package, _manifest = session.execute(save=False)
+    assert package.trace.complete, f"chain breaks at {package.trace.broken_at}"
+    levels = set(package.trace.levels())
+    assert {"result", "analysis", "cohort", "definition", "record", "span"} <= levels
 
 
-def test_a_candidate_naming_a_path_that_does_not_exist_is_refused(client):
-    response = client.post("/definitions/candidate", json={
-        "definition_id": "te_truncal_rash", "base_version": 1,
-        "changes": {"required_attributes.location.vibes": 1},
-    })
-    assert response.status_code == 400
-    assert "no such definition path" in response.json()["detail"]
+# -- retrieval ----------------------------------------------------------------
 
 
-def test_the_tool_surface_is_published_with_its_schemas(client):
-    body = ok(client.get("/agent/tools"))
-    assert len(body["tools"]) >= 5
-    assert all(t["writes_source_records"] is False for t in body["tools"])
-    assert "no SQL surface" in body["note"]
+def test_discovery_output_cannot_become_a_cohort(pipeline):
+    result = pipeline.discover(text="mucosal", top_k=5)
+    with pytest.raises(CandidateInCohort):
+        result.as_cohort()
 
 
-def test_an_underdetermined_question_returns_no_number(client):
-    response = client.post("/agent/ask", json={
-        "question": "how many severe rash cases were hospitalised?", "save": False,
-    })
-    assert response.status_code == 409
-    body = response.json()
-    assert body["executed"] is False
-    assert "no number was produced" in body["detail"]
+def test_the_precise_path_is_cohort_eligible(pipeline, index):
+    result = pipeline.retrieve(assertion=["present"], top_k=5)
+    assert result.as_cohort() is not None
 
 
-def test_asking_executes_without_an_approval_step_and_returns_a_trace(client):
-    body = ok(client.post("/agent/ask", json={
-        "question": "how many rash cases after first exposure?",
-    }))
-    assert body["executed"] is True
-    assert body["traceable"] is True
-    assert body["cohort"]["counts_by_verdict"]
-    assert body["tools_called"]
+def test_assertion_and_availability_are_separate_filters(pipeline, index):
+    absent = pipeline.retrieve(assertion=["absent"], top_k=200)
+    silent = pipeline.retrieve(availability=["not_collected"], top_k=200)
+    assert absent.records and silent.records
+    assert not (
+        {r.record_id for r in absent.records}
+        & {r.record_id for r in silent.records}
+    ), "a documented negative and an uncollected variable overlap"
 
 
-def test_a_run_replays_hash_for_hash_and_traces_to_a_span(client):
-    manifest = ok(client.post("/evaluate", json={
-        "definition_id": "te_truncal_rash", "version": 1,
-    }))["manifest"]
-    replayed = ok(client.post(f"/runs/{manifest['manifest_id']}/replay"))
-    assert replayed["reproduced"], replayed["differences"]
-    traced = ok(client.get(f"/trace/{manifest['manifest_id']}"))
-    assert traced["complete"]
-    assert traced["links"][-1]["level"] == "span"
+# -- the CLI ------------------------------------------------------------------
 
 
-def test_the_ui_is_served_from_the_same_process(client):
-    response = client.get("/")
-    assert response.status_code == 200
-    assert "<html" in response.text.lower()
+def test_cli_help_lists_the_two_headline_commands():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "ablation" in result.output
+    assert "supportability" in result.output
 
 
-# --------------------------------------------------------------------- CLI
-
-
-@pytest.fixture(scope="module")
-def runner() -> CliRunner:
-    return CliRunner()
-
-
-@pytest.fixture(scope="module")
-def store_path(tmp_path_factory):
-    return str(tmp_path_factory.mktemp("cli-store") / "store.db")
-
-
-def run(runner, *args, expect: int = 0):
-    result = runner.invoke(app, list(args))
-    assert result.exit_code == expect, result.output + str(result.exception)
-    return result.output
-
-
-def common(corpus_dir, store_path):
-    return ["--data-dir", str(corpus_dir), "--store", store_path]
-
-
-@pytest.fixture(scope="module")
-def built(runner, corpus_dir, store_path, runs_dir):
-    return run(runner, "extract", "--data-dir", str(corpus_dir), "--out", store_path)
-
-
-def test_generate_says_the_corpus_is_synthetic(runner, tmp_path_factory):
-    out = tmp_path_factory.mktemp("gen-cli")
-    output = run(runner, "generate", "--seed", "3", "--truths", "2",
-                 "--background", "1", "--out", str(out))
-    assert "No real patient data" in output
-    for profile in ("P1_structured", "P6_both"):
-        assert profile in output
-
-
-def test_normalize_reports_the_route_per_profile(runner, corpus_dir):
-    output = run(runner, "normalize", "--data-dir", str(corpus_dir))
-    assert "location, by profile and route" in output
-    assert "a route is part of the fact" in output
-
-
-def test_extract_reports_versions_and_provenance(built):
-    assert "normalizer" in built and "extractor" in built
-    assert "every populated attribute on every record traces to a span" in built
-
-
-def test_definitions_show_which_routes_each_accepts(runner, corpus_dir):
-    output = run(runner, "definitions", "--data-dir", str(corpus_dir))
-    assert "te_truncal_rash.v1" in output
-    assert "accepts=direct,extracted,normalized" in output
-
-
-def test_comparing_without_a_scope_is_refused(runner, corpus_dir):
+def test_cli_ask_exits_non_zero_on_a_conflict(corpus_dir):
     result = runner.invoke(app, [
-        "definitions", "--data-dir", str(corpus_dir),
-        "--compare", "te_truncal_rash:1:2",
-    ])
-    assert result.exit_code == 1
-    assert "requires an explicit scope" in result.output
-
-
-@pytest.fixture(scope="module")
-def evaluated(runner, corpus_dir, store_path, built):
-    return run(runner, "evaluate", *common(corpus_dir, store_path), "--version", "1")
-
-
-def test_evaluate_reports_the_unascertainable_apart(evaluated):
-    assert "not ascertainable" in evaluated
-    assert "Not a negative" in evaluated or "neither cases nor negatives" in evaluated
-
-
-def test_evaluate_prints_the_route_behind_each_verdict(evaluated):
-    assert "routes" in evaluated
-    assert "location=" in evaluated
-
-
-def test_silver_reports_every_metric_and_writes_a_queue(
-    runner, corpus_dir, store_path, built, tmp_path_factory
-):
-    queue = tmp_path_factory.mktemp("queue") / "adjudication.jsonl"
-    output = run(runner, "eval", "silver", "--queue", str(queue),
-                 *common(corpus_dir, store_path))
-    for label in ("precision", "recall", "coverage", "abstention rate",
-                  "normalized agreement"):
-        assert label in output
-    assert "silver standard, not ground truth" in output
-    assert "sampled agreement" in output
-    rows = [json.loads(line) for line in queue.read_text().splitlines() if line]
-    assert rows
-
-
-def test_transport_holds_out_whole_studies(runner, corpus_dir, store_path, built):
-    output = run(runner, "eval", "transport", *common(corpus_dir, store_path))
-    assert "never rows" in output
-    assert "development" in output and "held_out" in output
-
-
-def test_eval_all_writes_a_report(runner, corpus_dir, store_path, built,
-                                  tmp_path_factory):
-    report = tmp_path_factory.mktemp("report") / "eval.md"
-    output = run(runner, "eval", "all", "--report", str(report),
-                 *common(corpus_dir, store_path))
-    assert "silver" in output and "ablation" in output
-    body = report.read_text(encoding="utf-8")
-    assert "Consistency across representations is not clinical validity" in body
-
-
-def test_an_underdetermined_question_stops_before_executing(
-    runner, corpus_dir, store_path, built
-):
-    result = runner.invoke(app, [
-        "ask", "how many severe rash cases were hospitalised?",
-        *common(corpus_dir, store_path),
+        "ask", "cutaneous events without mucosal involvement",
+        "--data-dir", str(corpus_dir), "--no-save",
     ])
     assert result.exit_code == 2
-    assert "No specification was compiled and nothing was executed" in result.output
+    assert "NOT RUN" in result.output
+    assert "does not override" in result.output
 
 
-def test_asking_traces_the_number_it_reports(runner, corpus_dir, store_path, built):
-    output = run(runner, "ask", "how many rash cases after first exposure?",
-                 *common(corpus_dir, store_path))
-    assert "traceable to source: True" in output
-    assert "tools" in output
+def test_cli_supportability_reads_no_patient_record(corpus_dir):
+    result = runner.invoke(app, ["supportability", "--data-dir", str(corpus_dir)])
+    assert result.exit_code == 0
+    assert "no patient record was read" in result.output
+    assert "cannot_ascertain" in result.output
 
 
-def test_the_tool_surface_is_listed(runner):
-    output = run(runner, "knowledge", "tools")
-    assert "cohort.run" in output
-    assert "no SQL surface" in output
+def test_cli_ablation_ends_in_a_decision(corpus_dir):
+    result = runner.invoke(app, ["ablation", "--data-dir", str(corpus_dir)])
+    assert result.exit_code == 0
+    assert "DECISION:" in result.output
 
 
-def test_a_recorded_run_replays(runner, corpus_dir, store_path, evaluated, runs_dir):
-    manifest_id = [
-        line.split()[1] for line in evaluated.splitlines()
-        if line.strip().startswith("manifest ")
-    ][0]
-    output = run(runner, "replay", manifest_id, "--data-dir", str(corpus_dir))
-    assert "reproduced exactly" in output
+def test_cli_silver_prints_both_caveats(corpus_dir):
+    from aelayer.silver import SILVER_CAVEATS
+
+    result = runner.invoke(app, ["eval", "silver", "--data-dir", str(corpus_dir)])
+    assert result.exit_code == 0
+    for caveat in SILVER_CAVEATS:
+        # The CLI wraps, so compare on a distinctive fragment.
+        assert caveat.split(".")[0] in result.output.replace("\n", " ")
 
 
-def test_retrieval_separates_the_two_paths(runner, corpus_dir, store_path, evaluated):
-    precise = run(runner, "retrieve", "RASH", *common(corpus_dir, store_path))
-    assert "usable as a cohort: True" in precise
-    discovery = run(runner, "retrieve", "rash", "--mode", "lexical",
-                    *common(corpus_dir, store_path))
-    assert "every result is a candidate" in discovery
+def test_cli_normalize_reports_the_reconciliation_split(corpus_dir):
+    result = runner.invoke(app, ["normalize", "--data-dir", str(corpus_dir)])
+    assert result.exit_code == 0
+    for outcome in ("unchanged", "remapped_mechanically", "flagged_for_review"):
+        assert outcome in result.output

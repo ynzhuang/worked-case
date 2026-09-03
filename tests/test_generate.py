@@ -1,181 +1,156 @@
-"""The corpus: synthetic, deterministic, and rendered six ways."""
+"""The corpus. It is synthetic, it says so, and it plants each thing measured."""
 
 from __future__ import annotations
 
-import collections
-import csv
-import json
-from pathlib import Path
+from collections import Counter
 
 import pytest
 
-from aelayer.generate import generate_corpus
+from aelayer.generate import SYNTHETIC_FLAG, generate_corpus
 
 
-def rows(root: Path, table: str) -> list[dict]:
-    with (root / f"{table}.csv").open(encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
+def test_every_row_is_flagged_synthetic(store):
+    for name, rows in store.tables.items():
+        for row in rows:
+            assert row.get("SYNTHETIC") == SYNTHETIC_FLAG, (
+                f"a row in {name} is not marked synthetic"
+            )
 
 
-def jsonl(root: Path, name: str) -> list[dict]:
-    return [
-        json.loads(line)
-        for line in (root / name).read_text(encoding="utf-8").splitlines() if line
-    ]
+def test_every_document_carries_the_synthetic_header(store):
+    for document in store.documents.values():
+        assert "SYNTHETIC" in document.header
+        assert "NOT REAL PATIENT DATA" in document.header
 
 
-@pytest.fixture(scope="module")
-def small(tmp_path_factory) -> Path:
-    root = tmp_path_factory.mktemp("gen")
-    generate_corpus(seed=3, out_dir=root, shared_truths=8, extra_per_profile=4)
-    return root
+def test_the_manifest_says_the_corpus_is_generated(store):
+    assert store.manifest["synthetic"] is True
+    assert "No real patient data" in store.manifest["notice"]
 
 
-# -- determinism ------------------------------------------------------------
-
-
-def test_the_same_seed_produces_byte_identical_files(tmp_path):
-    a, b = tmp_path / "a", tmp_path / "b"
-    for target in (a, b):
-        generate_corpus(seed=5, out_dir=target, shared_truths=4, extra_per_profile=2)
-    for name in ("ae.csv", "ex.csv", "dm.csv", "suppae.csv", "co.csv",
-                 "documents.jsonl", "truths.jsonl", "gold_records.jsonl",
-                 "gold_episodes.jsonl", "manifest.json"):
-        assert (a / name).read_bytes() == (b / name).read_bytes(), name
+def test_generation_is_deterministic(tmp_path):
+    a, _ = generate_corpus(seed=3, out_dir=tmp_path / "a")
+    b, _ = generate_corpus(seed=3, out_dir=tmp_path / "b")
+    assert (a / "ae.csv").read_text() == (b / "ae.csv").read_text()
+    assert (a / "gold.jsonl").read_text() == (b / "gold.jsonl").read_text()
 
 
 def test_a_different_seed_produces_a_different_corpus(tmp_path):
-    a, b = tmp_path / "a", tmp_path / "b"
-    generate_corpus(seed=5, out_dir=a, shared_truths=4, extra_per_profile=2)
-    generate_corpus(seed=6, out_dir=b, shared_truths=4, extra_per_profile=2)
-    assert (a / "ae.csv").read_bytes() != (b / "ae.csv").read_bytes()
+    a, _ = generate_corpus(seed=3, out_dir=tmp_path / "a")
+    b, _ = generate_corpus(seed=4, out_dir=tmp_path / "b")
+    assert (a / "ae.csv").read_text() != (b / "ae.csv").read_text()
 
 
-# -- it says what it is -----------------------------------------------------
+# -- what the corpus contains -------------------------------------------------
 
 
-def test_every_row_is_marked_synthetic(small):
-    for table in ("dm", "ae", "ex", "suppae", "co"):
-        table_rows = rows(small, table)
-        assert table_rows, table
-        assert {r["SYNTHETIC"] for r in table_rows} == {"Y"}
+def test_all_seven_profiles_are_rendered(store, profiles):
+    studies = set(store.studies())
+    declared = {p.study_id for p in profiles.profiles.values()}
+    assert studies == declared
+    assert len(studies) == 7
 
 
-def test_the_corpus_carries_a_notice_that_it_is_not_patient_data(small):
-    manifest = json.loads((small / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["synthetic"] is True
-    assert "No real patient data" in manifest["notice"]
-    assert "SYNTHETIC DATA ONLY" in (small / "README.txt").read_text(encoding="utf-8")
+def test_the_gold_records_what_each_route_holds_separately(store):
+    gold = store.gold()
+    assert gold
+    for row in gold:
+        assert set(row) >= {
+            "true_assertion", "true_availability", "structured_assertion",
+            "text_assertion", "in_structured", "in_text", "readable",
+            "true_verdict", "verdict_if_readable",
+        }
 
 
-# -- the six renderings -----------------------------------------------------
+def test_the_gold_carries_a_verdict_per_ablation_stage(store):
+    for row in store.gold():
+        assert row["verdict_stage_structured"]
+        assert row["verdict_stage_reported_term"]
+        assert row["verdict_stage_comments"]
 
 
-def test_each_shared_truth_is_rendered_under_every_profile(small):
-    by_truth = collections.defaultdict(set)
-    for episode in jsonl(small, "gold_episodes.jsonl"):
-        if episode["cohort"] == "shared":
-            by_truth[episode["truth_id"]].add(episode["profile"])
-    assert by_truth
-    for truth_id, seen in by_truth.items():
-        assert len(seen) == 6, f"{truth_id} rendered in {sorted(seen)}"
-
-
-def test_the_underlying_truth_does_not_change_between_renderings(small):
-    by_truth = collections.defaultdict(set)
-    for episode in jsonl(small, "gold_episodes.jsonl"):
-        if episode["cohort"] == "shared":
-            by_truth[episode["truth_id"]].add(
-                (episode["true_location"], episode["onset_offset_days"])
-            )
-    for truth_id, seen in by_truth.items():
-        assert len(seen) == 1, f"{truth_id} differs across renderings: {seen}"
-
-
-def test_what_a_rendering_can_support_may_be_weaker_than_the_truth(small):
-    weaker = [
-        e for e in jsonl(small, "gold_episodes.jsonl")
-        if e["true_verdict"] != e["verdict_if_location_available"]
+def test_each_stage_can_ascertain_at_least_as_much_as_the_one_below(store):
+    gold = store.gold()
+    stages = [
+        "verdict_stage_structured", "verdict_stage_reported_term",
+        "verdict_stage_comments",
     ]
-    assert weaker
-    assert all(not e["location_available"] for e in weaker)
-    assert all(e["true_verdict"] == "not_ascertainable" for e in weaker)
-
-
-def test_the_location_lives_in_a_different_place_in_each_profile(small):
-    manifest = json.loads((small / "manifest.json").read_text(encoding="utf-8"))
-    homes = {
-        profile: tuple(body["location_home"])
-        for profile, body in manifest["profiles"].items()
-    }
-    assert homes["P1_structured"] == ("AELOC",)
-    assert homes["P2_text"] == ("reported_term",)
-    assert homes["P3_prespecified"] == ("none",)
-    assert homes["P4_sponsor"] == ("sponsor_variable",)
-    assert homes["P5_comment"] == ("comment",)
-    assert set(homes["P6_both"]) == {"AELOC", "reported_term"}
-
-
-def test_the_sponsor_variable_is_deliberately_non_standard(small):
-    supplemental = rows(small, "suppae")
-    assert supplemental
-    assert {r["QNAM"] for r in supplemental} == {"RASHSITE"}
-    assert {r["IDVAR"] for r in supplemental} == {"AESPID"}
-
-
-def test_comments_point_back_at_the_ae_record_they_describe(small):
-    comments = rows(small, "co")
-    assert comments
-    record_ids = {r["AESPID"] for r in rows(small, "ae")}
-    assert {r["IDVARVAL"] for r in comments} <= record_ids
-
-
-def test_profiles_use_different_dictionary_versions_and_date_styles(small):
-    manifest = json.loads((small / "manifest.json").read_text(encoding="utf-8"))
-    versions = {b["dictionary_version"] for b in manifest["profiles"].values()}
-    assert len(versions) > 1
-    dates = {r["AESTDTC"] for r in rows(small, "ae") if r["AESTDTC"]}
-    assert any("-" in d and d[2] == "-" and not d[:4].isdigit() for d in dates)
-
-
-# -- the answer key ---------------------------------------------------------
-
-
-def test_gold_distinguishes_no_site_from_no_site_recorded(small):
-    """The distinction the availability confusion matrix is scored against."""
-    gold = jsonl(small, "gold_episodes.jsonl")
-    generalised = [e for e in gold if e["true_location"] == "GENERALISED"]
-    not_collected = [
-        e for e in gold if e["profile"] == "P3_prespecified" and e["concept"] == "RASH"
+    ascertained = [
+        sum(1 for row in gold if row[stage] in ("case", "non_case"))
+        for stage in stages
     ]
-    assert generalised, "no genuinely site-less event, so 'absent' is untested"
-    assert not_collected
-    assert all(e["true_verdict"] != "not_ascertainable" for e in generalised
-               if e["location_available"])
-    assert any(e["true_verdict"] == "not_ascertainable" for e in not_collected)
-
-
-def test_gold_records_where_each_route_holds_the_location(small):
-    gold = jsonl(small, "gold_records.jsonl")
-    assert any(g["location_in_structured"] and g["location_in_text"] for g in gold)
-    assert any(g["location_in_structured"] and not g["location_in_text"] for g in gold)
-    assert any(not g["location_in_structured"] and g["location_in_text"] for g in gold)
-
-
-def test_the_corpus_contains_text_the_lexicon_cannot_cover(small):
-    outcomes = collections.Counter(
-        g["text_outcome"] for g in jsonl(small, "gold_records.jsonl")
+    assert ascertained == sorted(ascertained)
+    assert ascertained[0] < ascertained[-1], (
+        "text buys nothing in the answer key, so the ablation cannot measure it"
     )
-    assert outcomes["unlexiconed"] > 0
-    assert outcomes["omitted"] > 0
 
 
-def test_seeded_discrepancies_never_cross_a_verdict_class(small):
-    """So the silver numbers and the phenotype numbers stay separable."""
-    truncal = {"CHEST", "ABDOMEN", "BACK"}
-    for record in jsonl(small, "gold_records.jsonl"):
-        if record["text_outcome"] != "discrepant":
-            continue
-        structured, text = record["true_location"], record["text_location"]
-        assert structured != text
-        assert (structured in truncal) == (text in truncal)
+def test_the_text_never_contradicts_the_truth(store):
+    """The generator writes what is true, or says nothing. Never the opposite."""
+    mismatches = [
+        row for row in store.gold()
+        if row["text_assertion"] is not None
+        and row["true_assertion"] is not None
+        and row["text_assertion"] != row["true_assertion"]
+    ]
+    assert mismatches == []
+
+
+def test_only_the_negated_and_mixed_styles_write_an_absence_in_the_term(store,
+                                                                        profiles):
+    """The style governs AETERM. A comment is a different home with its own rule."""
+    documented = {
+        row["profile"] for row in store.gold() if row["term_assertion"] == "absent"
+    }
+    assert documented
+    for profile_id in documented:
+        assert profiles.profile(profile_id).reported_term_style in \
+            ("negated", "mixed"), (
+                f"{profile_id} writes an absence into AETERM but is not "
+                f"declared to"
+            )
+
+
+def test_a_rich_style_says_nothing_about_an_absence_in_its_term(store, profiles):
+    rich = {
+        p.profile_id for p in profiles.profiles.values()
+        if p.reported_term_style == "rich"
+    }
+    checked = 0
+    for row in store.gold():
+        if row["profile"] in rich and row["true_assertion"] == "absent":
+            checked += 1
+            assert row["term_assertion"] is None, (
+                "a `rich` site wrote an absence into its reported term; the "
+                "trap this profile exists to set is that an absence there "
+                "looks identical to silence"
+            )
+    assert checked, "no rich profile was tested against an absence"
+
+
+def test_unlexiconed_phrasings_exist_so_abstention_is_measurable(store):
+    """Some text states the modifier in words no catalogue covers."""
+    from aelayer.generate import UNLEXICONED
+
+    terms = " ".join(row["AETERM"] for row in store.rows("ae"))
+    assert any(phrase in terms for phrase in UNLEXICONED)
+
+
+def test_every_dictionary_version_is_used(store, profiles, catalog):
+    used = {p.dictionary_version for p in profiles.profiles.values()}
+    assert used == set(catalog.dictionary_versions)
+
+
+def test_a_subject_appears_in_exactly_one_study(store):
+    owners = Counter()
+    for row in store.rows("ae"):
+        owners[row["USUBJID"]] = row["STUDYID"]
+    for subject, study in owners.items():
+        assert subject.startswith(study)
+
+
+def test_shared_truths_are_rendered_under_every_profile(store):
+    shared = [row for row in store.gold() if row["cohort"] == "shared"]
+    by_truth = Counter(row["truth_id"] for row in shared)
+    assert by_truth
+    assert max(by_truth.values()) == len(store.studies())

@@ -121,6 +121,10 @@ class ConceptCatalog:
             self.dictionaries.get("versions") or []
         )
         self.target_version: str = self.dictionaries.get("target", "")
+        #: The licensing notice declared beside the terms. Carried on the
+        #: object rather than left in the YAML, so anything that reports a
+        #: coded value can print it without re-reading the file.
+        self.notice: str = (self.dictionaries.get("notice") or "").strip()
 
         self.concepts: dict[str, Concept] = {
             cid: Concept(

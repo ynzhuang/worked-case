@@ -85,8 +85,24 @@ class CompileResult:
         }
 
 
+#: Words that carry no signal about which phenotype is meant. Without this,
+#: "how many patients had a stroke?" scores a point against every definition
+#: on the word "a" and the compiler reports an ambiguity instead of the truth,
+#: which is that the catalogue defines nothing of the sort.
+_STOPWORDS = frozenset({
+    "a", "an", "and", "any", "are", "as", "at", "be", "by", "did", "do", "for",
+    "from", "had", "has", "have", "how", "in", "is", "it", "many", "much",
+    "not", "of", "on", "or", "patient", "patients", "subject", "subjects",
+    "that", "the", "there", "to", "was", "were", "what", "which", "who",
+    "with", "within",
+})
+
+
 def _tokenise(text: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]+", text.lower()))
+    return {
+        token for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) > 2 and token not in _STOPWORDS
+    }
 
 
 def _score(definition: PhenotypeDefinition, tokens: set[str]) -> int:

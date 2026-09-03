@@ -524,6 +524,11 @@ class CorpusGenerator:
             "structured_assertion": {
                 "Y": "present", "N": "absent", "U": "uncertain",
             }.get(structured or "", None),
+            # Kept apart because the reported-term style governs AETERM only.
+            # A comment record documenting an absence is legitimate whatever
+            # the site's terse-or-rich habit with the term itself.
+            "term_assertion": term_assertion,
+            "comment_assertion": comment_assertion,
             "text_assertion": text_assertion,
             "text_value": term_value or comment_value,
             **readable,

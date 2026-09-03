@@ -1,143 +1,157 @@
-"""The Attribute: a value, and the route that produced it."""
+"""The two-field model, and the invariant the whole system rests on.
+
+`assertion` is what the source said. `availability` is whether it said
+anything. They are orthogonal, and merging them is the error that biases every
+downstream estimate — so the model refuses to represent a merged state at all.
+"""
 
 from __future__ import annotations
 
 import datetime as _dt
 
 import pytest
+from pydantic import ValidationError
 
 from aelayer.models import (
-    AVAILABILITY_VALUES,
+    ASCERTAINED,
+    ASSERTIONS,
+    AVAILABILITIES,
     METHODS,
-    NOT_EVIDENCE_OF_ABSENCE,
+    SILENT,
+    VERDICTS,
     Attribute,
     Span,
 )
 
-
-def span(field: str = "location") -> Span:
-    return Span(doc_id="AE:R1", start=0, end=5, field=field, extracted_value="CHEST",
-                text="chest")
-
-
-# -- the four invariants ---------------------------------------------------
-
-
-def test_an_extracted_value_must_point_at_the_text_it_came_from():
-    with pytest.raises(ValueError, match="must carry at least one span"):
-        Attribute[str](
-            value="CHEST", method="extracted", source="reported_term",
-            availability="collected",
-        )
-
-
-def test_a_direct_value_must_come_from_a_standard_variable():
-    """`direct` is a claim about the route, not a synonym for "confident"."""
-    with pytest.raises(ValueError, match="means a standard structured variable"):
-        Attribute[str](
-            value="CHEST", method="direct", source="reported_term",
-            availability="collected",
-        )
-
-
-@pytest.mark.parametrize(
-    "availability", [a for a in AVAILABILITY_VALUES if a != "collected"]
+SPAN = Span(
+    doc_id="AE:R1:AETERM", start=0, end=4, field="mucosal_involvement",
+    extracted_value="ORAL", text="oral", kind="text",
 )
-def test_an_unavailable_attribute_never_carries_a_value(availability):
-    with pytest.raises(ValueError, match="only a collected attribute has one"):
-        Attribute[str](value="CHEST", availability=availability)
 
 
-def test_a_collected_attribute_must_say_what_was_collected():
-    with pytest.raises(ValueError, match="say which kind of empty"):
-        Attribute[str](value=None, availability="collected")
+# -- the orthogonality invariant --------------------------------------------
 
 
-def test_only_the_model_path_stamps_an_extractor_version():
-    body = Attribute[str].direct("CHEST", "AELOC", [span()]).model_dump()
-    with pytest.raises(ValueError, match="only the model path stamps it"):
-        Attribute[str].model_validate({**body, "extractor_version": "extract-3"})
+def test_silence_cannot_carry_an_assertion():
+    """The error the spec names: a silent attribute asserting something."""
+    for availability in AVAILABILITIES:
+        if availability == "observed":
+            continue
+        for assertion in ASSERTIONS:
+            with pytest.raises(ValidationError) as exc:
+                Attribute[str](availability=availability, assertion=assertion)
+            assert "orthogonal" in str(exc.value)
 
 
-# -- there is no "inferred" ------------------------------------------------
+def test_observed_must_carry_an_assertion():
+    """The mirror error: the source spoke, but nothing records what it said."""
+    with pytest.raises(ValidationError) as exc:
+        Attribute[str](availability="observed", assertion=None)
+    assert "must carry an assertion" in str(exc.value)
 
 
-def test_inferred_is_not_a_method():
-    assert "inferred" not in METHODS
-    with pytest.raises(ValueError):
+def test_every_assertion_and_availability_combination_is_decided():
+    """No combination is left implicitly legal. Each is allowed or refused."""
+    allowed = 0
+    for availability in AVAILABILITIES:
+        for assertion in (*ASSERTIONS, None):
+            try:
+                Attribute[str](availability=availability, assertion=assertion)
+                allowed += 1
+            except ValidationError:
+                continue
+    # observed x 3 assertions, plus each non-observed availability with None.
+    assert allowed == len(ASSERTIONS) + (len(AVAILABILITIES) - 1)
+
+
+def test_documented_negative_is_not_silence():
+    absent = Attribute[str].direct("absent", "AEMUCOS", [SPAN])
+    silent = Attribute[str].silent_because("not_collected", variable="AEMUCOS")
+    assert absent.documented_negative and not absent.silent
+    assert silent.silent and not silent.documented_negative
+    assert absent.availability != silent.availability
+    assert absent.assertion == "absent" and silent.assertion is None
+
+
+def test_silent_is_exactly_the_complement_of_observed():
+    assert SILENT == frozenset(set(AVAILABILITIES) - {"observed"})
+
+
+def test_a_value_requires_an_observation():
+    with pytest.raises(ValidationError) as exc:
+        Attribute[str](availability="not_collected", value="ORAL")
+    assert "only an observed attribute has one" in str(exc.value)
+
+
+# -- method invariants -------------------------------------------------------
+
+
+def test_extracted_requires_a_span():
+    with pytest.raises(ValidationError) as exc:
         Attribute[str](
-            value="CHEST", method="inferred", source="derived",
-            availability="collected",
+            availability="observed", assertion="present", method="extracted",
+            source="reported_term", evidence=[],
+        )
+    assert "at least one span" in str(exc.value)
+
+
+def test_direct_means_a_structured_variable():
+    with pytest.raises(ValidationError):
+        Attribute[str](
+            availability="observed", assertion="present", method="direct",
+            source="reported_term",
         )
 
 
-def test_the_word_inferred_appears_nowhere_in_the_package():
-    """A value the system worked out for itself is not an attribute of a patient."""
-    import pathlib
-    import re
-
-    root = pathlib.Path(__file__).resolve().parents[1] / "src" / "aelayer"
-    offending = []
-    for path in root.rglob("*.py"):
-        for number, line in enumerate(
-            path.read_text(encoding="utf-8").splitlines(), start=1
-        ):
-            if re.search(r"[\"']inferred[\"']", line):
-                offending.append(f"{path.name}:{number}")
-    assert not offending, offending
+def test_derived_means_a_cross_domain_computation():
+    with pytest.raises(ValidationError):
+        Attribute[int](
+            availability="observed", assertion="present", method="derived",
+            source="structured_standard", value=3,
+        )
+    ok = Attribute[int].derived(3, "AE+EX", [SPAN])
+    assert ok.method == "derived" and ok.source == "cross_domain"
 
 
-# -- what an availability means --------------------------------------------
+def test_methods_are_exactly_three_and_none_is_called_inferred():
+    assert METHODS == ("direct", "derived", "extracted")
+    assert "inferred" not in METHODS
 
 
-def test_only_a_collected_value_is_evidence_of_absence():
-    assert Attribute[str].direct("CHEST", "AELOC", [span()]).is_evidence_of_absence
-    for availability in NOT_EVIDENCE_OF_ABSENCE:
-        assert not Attribute[str].unavailable(availability).is_evidence_of_absence
+def test_silent_because_refuses_to_manufacture_an_observation():
+    with pytest.raises(ValueError) as exc:
+        Attribute[str].silent_because("observed")
+    assert "state the assertion" in str(exc.value)
 
 
-def test_an_unavailable_attribute_cannot_claim_to_be_collected():
-    with pytest.raises(ValueError, match="cannot be 'collected'"):
-        Attribute[str].unavailable("collected")
+# -- reading -----------------------------------------------------------------
 
 
-def test_the_structured_availability_survives_a_text_recovery():
-    """Recovering a site from prose does not make the CRF column collected."""
+def test_route_description_names_the_variable():
+    attribute = Attribute[str].direct("present", "AEMUCOS", [SPAN], value="ORAL")
+    assert "AEMUCOS" in attribute.describe_route()
+    assert "direct" in attribute.describe_route()
+
+
+def test_prior_availability_keeps_both_facts():
+    """Recovering a value from prose does not make the CRF column collected."""
     recovered = Attribute[str].extracted(
-        "CHEST", "AETERM", [span()], prior_availability="not_collected_by_protocol",
+        "present", "AETERM", [SPAN], value="ORAL",
+        prior_availability="not_collected",
     )
-    assert recovered.availability == "collected"
-    assert recovered.structured_availability == "not_collected_by_protocol"
-    assert recovered.from_text
+    assert recovered.availability == "observed"
+    assert recovered.structured_availability == "not_collected"
 
 
-# -- constructors ----------------------------------------------------------
+def test_verdicts_and_the_ascertained_set():
+    assert VERDICTS == ("case", "non_case", "review", "not_ascertainable")
+    assert ASCERTAINED == frozenset({"case", "non_case"})
+    assert "not_ascertainable" not in ASCERTAINED
+    assert "review" not in ASCERTAINED
 
 
-def test_each_route_produces_the_method_it_claims():
-    assert Attribute[str].direct("CHEST", "AELOC", [span()]).method == "direct"
-    assert Attribute[str].normalized("CHEST", "SUPPAE.RASHSITE").method == "normalized"
-    assert Attribute[str].extracted("CHEST", "AETERM", [span()]).method == "extracted"
-    assert Attribute[str].unavailable("unknown").method is None
-
-
-def test_a_route_reads_back_as_a_sentence():
-    attribute = Attribute[str].direct("CHEST", "AELOC", [span()])
-    assert attribute.describe_route() == "'CHEST' via direct from AELOC"
-    assert Attribute[str].unavailable(
-        "not_collected_by_protocol"
-    ).describe_route() == "not_collected_by_protocol"
-
-
-def test_a_populated_attribute_without_provenance_is_a_defect():
-    assert Attribute[str].normalized("CHEST", "SUPPAE.X").has_provenance() is False
-    assert Attribute[str].unavailable("unknown").has_provenance() is True
-
-
-def test_a_date_attribute_round_trips():
-    attribute = Attribute[_dt.date].direct(
-        _dt.date(2024, 2, 6), "AESTDTC", [span("onset")]
+def test_date_attribute_is_generic():
+    onset = Attribute[_dt.date].direct(
+        "present", "AESTDTC", [SPAN], value=_dt.date(2022, 4, 1)
     )
-    assert attribute.value == _dt.date(2024, 2, 6)
-    restored = Attribute[_dt.date].model_validate_json(attribute.model_dump_json())
-    assert restored.value == attribute.value
+    assert onset.value.year == 2022

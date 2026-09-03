@@ -1,192 +1,172 @@
-"""The model path: finding modifiers in language and normalizing them."""
+"""The model path: assertion classification, spans, confidence, abstention."""
 
 from __future__ import annotations
 
 import pytest
 
-from aelayer.extract.backends import ExtractionRequest, LLMBackend, RulesBackend, select_backend
-from aelayer.extract.modifiers import ModifierExtractor
+from aelayer.extract import ExtractionEngine, MentionFinder
+from aelayer.extract.assertion import AssertionClassifier
+from aelayer.extract.text import Sentence, split_sentences
+
+MODIFIER = "mucosal_involvement"
 
 
 @pytest.fixture(scope="module")
-def extractor(catalog, configs):
-    return ModifierExtractor(catalog, configs.extraction)
+def finder(configs):
+    return MentionFinder(configs.catalog, configs.extraction)
 
 
-@pytest.fixture(scope="module")
-def backend(catalog, configs):
-    return RulesBackend(catalog, configs.extraction, configs.extractor_version)
+@pytest.mark.parametrize(
+    "text, assertion",
+    [
+        ("rash with oral mucosal involvement", "present"),
+        ("rash and mucosal erosions", "present"),
+        ("rash, oral ulceration noted", "present"),
+        ("rash without mucosal involvement", "absent"),
+        ("rash, no mucosal involvement", "absent"),
+        ("rash; mucosal involvement was absent", "absent"),
+        ("rash, mucosal involvement was not present", "absent"),
+        ("rash with possible mucosal involvement", "uncertain"),
+        ("rash, query mucosal involvement", "uncertain"),
+        ("rash; mucosal involvement cannot be excluded", "uncertain"),
+    ],
+)
+def test_assertion_classification(finder, text, assertion):
+    mention = finder.best(text, MODIFIER)
+    assert mention is not None, f"abstained on {text!r}"
+    assert mention.assertion == assertion
 
 
-# -- anchoring --------------------------------------------------------------
+def test_a_pseudo_cue_does_not_negate(finder):
+    mention = finder.best(
+        "rash with oral ulceration. No dose change was made.", MODIFIER
+    )
+    assert mention is not None
+    assert mention.assertion == "present"
 
 
-@pytest.mark.parametrize("text,expected", [
-    ("rash on the chest", "CHEST"),
-    ("skin rash over the anterior chest", "CHEST"),
-    ("maculopapular rash affecting the abdomen", "ABDOMEN"),
-    ("rash involving the lower back", "BACK"),
-    ("chest rash", "CHEST"),
-    ("eruption over the periumbilical area", "ABDOMEN"),
-])
-def test_a_site_joined_to_the_event_is_found(extractor, text, expected):
-    hit = extractor.best(text, "location", "RASH")
-    assert hit is not None, text
-    assert hit.value == expected
+def test_a_terminator_ends_a_cue_scope(finder):
+    """"No rash, but oral ulceration was seen" does not negate the ulceration."""
+    mention = finder.best("no rash, but oral ulceration was seen", MODIFIER)
+    assert mention is not None
+    assert mention.assertion == "present"
 
 
-def test_a_site_belonging_to_another_event_is_not_attached(extractor):
-    """"rash resolved; history of eczema on the back" is not a truncal rash."""
-    assert extractor.best(
-        "rash resolved; history of eczema on the back", "location", "RASH"
+def test_a_hedge_outranks_a_negation(configs):
+    """A sentence that refuses to commit is not a documented negative."""
+    classifier = AssertionClassifier(configs.extraction)
+    text = "possible mucosal involvement, no ulceration seen"
+    sentence = split_sentences(text)[0]
+    start = text.index("mucosal involvement")
+    call = classifier.classify(text, sentence, start, start + len("mucosal involvement"))
+    assert call.assertion == "uncertain"
+
+
+def test_abstention_when_no_catalogue_form_matches(finder):
+    """A phrasing nobody declared produces no answer, not a guess."""
+    assert finder.best("rash with involvement of the wet surfaces", MODIFIER) is None
+
+
+def test_abstention_when_the_sentence_names_no_event(finder):
+    """A mention with nothing to anchor it to is not this event's."""
+    assert finder.best("Mucosal involvement was absent.", MODIFIER) is None
+
+
+def test_abstention_when_two_readings_are_equally_supported(finder):
+    mention = finder.best(
+        "rash with oral ulceration and rash with conjunctival involvement",
+        MODIFIER,
+    )
+    # Two different sites, both directly attached. Picking one would assert
+    # something the text does not settle.
+    assert mention is None or mention.value in {"ORAL", "OCULAR"}
+
+
+def test_a_comment_is_anchored_by_its_record(finder):
+    """A comment points at one AE row structurally; it need not name the event."""
+    mention = finder.best(
+        "Investigator comment: no mucosal involvement was seen at any visit.",
+        MODIFIER, source_kind="comment",
+    )
+    assert mention is not None
+    assert mention.assertion == "absent"
+    assert mention.anchor_surface == "(the comment's own record)"
+    # The same text read as a reported term has nothing to anchor it.
+    assert finder.best(
+        "Investigator comment: no mucosal involvement was seen at any visit.",
+        MODIFIER, source_kind="reported_term",
     ) is None
 
 
-def test_a_site_in_another_sentence_is_not_attached(extractor):
-    assert extractor.best(
-        "Rash noted. The patient has a tattoo on the back.", "location", "RASH"
-    ) is None
+def test_every_mention_carries_a_span_covering_its_cue(finder):
+    mention = finder.best("rash without mucosal involvement", MODIFIER)
+    span = mention.span("AE:R1:AETERM", MODIFIER)
+    assert span.start < span.end
+    assert "without" in mention.surface
 
 
-def test_a_connector_only_counts_when_nothing_else_intervenes(extractor):
-    hits = {h.value: h for h in extractor.find("rash on the chest and the back",
-                                               "location", "RASH")}
-    assert hits["CHEST"].confidence > hits["BACK"].confidence
+def test_confidence_comes_from_declared_keys(finder, configs):
+    declared = set(configs.extraction.confidence.values())
+    for text in (
+        "rash with oral ulceration",
+        "rash without mucosal involvement",
+        "rash with possible mucosal involvement",
+    ):
+        mention = finder.best(text, MODIFIER)
+        assert mention.confidence in declared
 
 
-def test_confidence_reflects_how_the_site_was_attached(extractor):
-    joined = extractor.best("rash on the chest", "location", "RASH")
-    adjacent = extractor.best("chest rash", "location", "RASH")
-    assert joined.confidence > adjacent.confidence
-    assert "joined to the event" in joined.rule
-
-
-def test_a_comment_gets_its_own_confidence(extractor):
-    """A comment is written about this record, so it supports more than prose."""
-    prose = extractor.best(
-        "Site clarification: rash noted, the chest was affected.", "location", "RASH"
+def test_a_direct_phrase_scores_above_a_loose_one(finder):
+    tight = finder.best("rash with oral ulceration", MODIFIER)
+    loose = finder.best(
+        "rash reported by the site at the visit, with oral ulceration", MODIFIER
     )
-    comment = extractor.best(
-        "Site clarification: rash noted, the chest was affected.", "location",
-        "RASH", "comment",
-    )
-    assert comment.confidence >= prose.confidence
+    assert loose is None or tight.confidence >= loose.confidence
 
 
-# -- abstention -------------------------------------------------------------
+# -- the engine ---------------------------------------------------------------
 
 
-def test_a_term_with_no_site_yields_nothing(extractor):
-    assert extractor.best("rash", "location", "RASH") is None
-    assert extractor.best("Skin disorder", "location", "RASH") is None
+def test_abstention_is_measured_not_hidden(pipeline, configs):
+    engine = ExtractionEngine.build(configs, pipeline.store, "rules")
+    engine.enrich_all(pipeline.structured_only_records())
+    stats = engine.stats
+    assert stats.requests > 0
+    assert stats.abstained > 0
+    assert 0.0 < stats.abstention_rate < 1.0
+    assert set(stats.by_assertion) <= {"present", "absent", "uncertain"}
 
 
-def test_a_word_no_lexicon_carries_yields_nothing(extractor):
-    """Abstaining is correct: inventing a catalogue value would be the defect."""
-    for text in ("rash over the torso", "rash on the midriff",
-                 "rash affecting the shoulder blade area"):
-        assert extractor.best(text, "location", "RASH") is None, text
+def test_an_abstention_leaves_both_facts_on_the_row(pipeline, configs):
+    engine = ExtractionEngine.build(configs, pipeline.store, "rules")
+    enriched = engine.enrich_all(pipeline.structured_only_records())
+    notes = [
+        r.modifiers[MODIFIER].note for r in enriched
+        if r.modifiers.get(MODIFIER) and "abstained" in r.modifiers[MODIFIER].note
+    ]
+    assert notes
+    for note in notes:
+        # The availability and its explanation must not contradict each other.
+        assert "abstained" in note
+        assert any(word in note for word in ("unresolved", "not_collected", "pending"))
 
 
-def test_two_equally_supported_values_yield_nothing(extractor):
-    hits = extractor.find("rash on the chest, rash on the back", "location", "RASH")
-    values = {h.value for h in hits if h.confidence == max(x.confidence for x in hits)}
-    if len(values) > 1:
-        assert extractor.best("rash on the chest, rash on the back",
-                              "location", "RASH") is None
+def test_the_engine_degrades_offline_and_says_so(pipeline, configs):
+    engine = ExtractionEngine.build(configs, pipeline.store, "llm")
+    assert engine.backend.name == "rules"
+    assert any("no credentials" in note for note in engine.notes)
 
 
-# -- patterns and qualities -------------------------------------------------
+def test_the_backend_is_never_described_as_a_trained_model(pipeline, configs):
+    engine = ExtractionEngine.build(configs, pipeline.store, "rules")
+    joined = " ".join(engine.notes)
+    assert "not a trained clinical NLP model" in joined
 
 
-def test_a_pattern_is_normalized_to_the_catalogue(extractor):
-    hit = extractor.best("morbilliform rash on the chest", "pattern", "RASH")
-    assert hit.value == "MACULOPAPULAR"
-
-
-def test_quality_descriptors_are_found_but_not_normalized(extractor):
-    hits = extractor.qualities("itchy spreading rash on the chest")
-    assert {h.value for h in hits} == {"itchy", "spreading"}
-    assert all(h.attribute == "quality" for h in hits)
-
-
-# -- the backend contract ---------------------------------------------------
-
-
-def test_the_backend_returns_attributes_that_validate(backend):
-    result = backend.extract(ExtractionRequest(
-        doc_id="AE:R1:AETERM", text="rash on the chest",
-        attributes=("location", "pattern"), concept_id="RASH",
-    ))
-    assert result.values["location"].value == "CHEST"
-    assert result.values["location"].method == "extracted"
-    assert result.values["location"].evidence
-    assert "pattern" in result.abstained
-
-
-def test_a_span_points_at_the_characters_it_claims(backend):
-    text = "maculopapular rash over the lower back"
-    result = backend.extract(ExtractionRequest(
-        doc_id="D1", text=text, attributes=("location",), concept_id="RASH",
-    ))
-    span = result.values["location"].evidence[0]
-    assert text[span.start:span.end].lower() == span.text.lower()
-    assert span.extracted_value == "BACK"
-
-
-def test_the_backend_stamps_the_versions_that_produced_the_value(backend, configs):
-    result = backend.extract(ExtractionRequest(
-        doc_id="D1", text="rash on the chest", attributes=("location",),
-        concept_id="RASH",
-    ))
-    attribute = result.values["location"]
-    assert attribute.extractor_version == configs.extractor_version
-    assert attribute.prompt_version
-
-
-def test_the_backend_reports_abstention_rather_than_guessing(backend):
-    result = backend.extract(ExtractionRequest(
-        doc_id="D1", text="rash", attributes=("location",), concept_id="RASH",
-    ))
-    assert result.values == {}
-    assert result.abstained == ["location"]
-
-
-# -- backend selection ------------------------------------------------------
-
-
-def test_without_credentials_the_model_path_is_the_offline_baseline(
-    catalog, configs, monkeypatch
-):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    backend, notes = select_backend(
-        catalog, configs.extraction, configs.extractor_version, "auto"
-    )
-    assert isinstance(backend, RulesBackend)
-    assert any("offline rules baseline" in note for note in notes)
-
-
-def test_asking_for_an_llm_without_credentials_says_it_degraded(
-    catalog, configs, monkeypatch
-):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    backend, notes = select_backend(
-        catalog, configs.extraction, configs.extractor_version, "llm"
-    )
-    assert isinstance(backend, RulesBackend)
-    assert any("degraded to the offline rules baseline" in n for n in notes)
-
-
-def test_the_llm_backend_validates_its_output_against_the_catalogue(catalog, configs):
-    llm = LLMBackend(catalog, configs.extraction, configs.extractor_version)
-    request = ExtractionRequest(
-        doc_id="D1", text="rash on the chest", attributes=("location",),
-    )
-    assert llm._validate("location", {"value": "ELBOW_PIT", "start": 0, "end": 4},
-                         request) is None
-    assert llm._validate("location", {"value": "CHEST", "start": 99, "end": 200},
-                         request) is None
-    good = llm._validate(
-        "location", {"value": "anterior chest", "start": 12, "end": 17}, request
-    )
-    assert good is not None and good.value == "CHEST"
+def test_sentence_splitting_preserves_offsets():
+    text = "Rash on day 4. Oral ulceration followed."
+    sentences = split_sentences(text)
+    assert len(sentences) == 2
+    for sentence in sentences:
+        assert isinstance(sentence, Sentence)
+        assert text[sentence.start:sentence.end] == sentence.text

@@ -1,23 +1,19 @@
-"""The evaluation harnesses: ablation, availability, transport, invariance."""
+"""The evaluation harness and its caveats."""
 
 from __future__ import annotations
 
 import pytest
 
 from aelayer.eval.harness import (
-    ABLATION_NOTE,
-    DISCLAIMER,
-    INVARIANCE_CAVEAT,
-    EvaluationHarness,
-    run_evaluation,
+    DISCLAIMER, INVARIANCE_CAVEAT, SILENCE_CAVEAT, EvaluationHarness,
 )
 from aelayer.eval.report import render_markdown
 from aelayer.eval.transport import DEVELOPMENT_PROFILES, transportability
 
 
 @pytest.fixture(scope="module")
-def harness(pipeline, definition_v1):
-    return EvaluationHarness.build(pipeline, definition_v1)
+def harness(pipeline, definition_v2):
+    return EvaluationHarness.build(pipeline, definition_v2)
 
 
 @pytest.fixture(scope="module")
@@ -25,173 +21,146 @@ def results(harness):
     return harness.run_all()
 
 
-# -- phenotype --------------------------------------------------------------
+# -- the phenotype numbers ----------------------------------------------------
 
 
-def test_the_not_ascertainable_rate_is_a_first_class_number(results):
-    pooled = results["phenotype"]["pooled"]
+def test_the_not_ascertainable_rate_is_its_own_number(harness):
+    pooled = harness.phenotype()["pooled"]
     assert "not_ascertainable_rate" in pooled
-    assert pooled["not_ascertainable_predicted"] > 0
-    assert 0.0 <= pooled["not_ascertainable_rate"] <= 1.0
-    # It is not folded into the negatives.
-    assert pooled["fp"] + pooled["tp"] == pooled["predicted_cases"]
+    assert 0.0 < pooled["not_ascertainable_rate"] < 1.0
+    assert pooled["ppv"] > 0 and pooled["sensitivity"] > 0
 
 
-def test_the_not_ascertainable_rate_is_reported_per_profile(results):
-    per_profile = results["phenotype"]["per_profile"]
-    assert per_profile["P3_prespecified"]["not_ascertainable_rate"] > 0
-    assert per_profile["P1_structured"]["not_ascertainable_rate"] < \
-        per_profile["P3_prespecified"]["not_ascertainable_rate"]
-
-
-def test_cases_are_attributed_to_the_routes_that_produced_them(results):
-    phenotype = results["phenotype"]
-    assert set(phenotype["attribute_methods"]) <= {"direct", "normalized", "extracted"}
-    assert phenotype["cases_depending_on_text"] > 0
-
-
-# -- ablation ---------------------------------------------------------------
-
-
-def test_the_ablation_names_what_text_recovery_is_worth(results):
-    ablation = results["ablation"]
-    assert ablation["note"] == ABLATION_NOTE
-    assert ablation["cases_with_text"] > ablation["cases_structured_only"]
-    assert ablation["cases_only_findable_through_text"] > 0
-    assert 0.0 < ablation["fraction_only_findable_through_text"] <= 1.0
-
-
-def test_the_ablation_shows_text_resolving_unascertainable_episodes(results):
-    """Without text those events are not negatives — they are unanswerable."""
-    ablation = results["ablation"]
-    assert ablation["not_ascertainable_structured_only"] > \
-        ablation["not_ascertainable_with_text"]
-    assert ablation["not_ascertainable_resolved_by_text"] > 0
-
-
-def test_the_ablation_runs_the_same_definition_both_times(harness, results):
-    """Only the accepted routes differ, so nothing else can explain the gap."""
-    examples = results["ablation"]["examples"]
-    assert examples
-    assert {e["profile"] for e in examples} <= {"P2_text", "P5_comment", "P6_both"}
-    assert all(e["without_text"] != "case" for e in examples)
-
-
-# -- availability -----------------------------------------------------------
-
-
-def test_the_availability_matrix_separates_the_kinds_of_missing(results):
-    availability = results["availability"]
-    assert availability["confusion"]["total"] > 0
-    assert availability["accuracy"] > 0.9
-    # The failure that quietly biases everything downstream.
-    assert availability["missing_read_as_collected"] == 0
-
-
-def test_not_collected_is_never_read_as_a_negative(records):
-    for record in records:
-        if record.location.availability == "not_collected_by_protocol":
-            assert not record.location.is_evidence_of_absence
-
-
-# -- transport --------------------------------------------------------------
-
-
-def test_the_holdout_is_by_study_not_by_row(results):
-    transport = results["transport"]
-    assert transport["split"] == "whole_study"
-    assert "never rows" in transport["note"]
-    assert not set(transport["development_profiles"]) & set(
-        transport["held_out_profiles"]
+def test_per_study_numbers_are_reported_separately(harness):
+    per_study = harness.phenotype()["per_study"]
+    assert len(per_study) == 7
+    absent = next(
+        m for study, m in per_study.items() if m["not_ascertainable_rate"] == 1.0
+    )
+    assert absent["ppv"] == 0.0, (
+        "a study that cannot ascertain anything should not report a PPV above 0"
     )
 
 
-def test_the_development_side_is_the_profiles_the_rules_were_written_against(results):
-    assert set(results["transport"]["development_profiles"]) == set(
-        DEVELOPMENT_PROFILES
+# -- silence versus a documented negative -------------------------------------
+
+
+def test_silence_is_never_read_as_an_assertion(harness):
+    body = harness.assertion_confusion()
+    assert body["silence_read_as_an_assertion"] == 0, (
+        "the system invented an assertion where the source said nothing"
     )
 
 
-def test_a_custom_holdout_is_honoured(pipeline, definition_v1):
-    result = transportability(pipeline, definition_v1, ["P6_both"])
-    assert result["held_out_profiles"] == ["P6_both"]
-    assert len(result["development_profiles"]) == 5
+def test_documented_negatives_are_recovered_or_missed_never_flipped(harness):
+    body = harness.assertion_confusion()
+    matrix = body["assertion_matrix"]
+    assert body["documented_negatives_recovered"] > 0
+    # An absence may be missed (read as silence) but must never be read as a
+    # presence: that would turn a non-case into a case.
+    assert matrix.get("absent", "present") == 0
 
 
-def test_holding_out_everything_is_refused(pipeline, definition_v1, profiles):
-    with pytest.raises(ValueError, match="at least one profile on each side"):
-        transportability(pipeline, definition_v1, profiles.profile_ids())
+def test_the_silence_caveat_is_stated(harness):
+    assert "biases" in SILENCE_CAVEAT or "wrong by however many" in SILENCE_CAVEAT
+    assert harness.assertion_confusion()["caveat"] == SILENCE_CAVEAT
 
 
-def test_holding_out_an_unknown_profile_is_refused(pipeline, definition_v1):
-    with pytest.raises(ValueError, match="no such profile"):
-        transportability(pipeline, definition_v1, ["P9_imaginary"])
+# -- invariance ---------------------------------------------------------------
 
 
-def test_the_report_says_the_gap_is_not_overfitting(results):
-    assert "not overfitting" in results["transport"]["not_fitted"]
+def test_invariance_says_it_is_not_validity(harness):
+    body = harness.invariance()
+    assert body["caveat"] == INVARIANCE_CAVEAT
+    assert "is not clinical validity" in body["caveat"]
+    assert "consistently wrong" in body["caveat"]
 
 
-# -- invariance -------------------------------------------------------------
-
-
-def test_invariance_separates_raw_agreement_from_supported_agreement(results):
-    invariance = results["invariance"]
-    assert invariance["truths_compared"] > 0
-    assert invariance["agreement_where_evidence_supports_it"] >= \
-        invariance["raw_agreement"]
-
-
-def test_invariance_states_what_it_does_not_establish(results):
-    caveat = results["invariance"]["caveat"]
-    assert "Consistency across representations is not clinical validity" in caveat
-    assert caveat == INVARIANCE_CAVEAT
-
-
-# -- reproducibility --------------------------------------------------------
-
-
-def test_the_same_inputs_produce_the_same_run_twice(results):
-    repro = results["reproducibility"]
-    assert repro["manifest_id_stable"]
-    assert repro["results_stable"]
-    assert repro["normalization_stable"]
-
-
-# -- the report -------------------------------------------------------------
-
-
-def test_the_report_disclaims_before_any_number(results):
-    body = render_markdown(results)
-    assert DISCLAIMER in body
-    assert body.index(DISCLAIMER) < body.index("## Silver standard")
-
-
-def test_the_report_labels_the_silver_standard_as_silver(results):
-    body = render_markdown(results)
-    assert "Silver standard" in body
-    assert "not ground truth" in body
-
-
-def test_the_report_names_every_version_behind_the_numbers(results):
-    body = render_markdown(results)
-    for value in (
-        results["versions"]["normalizer_version"],
-        results["versions"]["extractor_version"],
-        results["definition"]["hash"],
-    ):
-        assert value in body
-
-
-def test_run_evaluation_writes_where_it_is_told(pipeline, tmp_path):
-    results, written = run_evaluation(
-        pipeline, "te_truncal_rash", 1, tmp_path / "nested" / "eval.md"
+def test_invariance_is_measured_where_evidence_supports_it(harness):
+    body = harness.invariance()
+    assert body["truths_compared"] > 0
+    assert body["agreement_where_evidence_supports_it"] >= body["raw_agreement"], (
+        "a study that could not record the modifier is being counted as a "
+        "disagreement, which punishes the system for a collection decision"
     )
-    assert written.exists()
-    assert written.read_text(encoding="utf-8").startswith("# Adverse event")
-    assert results["definition"]["version"] == 1
 
 
-def test_run_evaluation_can_be_asked_for_no_report(pipeline):
-    _results, written = run_evaluation(pipeline, "te_truncal_rash", 1, None)
-    assert written is None
+# -- transportability ---------------------------------------------------------
+
+
+def test_the_holdout_is_by_study_never_by_row(pipeline, definition_v2):
+    body = transportability(pipeline, definition_v2)
+    assert body["split"] == "whole_study"
+    assert body["row_splits"] == "disallowed"
+    assert set(body["development_profiles"]) == set(DEVELOPMENT_PROFILES)
+    assert not set(body["development_profiles"]) & set(body["held_out_profiles"])
+
+
+def test_the_holdout_reports_a_drop_and_says_nothing_is_fitted(pipeline,
+                                                               definition_v2):
+    body = transportability(pipeline, definition_v2)
+    assert "sensitivity_drop" in body
+    assert "is fitted to data" in body["not_fitted"]
+    assert body["held_out"]["not_ascertainable_rate"] > \
+        body["development"]["not_ascertainable_rate"], (
+            "the held-out studies are supposed to be harder to ascertain"
+        )
+
+
+def test_an_unknown_holdout_profile_is_refused(pipeline, definition_v2):
+    with pytest.raises(ValueError) as exc:
+        transportability(pipeline, definition_v2, ["P_nonexistent"])
+    assert "no such profile" in str(exc.value)
+
+
+def test_a_split_needs_both_sides(pipeline, definition_v2, profiles):
+    with pytest.raises(ValueError):
+        transportability(pipeline, definition_v2, profiles.profile_ids())
+
+
+# -- reproducibility ----------------------------------------------------------
+
+
+def test_identical_inputs_reproduce_identically(harness):
+    body = harness.reproducibility(repeats=2)
+    assert body["manifest_id_stable"]
+    assert body["results_stable"]
+    assert body["normalization_stable"]
+
+
+# -- the report ---------------------------------------------------------------
+
+
+def test_the_report_leads_with_the_disclaimer_and_the_decision(results):
+    markdown = render_markdown(results)
+    assert markdown.index(DISCLAIMER) < markdown.index("## The decision")
+    assert markdown.index("## The decision") < markdown.index("## Phenotype")
+
+
+def test_the_report_prints_both_silver_caveats_verbatim(results):
+    from aelayer.silver import SILVER_CAVEATS
+
+    markdown = render_markdown(results)
+    for caveat in SILVER_CAVEATS:
+        assert caveat in markdown
+
+
+def test_the_report_prints_the_denominator_note(results):
+    from aelayer.models import DENOMINATOR_NOTE
+
+    assert DENOMINATOR_NOTE in render_markdown(results)
+
+
+def test_the_report_states_the_decision_in_bold(results):
+    markdown = render_markdown(results)
+    assert f"**{results['ablation']['decision']}**" in markdown
+
+
+def test_the_report_writes_to_disk(pipeline, tmp_path):
+    from aelayer.eval.harness import run_evaluation
+
+    _results, path = run_evaluation(
+        pipeline, "cutaneous_mucosal", 2, report_path=tmp_path / "r.md"
+    )
+    assert path.exists()
+    assert "evaluation report" in path.read_text()
