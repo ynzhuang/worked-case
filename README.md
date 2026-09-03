@@ -1,19 +1,30 @@
 # Adverse event evidence layer
 
 A working prototype of a clinical evidence layer over completed-trial adverse
-event data. It takes one clinically relevant attribute — **anatomical
-location** — and reads it out of whichever of **five different places** a study
-happened to record it, into a single provenance-bearing shape. Above that it
-derives episodes and trajectories, evaluates **versioned phenotype definitions**
-with four verdicts, and scores its own text extraction against a **silver
-standard** built from the studies' own structured fields.
+event data.
+
+The worked example is a **cutaneous event with mucosal involvement within 30
+days of first exposure**. That question is hard for one specific reason: the
+modifier — *mucosal involvement* — is recorded in a different place by every
+study. A structured qualifier here, a linked form there, the investigator's own
+words somewhere else, a comment record, or nowhere at all. This layer reads all
+five into one provenance-bearing shape and runs one versioned phenotype
+definition across them.
+
+Two things in this build are the point of it:
 
 ```bash
-make demo      # generate, normalize, extract, score, evaluate — offline, ~1s
-make silver    # the centrepiece: extraction vs the study's own structured field
-make eval      # every harness -> reports/eval.md
-make serve     # the API and the single-page UI on http://127.0.0.1:8000/
-make test      # 241 tests, 86% statement coverage
+make ablation   # is reading narrative text worth it? Ends in a DECISION.
+make silver     # what the extraction is worth, with both caveats printed.
+```
+
+If only those two work, the prototype has done its job.
+
+```bash
+make demo       # the whole path end to end, offline, ~10s
+make eval       # every harness -> reports/evaluation.md
+make serve      # the API and the single-page UI on http://127.0.0.1:8000/
+make test       # 299 tests, 89% statement coverage
 ```
 
 ---
@@ -22,323 +33,445 @@ make test      # 241 tests, 86% statement coverage
 
 **All data is synthetic.** The repository generates its own corpus. No real
 patient data, and nothing derived from real patient data, is present anywhere
-here. Every table row carries a `SYNTHETIC` column.
+here. Every table row carries a `SYNTHETIC` column and every narrative carries a
+synthetic header.
 
 **The extraction backend is a configurable rule and lexicon baseline.** By
-default it is a deterministic system of dictionaries and scope rules driven
-entirely by `config/`. It is not a trained clinical NLP model and must not be
-described as one. An LLM backend can be swapped in behind the same interface;
-the manifest records which one ran, and with the network disconnected the model
-path degrades to the rules baseline and says so.
+default it is a deterministic system of dictionaries and cue-scoping rules
+driven entirely by `config/`. It is not a trained clinical NLP model and must
+not be described as one. Its recall is exactly the surface forms somebody wrote
+into the catalogue — a property of the configuration, not of the method. An LLM
+backend can be swapped in behind the same interface; the manifest records which
+one ran, and with the network disconnected the model path degrades to the rules
+baseline and says so in its notes.
 
 **Coded terms in the configuration are illustrative placeholders.** This
 repository holds no terminology licence and ships no licensed dictionary
 content. The terms in `config/concepts.yaml` are stand-ins with the right
-*shape* — a preferred term, lower-level terms, and different sets under
-different dictionary versions — so that version bridging can be exercised.
+*shape* — several legitimate codings of one clinical situation, a code renamed
+between dictionary versions, and a code that disappears from the target version
+— so that concept-set membership and version reconciliation can be exercised.
+Replace them with a licensed extract before any real use.
 
 **The metrics measure signal recovery, not clinical performance.** Gold labels
-are the generator's own intent. A number in `reports/eval.md` says the pipeline
-recovered a signal that was deliberately planted in a corpus it also wrote.
+are the generator's own intent, so the numbers measure whether the pipeline
+recovers a signal that was deliberately planted. They are not an estimate of
+performance on real clinical text.
 
-**Nothing is trained.** There is no model in this repository to train, and no
-code path that fits parameters to data.
-
-### What this is not
-
-- Not a replacement for coding. Coded terms are inputs: preserved, and used.
-- Not a pharmacovigilance system. It supports secondary research on locked data.
-- Not a clinical decision support tool.
-- Not a claim that consistency is validity. See *Representation invariance*.
+**Model training is out of scope.** Nothing here is fitted to data. The
+transportability gap therefore measures how much harder the held-out collection
+conventions are, not overfitting.
 
 ---
 
-## The claim
+## The one idea
 
-One clinically relevant attribute can live in any of five places, and which one
-applies is a per-study collection decision:
+Two fields, never merged:
 
-| # | home | example variable |
-| --- | --- | --- |
-| 1 | a standard structured qualifier | `AELOC` |
-| 2 | a sponsor-defined supplemental variable | `SUPPAE.RASHSITE` |
-| 3 | the investigator-reported term | `AETERM` — "skin rash on chest" |
-| 4 | a linked comment | `CO.COVAL` |
-| 5 | nowhere | — |
+| field | question it answers | values |
+|---|---|---|
+| `assertion` | what did the source **say**? | `present` · `absent` · `uncertain` |
+| `availability` | did the source say **anything**? | `observed` · `not_collected` · `not_applicable` · `pending` · `unresolved` |
 
-Terminology guidance is why (3) happens routinely: where no available term
-covers both the event and the body site, the **event** term is selected and the
-site is not carried in the coded term. Nothing is coded incorrectly. The site
-simply survives somewhere else, or not at all.
+A record with `assertion=absent` is a patient somebody examined and found clear.
+That is a **`non_case`**, and they belong in the denominator.
 
-**The consequence this prototype demonstrates:** one versioned rule runs across
-all five, returning the same verdict where the evidence supports it and
-`not_ascertainable` where it does not.
+A record with `availability=not_collected` is silence. Nobody looked. That
+patient belongs in **neither** the numerator nor the denominator.
 
----
-
-## The worked example
-
-Concept **rash**; modifiers **location** and **pattern**. `te_truncal_rash` v1
-requires a rash concept, a location in {CHEST, ABDOMEN, BACK}, and an onset
-within 14 days of first exposure.
-
-| | P1 | P2 | P3 | P4 | P5 | P6 |
-| --- | --- | --- | --- | --- | --- | --- |
-| coded event | rash | rash | rash | rash | rash | rash |
-| location home | `AELOC` | `AETERM` | none | `SUPPAE.RASHSITE` | `CO.COVAL` | `AELOC` + `AETERM` |
-| reported term | terse | rich | prespecified | terse | terse | rich |
-| method | direct | extracted | — | normalized | extracted | direct |
-| verdict | case | case | **not ascertainable** | case | case | case |
-
-**P3 is the one to get right.** The rash is real, the timing qualifies, and the
-phenotype still cannot be evaluated. That is not a negative case, and it is not
-a review item either — no reviewer can settle it. It is counted and reported on
-its own.
-
-P6 is the evaluation profile: it records the location in a structured variable
-*and* in the investigator's own words, which is what makes a silver standard
-possible without anyone hand-annotating anything.
-
----
-
-## The data model
+Collapse those two into one "missing" flag and every rate the system reports is
+wrong by however many patients were never examined. The model refuses to
+represent the merged state at all:
 
 ```python
-Method     = Literal["direct", "normalized", "extracted"]        # never "inferred"
-SourceKind = Literal["structured_standard", "structured_sponsor",
-                     "reported_term", "comment", "linked_form", "derived"]
-Availability = Literal["collected", "not_collected_by_protocol",
-                       "not_applicable_gated", "pending_ongoing",
-                       "not_representable", "unknown"]
-
-class Attribute(BaseModel, Generic[T]):
-    value: T | None
-    source: SourceKind | None
-    source_variable: str | None      # "AELOC", "AETERM", "SUPPAE.RASHSITE", "CO.COVAL"
-    method: Method | None
-    evidence: list[Span] = []        # required whenever method == "extracted"
-    availability: Availability
+Attribute[str](availability="not_collected", assertion="absent")
+# ValidationError: availability 'not_collected' means the source is silent, so
+# it cannot assert 'absent'; assertion and availability are orthogonal and must
+# never be merged
 ```
 
-Four invariants, each enforced in the model and asserted by a test:
-
-- `method == "extracted"` ⟹ at least one span. A value with no text behind it
-  cannot be checked by anyone.
-- `method == "direct"` ⟹ `source == "structured_standard"`, and no model
-  touched it.
-- `availability != "collected"` ⟹ `value is None`. Only a collected attribute
-  has one.
-- **There is no `inferred`.** A value the system worked out for itself, with
-  nothing in the source to point at, is not an attribute of a patient. A test
-  asserts the word appears nowhere in the package.
-
-Source records are immutable. Episodes and trajectories derive above them and
-can be recomputed; deleting them loses nothing.
-
----
-
-## The deterministic and model paths, enforced in code
-
-The deterministic path reads structured variables — `direct` from a standard
-one, `normalized` through a declared sponsor mapping. The model path reads
-language, and only language.
-
-```python
-from aelayer.guards import assert_model_path_permitted, askable_attributes
-```
-
-Every model request passes through the guard, which refuses one that names an
-already-settled attribute or reads a structured source. A test asserts, over
-every record in the corpus, that no structured value ever reaches a backend, and
-`config/extraction.yaml` cannot even *declare* a structured source readable.
-
-**Abstention is correct behaviour.** Where the text does not support a value the
-backend returns nothing and says so, and the abstention rate is reported as a
-metric rather than counted as a failure. A phrase no lexicon carries — "torso",
-"midriff", "shoulder blade area" — produces an abstention, not a guess.
-
----
-
-## The silver-standard harness
-
-`make silver` — this is the piece that turns the prototype from a demo into
-something that reports real numbers.
-
-For a study that records the location in **both** a structured variable and the
-reported term:
-
-1. mask the structured variable from the extractor
-2. run the model path over the text alone
-3. normalize both sides to the concept catalogue
-4. compare the extracted value against the masked structured value
-
-It is called a **silver** standard everywhere it is reported, never ground
-truth. The structured field has its own error rate — a site can mistype a coded
-qualifier as easily as it can write an ambiguous phrase — so a disagreement
-means the two disagree, not that the extractor is wrong.
-
-The output includes an **adjudication queue**: every disagreement, every
-low-confidence prediction, **and a random sample of agreements**. The sample is
-not optional. Without it you only ever inspect failures and can never estimate
-the silver standard's own error rate.
+There is a test that walks every combination of the two fields and asserts each
+one is explicitly allowed or explicitly refused.
 
 ---
 
 ## Four verdicts
 
+| verdict | meaning | denominator? |
+|---|---|---|
+| `case` | every criterion satisfied | numerator and denominator |
+| `non_case` | a criterion was **evaluated** and failed | denominator |
+| `review` | the evidence exists but does not settle it | neither |
+| `not_ascertainable` | the evidence was never collected in a form this study can answer from | neither |
+
+Without an explicit `non_case` you cannot state a denominator. Incidence is
+computed **within the ascertainable population**, and the **ascertainable
+fraction** is printed beside every rate as a study characteristic:
+
+```
+study       total  case   non   rev   n/a   asc.f  incidence
+STUDY-A        32    11    11     4     6   0.688        0.5
+STUDY-B        33    14     5     2    12   0.576     0.7368
+STUDY-C        32     0     0     0    32   0.000       None   <- collects it nowhere
+STUDY-D        32    11    12     6     3   0.719     0.4783
+STUDY-E        32    12    10     4     6   0.688     0.5455
+STUDY-F        32    11    11     6     4   0.688        0.5
+STUDY-G        32    11     6     4    11   0.531     0.6471
+```
+
+STUDY-C is the one to get right. Qualifying events, qualifying timing, and a
+phenotype that still cannot be evaluated — because the modifier was never
+collected. That is `not_ascertainable`, not a run of negatives.
+
+---
+
+## Seven collection profiles
+
+One clinical truth, rendered seven ways. The profile is a **declared collection
+decision**, never inferred: a study whose profile is not declared cannot be read
+at all, because every silence in it would be guesswork.
+
+| profile | study | modifier lives in | what it demonstrates |
+|---|---|---|---|
+| `P_structured` | STUDY-A | `AEMUCOS` | the direct route; no model touches it |
+| `P_text` | STUDY-B | `AETERM` | survives only in the investigator's own words |
+| `P_absent` | STUDY-C | nowhere | `not_ascertainable`, not a `non_case` |
+| `P_both` | STUDY-D | `AEMUCOS` **and** `AETERM` | the silver-standard evaluation set |
+| `P_negated` | STUDY-E | `AETERM`, stated either way | **an observed negative, told from silence** |
+| `P_version` | STUDY-F | `SC.MUCOSAL` | coded under a superseded dictionary version |
+| `P_concept_variant` | STUDY-G | `CO.COVAL` | a different legitimate coding of the same situation |
+
+`P_negated` matters most. It is the only way to prove the system distinguishes
+an observed negative from silence.
+
+---
+
+## Three normalizations, and only one of them is a model
+
+Three different things get called "normalization". Conflating them is how a
+system ends up with a model quietly rewriting coded fields. `guards.py` enforces
+the separation; a request naming either of the last two raises rather than
+degrading.
+
+**5.1 · Language variation.** The same clinical fact written a dozen ways in
+prose. *This is the only mechanism a model is used for.* Cue-scoped assertion
+classification over declared lexicons, with a span required for every value.
+
+```
+'rash with oral mucosal involvement'          -> present, ORAL,  0.95
+'rash without mucosal involvement'            -> absent,  —,     0.90
+'rash; mucosal involvement cannot be excluded'-> uncertain, —,   0.55
+'rash with involvement of the wet surfaces'   -> (abstained)
+```
+
+Abstention is a valid answer and is measured as a rate. A guess is a defect.
+
+**5.2 · Coded-concept variation.** Several legitimate codings of one clinical
+situation — `Rash`, `Rash erythematous`, `Rash maculopapular`. Resolved by the
+phenotype's **concept set**. Nothing merges them and nothing overwrites either
+one.
+
+**5.3 · Terminology-version variation.** The same concept coded under different
+dictionary versions. Reconciled by a **mechanical 1:1 map** to a declared target
+version. The split is reported, always:
+
+```
+dictionary version reconciliation (mechanical, never a model):
+  unchanged                  213
+  remapped_mechanically       30    Rash erythematous -> Erythematous rash
+  flagged_for_review           9    Rash maculopapular: no code under D-21.0
+```
+
+A code that does not persist is **flagged for review, never auto-recoded**. The
+original code and its source version are preserved on every record; the
+reconciliation sits beside them, never on top of them.
+
+---
+
+## Cross-domain derivation
+
+`exposure_relation` exists in no single field. It is `AE.AESTDTC` minus the
+anchor exposure date from `EX`, computed by governed code and stamped
+`method="derived"`, `source_variable="AE+EX"`:
+
+```
+AE.AESTDTC 2022-04-19 - EX.first_exposure 2022-04-09 = 10 days
+```
+
+Governed computation, never model reasoning, and a reader can tell the
+difference from the record alone.
+
+---
+
+## §8 · The silver-standard harness
+
+STUDY-D records mucosal involvement **twice** — in a structured qualifier and,
+independently of that qualifier, in the investigator's own words. Masking the
+structured value gives a real evaluation set on data nobody hand-annotated.
+
+What is compared is the **assertion**, not just the value. An extractor that
+turned every documented "no" into silence would score perfectly on values while
+destroying the denominator.
+
+```
+                      n  answered  correct  recall  precision
+present              15        12       12   0.800      1.000
+absent                8         2        2   0.250      1.000
+uncertain             6         6        6   1.000      1.000
+
+Brier score              0.0724
+expected calib. error    0.209
+bin             n  mean conf  observed     gap
+[0.4, 0.6)      6      0.550     1.000  -0.450
+[0.6, 0.8)      4      0.780     1.000  -0.220
+[0.8, 1.0]     10      0.940     1.000  -0.060
+```
+
+Calibration is reported because every phenotype definition here thresholds on
+confidence, so an overconfident extractor turns into cases nobody can defend.
+
+The **adjudication queue** contains every disagreement, every low-confidence
+prediction, *and a random sample of agreements*. The sample is not optional:
+without it you only ever inspect failures and can never estimate the
+comparator's own error rate.
+
+### The two caveats, printed verbatim wherever a silver number appears
+
+> **CAVEAT 1 — THE TWO ROUTES ARE NOT INDEPENDENT.** The structured qualifier
+> and the narrative were produced by the same investigator, at the same visit,
+> on the same form, often in the same minute. They share every upstream error: a
+> clinician who did not examine the mucosa records nothing in the qualifier and
+> writes nothing in the term. Agreement between them is therefore an **upper
+> bound** on agreement with an independent adjudicator, not an estimate of it.
+> This is a silver standard, not ground truth, and the comparator has its own
+> error rate.
+
+> **CAVEAT 2 — THE EVALUATION SET IS NOT A RANDOM SUBSET.** Only studies that
+> collect the modifier **both** structurally and in prose can be scored at all.
+> Those studies are, by construction, the ones with the more thorough collection
+> conventions and the more detailed narratives. Performance measured here does
+> not transfer to a study that keeps the modifier only in free text, which is
+> precisely the study the layer is meant to help.
+
+---
+
+## §9 · The value ablation
+
+The experiment that can falsify the proposal. Three cumulative stages, each a
+distinct engineering investment:
+
+| stage | what it reads |
+|---|---|
+| `structured` | coded concepts, structured qualifiers, linked forms, cross-domain derivation. **No model runs at all.** |
+| `+ reported_term` | the model path reads `AETERM` where the structured route left the modifier unresolved |
+| `+ comments` | the model path also reads linked comment records |
+
+```
+stage             eval   asc  asc.f  case   ok  bad   prec  recall
+structured         225    67  0.298    33   33    0  1.000   1.000
+reported_term      225   108  0.480    59   59    0  1.000   0.967
+comments           225   125  0.556    70   70    0  1.000   0.946
+
+structured -> reported_term
+  - 26 correctly ascertained cases added (>= the declared floor of 10)
+  - a 78.8% relative gain over the 33 correct cases the previous stage found
+  - precision on the added cases is 100.0%; 0 of the added cases are wrong
+
+DECISION: ADOPT. Stage 'reported_term' is worth building: it adds 26 correctly
+ascertained cases the previous stage could not reach, at 100% precision on
+those additions.
+```
+
+**The output states a decision, not just numbers.** And "correctly" is
+load-bearing: a stage that finds forty more cases of which thirty are wrong has
+made the cohort worse while making the headline bigger, so precision on the
+*added* cases is a veto rather than a tiebreak. The materiality thresholds live
+in `ablation.py` and were written before the numbers were seen.
+
+The machinery can say no. Run it against `cutaneous_mucosal.v1`, which accepts
+only structured evidence:
+
+```
+DECISION: DO NOT ADOPT. Stage 'reported_term' changed no verdict at all.
+Whatever it recovered was already recorded structurally, or the records fail
+another criterion regardless.
+```
+
+---
+
+## Transportability
+
+Whole studies are held out, **never rows**. A random row split would leak every
+profile's collection conventions into both sides and measure nothing about
+protocol shift, which is how this layer actually fails when it meets a new
+study. Row splits are disallowed, not merely discouraged.
+
+```
+                        development     held out
+profiles          P_both, P_structured, P_text | P_absent, P_concept_variant,
+                                                 P_negated, P_version
+records                          97          128
+PPV                             1.0          1.0
+sensitivity                     1.0       0.8947
+not-ascertainable rate       0.2165       0.4141
+```
+
+---
+
+## Phenotype definitions
+
+A definition is a versioned scientific artifact with a content hash. Frozen
+versions are never edited: a change to what qualifies as a case is a **new
+version**, not an edit, and the loader refuses to overwrite a frozen file.
+
 ```yaml
-required_attributes:
-  - name: location
-    in: [CHEST, ABDOMEN, BACK]
-    accept_methods: [direct, normalized, extracted]   # route-agnostic by design
+concept_set:
+  include: [RASH, RASH_ERYTHEMATOUS, RASH_MACULOPAPULAR]
+  dictionary_target: "D-21.0"
+
+modifiers:
+  - name: mucosal_involvement
+    require_assertion: present
+    accept_methods: [direct, extracted]      # <- the demonstration
     on_unavailable: not_ascertainable
-  - name: onset
-    window: {unit: days, min: 0, max: 14, anchor: first_exposure}
-    on_unresolved: review
+
+temporal:
+  anchor: first_exposure
+  window: {min: 0, max: 30, unit: days}
 ```
 
-| verdict | meaning |
-| --- | --- |
-| `case` | every required attribute is present and satisfies its rule |
-| `not_case` | a required attribute is present and **fails** its rule |
-| `not_ascertainable` | a required attribute is unavailable and unrecoverable |
-| `review` | present but weakly supported, or an onset that will not resolve |
+`accept_methods: [direct, extracted]` **is** the demonstration: the rule does
+not know or care which study field supplied the evidence, only that it is there
+and points at something a reader can check. Nothing in the definition names
+`AEMUCOS`, `SC.MUCOSAL`, `AETERM` or `CO.COVAL` — there is a test asserting so.
 
-Precedence: a requirement that is present and fails settles the episode as a
-negative whatever else is missing — knowing the rash was on the arm makes it not
-a truncal rash even with the onset date gone. Only when nothing has failed does
-an unavailable requirement make the episode unascertainable.
+Three definitions ship. `cutaneous_mucosal.v1` accepts structured evidence only;
+`v2` supersedes it and also accepts evidence read out of prose. The executed
+difference between them is what the ablation measures.
 
-`accept_methods` listing all three routes is the point: the rule does not care
-whether the location came from `AELOC` or from the investigator's own words,
-only that it is present and points at something. `te_truncal_rash` **v2** lists
-only the structured routes — a narrower scientific claim, not a bug fix — and
-comparing the two measures what text extraction is worth.
+`graded_toxicity.v1` is structurally different — a grade threshold and a
+cumulative-exposure threshold, no modifier requirement at all — and it loads and
+runs with **no code changes**.
 
 ---
 
-## What it currently reports
+## The agent
 
-On the shipped corpus (seed 7, six profiles, 228 subjects, 241 source records,
-228 episodes), `te_truncal_rash` v1:
+The agent chooses *which* rule to run. It never decides what a case is, never
+computes a number, and never resolves an ambiguity by picking a default.
 
-| | |
-| --- | --- |
-| **silver standard** — precision / recall / F1 | 0.857 / 0.714 / 0.779 |
-| coverage / abstention rate | 0.795 / 0.205 |
-| adjudication queue | 5 disagreements + 20 sampled agreements |
-| **phenotype** — PPV / sensitivity | 1.000 / 1.000 |
-| **not-ascertainable rate** | **0.162**, agreement with gold 1.000 |
-| **value ablation** — cases findable only through text | **20 of 54 (37.0%)** |
-| unascertainable episodes resolved by reading text | 37 |
-| availability confusion — accuracy | 0.996, 0 missing read as collected |
-| **transportability** (whole studies held out) | sensitivity drop 0.000, not-ascertainable rate −0.237 |
-| representation invariance | 1.000 where the evidence supports it, 0.333 raw |
-| reproducibility | manifest id, results hash and normalization all stable |
+**It binds a definition version.** The compiled specification names an id, a
+version and a content hash. It carries no window, no threshold and no assertion
+of its own.
 
-Four of these are worth reading carefully rather than admiring.
+**It raises a conflict rather than overriding.** A question implying different
+parameters does not become a query option:
 
-**37% of qualifying events are findable only through text.** Without the
-extraction layer they are not negatives — they are unascertainable, and 37
-episodes move out of that bucket when the text is read. That single number is
-the business case for the whole layer, which is why it is a named output rather
-than something a reader has to derive.
+```
+$ aelayer ask "cutaneous events without mucosal involvement"
 
-**The silver numbers are the informative ones; the phenotype numbers are near
-ceiling by construction.** Given a correct attribute, the verdict logic
-reproduces the answer key exactly — that is what it should do. Extraction error
-shows up in the silver standard, and the corpus is built so the two stay
-separable: the disagreements it seeds between a structured qualifier and the
-investigator's prose are always within a verdict class (one truncal site
-confused for another), so they populate the adjudication queue without
-contaminating the phenotype metrics. That is a deliberate design choice, stated
-here so nobody mistakes a clean phenotype table for a hard-won one.
+NOT RUN — the question conflicts with the definition it names,
+or leaves a rule underdetermined. Nothing was computed.
 
-**Transportability shows no sensitivity drop and a large change in the
-not-ascertainable rate.** The held-out profiles record the location more often,
-so the drop that matters here is not accuracy but *answerability* — which is
-exactly the thing a random row split could never surface, because it would leak
-every profile's conventions into both sides.
+  conflict   The question asks about subjects who did not have
+             mucosal_involvement, and that phrase has two readings this system
+             keeps deliberately apart.
+  bound to   cutaneous_mucosal.v2
+  effect     A documented negative means somebody examined the patient and
+             recorded an absence; that subject is a non_case and belongs in the
+             denominator. Silence means nobody recorded anything, and that
+             subject belongs in neither the numerator nor the denominator. The
+             two readings give different rates, and one of them is not a rate
+             at all.
+  options:
+    - Subjects with an observed absence of mucosal_involvement
+      (assertion=absent) — evaluated negatives
+    - Subjects for whom mucosal_involvement was never recorded
+      (availability=not_collected or unresolved) — not ascertainable
+    - Both, as separate counts with the ascertainable fraction
+```
 
-**Raw invariance is 0.333, and that is correct.** A study that never collected
-the location returns `not_ascertainable`, and it is right to. Counting that as a
-disagreement would score the system for the study's collection decision. Where
-the evidence supports a verdict at all, agreement is 1.000.
+**It screens studies on metadata before any patient-level query.** A study that
+records the modifier nowhere cannot answer, and finding that out by scanning its
+patients first is both slower and worse manners:
+
+```
+supportability for 'mucosal_involvement', from declared collection metadata
+  no patient record was read to produce this
+
+  STUDY-A  P_structured       supported
+  STUDY-B  P_text             supported_via_extraction
+  STUDY-C  P_absent           cannot_ascertain
+  ...
+```
+
+**The tool surface is typed, permissioned, and small.** Eight tools, each with an
+input schema, an output schema and a permission. Calls are validated both ways.
+**No SQL surface. No tool writes to a source record.**
+
+**There is no approval gate.** Approving a specification you cannot
+independently evaluate is ceremony. What makes a number checkable is the trace
+returned with it:
+
+```
+result     case count = 70
+  analysis   d94ef9fbe0c27e89
+    cohort     70 source record(s) with verdict 'case' across 6 studies
+      definition cutaneous_mucosal.v2 (hash a97e91231505bd4a)
+        attribute  mucosal_involvement is present via direct from AEMUCOS
+        attribute  onset is 19 days after first_exposure, inside [0, 30] days
+          record     STUDY-A:STUDY-A-BG-001-AE-01
+            span       AE:STUDY-A-BG-001-AE-01:0-9  AEMUCOS = 'Y'
+```
+
+A number that cannot be traced end to end is a failing test, not a caveat.
 
 ---
 
-## Retrieval, the knowledge layer, and the agent
+## Grain
 
-**Precise retrieval** runs over normalized attributes and a definition's
-verdict, and never consults an embedding for cohort membership. **Discovery**
-returns candidates that cannot enter a cohort — `as_cohort()` raises — and
-answers the question the precise path cannot: *which modifiers does no catalogue
-value cover yet?* That is the honest job of semantic search here.
+The **source record** is the grain. Verdicts, denominators, the silver standard
+and the ablation all run over it, because it is the thing the study actually
+collected and the only grain every claim traces back to.
 
-**The knowledge layer** is forward-capture: it accrues from executions, is empty
-on day one, and says so. Manifests record which attribute sources contributed,
-so a later reader can see that a cohort depended on text extraction. Comparing
-two definition versions is executed rather than textual, and requires a scope —
-an unscoped programme-wide sweep is refused, because that is auditing
-colleagues' past choices rather than reusing evidence.
-
-**The agent** has a typed, permissioned tool surface and nothing else:
-
-```
-phenotype.resolve  cohort.run  evidence.search  exposure.build
-covariates.build   stats.compare  omics.run
-```
-
-Every call is validated against an input schema before it runs and an output
-schema before it returns. There is no SQL surface and no tool that writes to a
-source record. There is also no approval gate: approving a specification you
-cannot independently evaluate is ceremony. What makes a number checkable is the
-trace returned with it —
-
-```
-number -> analysis run -> cohort -> definition version -> episodes -> records -> spans
-```
-
-— which `aelayer trace <manifest-id>` walks and prints. A number that cannot be
-traced end to end is a failing test, not a caveat.
-
-**Trajectories** are deliberately minimal: exposures and episodes on one ordered
-timeline with offsets, which is what the phenotype window and a "distribution by
-time since exposure" question both need. Not progression modelling.
-
-**No graph store.** Traversal depth here is known and shallow — event → record →
-span, and event → exposure → covariate — both joins over a fixed schema.
-Relational plus a text index plus a definition registry. Revisit only if
-relationships become unknown ahead of query time.
+Episode grouping is **demoted** to a derived view. It carries no attributes of
+its own and nothing is evaluated at that grain — promotion would mean choosing
+between two records that disagree, and that choice would sit underneath every
+downstream number while being invisible in it.
 
 ---
 
-## Interfaces
+## Retrieval
+
+Two paths, and no parameter turns one into the other.
+
+**Precise.** Cohort membership is decided by normalized values and a
+definition's verdict. No embedding is consulted. Assertion and availability are
+separate predicates, so "documented negatives" and "never asked" cannot be
+requested as one population.
+
+**Discovery.** Free-text search over mentions. Everything it returns is a
+`candidate`; calling `as_cohort()` on it raises, because a mention is a place in
+a document where something was named, not an adjudicated event.
+
+---
+
+## Reproducibility
+
+Every execution writes a `Manifest` recording what was asked, what was compiled,
+which versions of everything produced the answer, and a **pointer** to where the
+result lives. It never stores the result payload: copying outputs into the
+registry would create a second, uncontrolled result store with its own drift
+problem.
 
 ```bash
-aelayer generate --seed 7               # one truth, six renderings
-aelayer normalize                       # the deterministic path, by route
-aelayer extract                         # normalize, extract, reconcile, index
-aelayer eval silver --attribute location
-aelayer eval transport --holdout P4_sponsor,P5_comment,P6_both
-aelayer eval all --report reports/eval.md
-aelayer evaluate --version 1            # verdicts, each with the route behind it
-aelayer definitions --compare te_truncal_rash:1:2 --scope "..."
-aelayer retrieve RASH --region trunk --verdict case
-aelayer retrieve rash --mode hybrid --unnormalized
-aelayer ask "how many rash cases after first exposure?"
-aelayer trace <manifest-id>             # the number, back to the text
-aelayer replay <manifest-id>            # hash for hash
-aelayer knowledge tools                 # the agent's entire callable surface
+aelayer replay d94ef9fbe0c27e89
+# run d94ef9fbe0c27e89 reproduced exactly (results hash ea97499ef51bdb21…)
 ```
 
-The HTTP API mirrors the CLI through the same pipeline object. `make serve` also
-serves a five-panel UI: one attribute across five homes; the silver standard and
-its adjudication queue; the four verdicts and the value ablation; the two
-retrieval paths; and the agent with its trace. The UI is API-driven, so opening
-`ui/index.html` from the filesystem shows an empty shell — run `make demo`, then
-`make serve`.
+The manifest id is content-derived, so identical inputs yield an identical id.
+Each input is checked separately on replay, so a failure says *which* one moved:
+the data, the deterministic config, the extraction config, or the definition.
 
 ---
 
@@ -346,42 +479,33 @@ retrieval paths; and the agent with its trace. The UI is API-driven, so opening
 
 ```
 config/
-  concepts.yaml           concepts, attribute catalogues, surface forms
-  study_profiles.yaml     where each attribute lives, per study
-  extraction.yaml         scope rules, connectors, anchors, confidences
-  phenotypes/             one file per definition version
+  concepts.yaml               concepts, dictionary versions, modifier catalogues
+  study_profiles.yaml         where each modifier lives, per study
+  extraction.yaml             readable sources, cue lists, confidence keys
+  phenotypes/*.yaml           versioned definitions, frozen
 src/aelayer/
-  models.py               Attribute, CanonicalAERecord, CanonicalAEEpisode, Trajectory
-  profiles.py             the profile config, homes, gates, sponsor codelists
-  guards.py               the deterministic/model boundary, in code
-  generate.py             one truth, six renderings, and the answer key
-  normalize/              the deterministic path
-  extract/                the model path: modifiers, backends, engine
-  episode.py              records -> episodes, with the route preserved
-  trajectory.py           exposures and episodes on one timeline
-  phenotype/              definition loading, validation, four-verdict evaluation
-  silver.py               the silver-standard harness and adjudication queue
-  eval/                   phenotype, ablation, availability, transport, invariance
-  retrieval/              precise and discovery paths over SQLite FTS5
-  knowledge/              the registry and the executed definition comparison
-  agent/                  typed permissioned tools, compile, run, trace
-  runs.py                 manifests, the result store, replay
-  api.py  cli.py  pipeline.py
-ui/                       static single-page client
-tests/                    241 tests
+  models.py                   Attribute[T], the two-field invariant, verdicts
+  guards.py                   the deterministic/model boundary, in code
+  catalog.py                  concepts, modifiers, version reconciliation
+  profiles.py                 collection conventions and supportability
+  generate.py                 the synthetic corpus and its answer key
+  normalize/                  the deterministic path
+  extract/                    the model path: mentions, assertions, backends
+  phenotype/                  definitions and the four-verdict evaluator
+  silver.py                   §8 — the silver-standard harness
+  ablation.py                 §9 — the value ablation and its decision
+  eval/                       harnesses, transportability, the markdown report
+  retrieval/                  the precise path and the discovery path
+  agent/                      compile, bind, refuse, execute, trace
+  runs.py                     manifests, result store, replay
+  pipeline.py  api.py  cli.py
+ui/                           the single-page UI
+tests/                        299 tests
 ```
-
-**Stack.** Python 3.11+, Pydantic v2, FastAPI, Typer, SQLite with FTS5, PyYAML,
-pytest. No cloud services. Everything runs on a laptop with the network cable
-pulled.
 
 ---
 
 ## Out of scope
 
-Regulatory signal detection and disproportionality analysis; genetics and omics
-analysis, though `omics.run` exports a case-control file shaped for an existing
-pipeline — with `status` null for review and not-ascertainable subjects, because
-coding them either way would put an unadjudicated judgement into someone else's
-analysis; multi-user auth and RBAC; real terminology licences; and model
-training of any kind.
+Real terminology licences. Model training. Real patient data of any kind. A
+graph store. Anything that requires a network connection.
