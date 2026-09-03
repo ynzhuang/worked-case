@@ -110,13 +110,13 @@ fraction** is printed beside every rate as a study characteristic:
 
 ```
 study       total  case   non   rev   n/a   asc.f  incidence
-STUDY-A        32    11    11     4     6   0.688        0.5
-STUDY-B        33    14     5     2    12   0.576     0.7368
-STUDY-C        32     0     0     0    32   0.000       None   <- collects it nowhere
-STUDY-D        32    11    12     6     3   0.719     0.4783
-STUDY-E        32    12    10     4     6   0.688     0.5455
-STUDY-F        32    11    11     6     4   0.688        0.5
-STUDY-G        32    11     6     4    11   0.531     0.6471
+STUDY-A        27    11     8     4     4   0.704     0.5789
+STUDY-B        29     8     3     3    15   0.379     0.7273
+STUDY-C        27     0     0     0    27   0.000       None   <- collects it nowhere
+STUDY-D        26     7     8     8     3   0.577     0.4667
+STUDY-E        28     6     9     4     9   0.536        0.4
+STUDY-F        27     9     9     5     4   0.667        0.5
+STUDY-G        25     5     7     2    11   0.480     0.4167
 ```
 
 STUDY-C is the one to get right. Qualifying events, qualifying timing, and a
@@ -177,9 +177,9 @@ version. The split is reported, always:
 
 ```
 dictionary version reconciliation (mechanical, never a model):
-  unchanged                  213
-  remapped_mechanically       30    Rash erythematous -> Erythematous rash
-  flagged_for_review           9    Rash maculopapular: no code under D-21.0
+  unchanged                  220
+  remapped_mechanically       24    Rash erythematous -> Erythematous rash
+  flagged_for_review           8    Rash maculopapular: no code under D-21.0
 ```
 
 A code that does not persist is **flagged for review, never auto-recoded**. The
@@ -215,16 +215,16 @@ destroying the denominator.
 
 ```
                       n  answered  correct  recall  precision
-present              15        12       12   0.800      1.000
-absent                8         2        2   0.250      1.000
-uncertain             6         6        6   1.000      1.000
+present              11         9        9   0.818      1.000
+absent                4         1        1   0.250      1.000
+uncertain             8         7        7   0.875      1.000
 
-Brier score              0.0724
-expected calib. error    0.209
+Brier score              0.0934
+expected calib. error    0.2476
 bin             n  mean conf  observed     gap
-[0.4, 0.6)      6      0.550     1.000  -0.450
-[0.6, 0.8)      4      0.780     1.000  -0.220
-[0.8, 1.0]     10      0.940     1.000  -0.060
+[0.4, 0.6)      7      0.550     1.000  -0.450
+[0.6, 0.8)      3      0.780     1.000  -0.220
+[0.8, 1.0]      7      0.943     1.000  -0.057
 ```
 
 Calibration is reported because every phenotype definition here thresholds on
@@ -268,16 +268,16 @@ distinct engineering investment:
 
 ```
 stage             eval   asc  asc.f  case   ok  bad   prec  recall
-structured         225    67  0.298    33   33    0  1.000   1.000
-reported_term      225   108  0.480    59   59    0  1.000   0.967
-comments           225   125  0.556    70   70    0  1.000   0.946
+structured         189    52  0.275    27   27    0  1.000   1.000
+reported_term      189    78  0.413    41   41    0  1.000   0.976
+comments           189    90  0.476    46   46    0  1.000   0.939
 
 structured -> reported_term
-  - 26 correctly ascertained cases added (>= the declared floor of 10)
-  - a 78.8% relative gain over the 33 correct cases the previous stage found
+  - 14 correctly ascertained cases added (>= the declared floor of 10)
+  - a 51.8% relative gain over the 27 correct cases the previous stage found
   - precision on the added cases is 100.0%; 0 of the added cases are wrong
 
-DECISION: ADOPT. Stage 'reported_term' is worth building: it adds 26 correctly
+DECISION: ADOPT. Stage 'reported_term' is worth building: it adds 14 correctly
 ascertained cases the previous stage could not reach, at 100% precision on
 those additions.
 ```
@@ -310,10 +310,10 @@ study. Row splits are disallowed, not merely discouraged.
                         development     held out
 profiles          P_both, P_structured, P_text | P_absent, P_concept_variant,
                                                  P_negated, P_version
-records                          97          128
+records                          82          107
 PPV                             1.0          1.0
-sensitivity                     1.0       0.8947
-not-ascertainable rate       0.2165       0.4141
+sensitivity                   0.963       0.9091
+not-ascertainable rate       0.2683       0.4766
 ```
 
 ---
@@ -351,7 +351,9 @@ difference between them is what the ablation measures.
 
 `graded_toxicity.v1` is structurally different — a grade threshold and a
 cumulative-exposure threshold, no modifier requirement at all — and it loads and
-runs with **no code changes**.
+runs with **no code changes**. Its ascertainable fraction is 1.000 in every
+study, which is the honest contrast: a definition whose criteria are always
+collected has nothing to be unascertainable about.
 
 ---
 
@@ -414,9 +416,9 @@ independently evaluate is ceremony. What makes a number checkable is the trace
 returned with it:
 
 ```
-result     case count = 70
+result     case count = 46
   analysis   d94ef9fbe0c27e89
-    cohort     70 source record(s) with verdict 'case' across 6 studies
+    cohort     46 source record(s) with verdict 'case' across 6 studies
       definition cutaneous_mucosal.v2 (hash a97e91231505bd4a)
         attribute  mucosal_involvement is present via direct from AEMUCOS
         attribute  onset is 19 days after first_exposure, inside [0, 30] days

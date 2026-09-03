@@ -221,11 +221,22 @@ class CorpusGenerator:
         elif kind == "distractor":
             concept = self._pick(DISTRACTORS)
             mucosal, offset = "unknown", self.rng.randint(0, 60)
+        elif kind == "graded_toxicity":
+            # A haematological event, so the second definition has a real
+            # denominator rather than a token handful of records. It has no
+            # mucosal modifier at all, which is the point: the two definitions
+            # select on different criteria and neither is special-cased.
+            concept = "NEUTROPENIA"
+            mucosal, offset = "unknown", self.rng.randint(5, 170)
         else:
             raise ValueError(f"unknown truth kind {kind!r}")
 
         serious = self.rng.random() < 0.15
         grade = self.rng.choice([1, 2, 2, 3, 3, 4])
+        if kind == "graded_toxicity":
+            # Spread across the threshold on purpose: a criterion nothing ever
+            # fails is not a criterion.
+            grade = self.rng.choice([1, 2, 3, 3, 4, 4])
         return ClinicalTruth(
             truth_id=truth_id,
             concept=concept,
@@ -552,9 +563,13 @@ class CorpusGenerator:
         corpus = GeneratedCorpus(
             tables={"dm": [], "ex": [], "ae": [], "sc": [], "co": []}
         )
+        # Weighted so the corpus contains each thing the evaluation needs to
+        # measure, rather than whatever a uniform sample happened to produce.
+        # `graded_toxicity` gives the second phenotype definition a denominator
+        # worth reporting.
         kinds = ["mucosal_in_window", "mucosal_in_window", "documented_negative",
                  "mucosal_out_of_window", "uncertain", "never_examined",
-                 "distractor"]
+                 "graded_toxicity", "distractor"]
         shared = [
             self.sample_truth(f"T{index + 1:04d}", kinds[index % len(kinds)])
             for index in range(self.shared_truths)

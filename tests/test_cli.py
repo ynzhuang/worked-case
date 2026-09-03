@@ -174,8 +174,12 @@ def test_knowledge_backfill_is_deliberate(data, tmp_path):
     assert "explicit, scoped act" in output
 
 
-def test_demo_runs_the_whole_path(tmp_path, monkeypatch):
-    output = _run("demo", "--seed", "5", "--limit", "3")
+def test_demo_runs_the_whole_path(tmp_path):
+    # Deliberately into a temporary directory: a test that regenerated the
+    # repository's own corpus would silently change every number a reader
+    # then saw from the CLI.
+    output = _run("demo", "--seed", "5", "--limit", "3",
+                  "--out", str(tmp_path / "corpus"))
     for heading in ("1. generate", "2. normalize", "3. extract",
                     "4. supportability", "5. evaluate", "6. silver standard",
                     "7. value ablation"):

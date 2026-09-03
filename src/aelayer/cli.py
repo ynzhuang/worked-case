@@ -740,7 +740,13 @@ def knowledge_backfill(
 
 
 @app.command()
-def demo(seed: int = typer.Option(7), limit: int = typer.Option(8)) -> None:
+def demo(
+    seed: int = typer.Option(7),
+    limit: int = typer.Option(8),
+    out: Optional[str] = typer.Option(
+        None, "--out", help="Write the corpus here instead of data/synthetic."
+    ),
+) -> None:
     """Generate, normalize, extract, evaluate, ablate — end to end, offline."""
     import collections
 
@@ -750,13 +756,13 @@ def demo(seed: int = typer.Option(7), limit: int = typer.Option(8)) -> None:
     from .silver import SILVER_CAVEATS, SilverHarness
 
     _echo("=== 1. generate ===")
-    path, manifest = generate_corpus(seed=seed)
+    path, manifest = generate_corpus(seed=seed, out_dir=out)
     _echo(f"  {manifest['counts']['profiles']} studies, "
           f"{manifest['counts']['subjects']} subjects, "
           f"{manifest['counts']['ae_records']} source records -> {path}")
     _echo("  synthetic data only; no real patient records anywhere in this repo")
 
-    pipeline = _pipeline()
+    pipeline = _pipeline(out)
 
     _echo()
     _echo("=== 2. normalize (deterministic path) ===")
