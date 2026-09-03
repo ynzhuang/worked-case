@@ -4,16 +4,22 @@ The default backend is the deterministic lexicon-and-scope extractor, so
 everything runs offline. An LLM backend is optional and swappable; both meet the
 same contract:
 
-1. the output validates against the attribute schema, or it is rejected
+1. the output validates against the modifier catalogue, or it is rejected
 2. every extracted value carries a span into the source text
-3. **abstention is correct behaviour** — where the text does not support a
-   value, the answer is no value, and that is reported as a rate rather than
-   counted as a failure
-4. values normalize to the concept catalogue before they leave the backend
-5. the model and prompt versions are stamped on every record the path touches
+3. the answer is an **assertion** — present, absent or uncertain — and never a
+   bare value, because "the source said no" and "the source said nothing" are
+   different answers and the layer must be able to tell them apart
+4. **abstention is correct behaviour**: where the text does not support an
+   answer, the answer is no answer, reported as a rate rather than counted as a
+   failure
+5. the extractor, model and prompt versions are stamped on every value
 
-With no network, the LLM backend is unavailable and the engine degrades to the
+With no network the LLM backend is unavailable, and the engine degrades to the
 rules backend and says so in its notes.
+
+A request may only ever concern ``language_variation``. Coded-concept variation
+and terminology-version variation are resolved by a concept set and a
+mechanical map; ``guards.py`` refuses a request that claims otherwise.
 """
 
 from __future__ import annotations
@@ -24,8 +30,11 @@ from dataclasses import dataclass, field as _dc_field
 from typing import Any, Protocol
 
 from ..catalog import ConceptCatalog, ExtractionConfig
-from ..models import Attribute, Span
-from .modifiers import ModifierExtractor
+from ..models import ASSERTIONS, Attribute, Span
+from .mentions import MentionFinder
+
+#: The only normalization mechanism a backend is ever asked about.
+LANGUAGE_VARIATION = "language_variation"
 
 
 @dataclass(frozen=True)
@@ -38,17 +47,19 @@ class ExtractionRequest:
 
     doc_id: str
     text: str
-    attributes: tuple[str, ...]
+    modifiers: tuple[str, ...]
     concept_id: str | None = None
     source_kind: str = "reported_term"
     source_variable: str = "AETERM"
+    mechanism: str = LANGUAGE_VARIATION
 
 
 @dataclass
 class ExtractionResult:
+    """What one request produced, including what it declined to answer."""
+
     values: dict[str, Attribute[str]] = _dc_field(default_factory=dict)
     abstained: list[str] = _dc_field(default_factory=list)
-    qualities: list[str] = _dc_field(default_factory=list)
     notes: list[str] = _dc_field(default_factory=list)
 
 
@@ -65,7 +76,7 @@ class RulesBackend:
 
     name = "rules"
     model_version = None
-    prompt_version = "rules-3.0.0"
+    prompt_version = "rules-4.0.0"
 
     def __init__(
         self, catalog: ConceptCatalog, config: ExtractionConfig,
@@ -74,31 +85,35 @@ class RulesBackend:
         self.catalog = catalog
         self.config = config
         self.extractor_version = extractor_version
-        self.modifiers = ModifierExtractor(catalog, config)
+        self.finder = MentionFinder(catalog, config)
+
+    def versions(self) -> dict[str, str]:
+        return {
+            k: v for k, v in {
+                "extractor": self.extractor_version,
+                "prompt": self.prompt_version,
+                "backend": self.name,
+            }.items() if v
+        }
 
     def extract(self, request: ExtractionRequest) -> ExtractionResult:
         result = ExtractionResult()
-        for attribute in request.attributes:
-            if attribute == "quality":
-                result.qualities = sorted(
-                    {h.value for h in self.modifiers.qualities(request.text)}
-                )
-                continue
-            hit = self.modifiers.best(
-                request.text, attribute, request.concept_id, request.source_kind
+        for modifier in request.modifiers:
+            mention = self.finder.best(
+                request.text, modifier, request.concept_id, request.source_kind
             )
-            if hit is None:
-                result.abstained.append(attribute)
+            if mention is None:
+                result.abstained.append(modifier)
                 continue
-            result.values[attribute] = Attribute[str].extracted(
-                hit.value,
+            result.values[modifier] = Attribute[str].extracted(
+                mention.assertion,  # type: ignore[arg-type]
                 request.source_variable,
-                [hit.span(request.doc_id, attribute)],
+                [mention.span(request.doc_id, modifier)],
+                value=mention.value,
                 source=request.source_kind,  # type: ignore[arg-type]
-                confidence=hit.confidence,
-                extractor_version=self.extractor_version,
-                prompt_version=self.prompt_version,
-                note=f"{hit.surface!r} {hit.rule}",
+                confidence=mention.confidence,
+                versions=self.versions(),
+                note=f"{mention.surface!r}: {mention.rule}",
             )
         return result
 
@@ -112,18 +127,25 @@ class LLMBackend:
     """
 
     name = "llm"
-    prompt_version = "extract-prompt-3"
+    prompt_version = "extract-prompt-4"
 
     SYSTEM = (
-        "You extract clinical modifiers from an adverse event record.\n\n"
-        "Return one JSON object and nothing else. For each requested attribute "
-        "return either a value with the exact character offsets of the text "
-        "that supports it, or null.\n\n"
-        "Returning null is correct whenever the text does not state the "
-        "attribute. Do not infer, do not guess, and do not use knowledge "
-        "outside the text provided.\n\n"
-        'Shape: {{"location": {{"value": "CHEST", "start": 12, "end": 17}}, '
-        '"pattern": null}}\n\n'
+        "You read one adverse event record and report what its text says "
+        "about the requested modifiers.\n\n"
+        "Return one JSON object and nothing else. For each requested modifier "
+        "return either an answer or null.\n\n"
+        "An answer has an `assertion`, which is one of:\n"
+        "  present   - the text says the modifier was there\n"
+        "  absent    - the text says it was looked for and was not there\n"
+        "  uncertain - the text hedges and does not settle it\n"
+        "It also has the exact character offsets of the text that supports it, "
+        "and optionally a `value` from the permitted list.\n\n"
+        "Returning null is correct whenever the text does not address the "
+        "modifier at all. Saying nothing and saying no are different answers "
+        "and must never be conflated. Do not infer, do not guess, and do not "
+        "use knowledge outside the text provided.\n\n"
+        'Shape: {{"mucosal_involvement": {{"assertion": "absent", '
+        '"value": null, "start": 12, "end": 41}}, "photosensitivity": null}}\n\n'
         "Permitted values:\n{vocabulary}"
     )
 
@@ -142,12 +164,22 @@ class LLMBackend:
         """Only with a key present. Absent one, the engine degrades and says so."""
         return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
-    def vocabulary(self, attributes: tuple[str, ...]) -> str:
+    def versions(self) -> dict[str, str]:
+        return {
+            k: v for k, v in {
+                "extractor": self.extractor_version,
+                "prompt": self.prompt_version,
+                "model": self.model_version,
+                "backend": self.name,
+            }.items() if v
+        }
+
+    def vocabulary(self, modifiers: tuple[str, ...]) -> str:
         lines = []
-        for attribute in attributes:
-            if attribute in self.catalog.attributes:
-                catalogue = self.catalog.attribute(attribute)
-                lines.append(f"{attribute}: {', '.join(catalogue.value_ids())}")
+        for modifier in modifiers:
+            if modifier in self.catalog.modifiers:
+                catalogue = self.catalog.modifier(modifier)
+                lines.append(f"{modifier}: {', '.join(catalogue.value_ids())}")
         return "\n".join(lines)
 
     def extract(self, request: ExtractionRequest) -> ExtractionResult:
@@ -156,38 +188,47 @@ class LLMBackend:
         if payload is None:
             result.notes.append(
                 "the LLM backend returned nothing usable; no value was invented "
-                "and every requested attribute is reported as abstained"
+                "and every requested modifier is reported as abstained"
             )
-            result.abstained.extend(request.attributes)
+            result.abstained.extend(request.modifiers)
             return result
 
-        for attribute in request.attributes:
-            body = payload.get(attribute)
-            if not isinstance(body, dict) or body.get("value") in (None, ""):
-                result.abstained.append(attribute)
+        for modifier in request.modifiers:
+            body = payload.get(modifier)
+            if not isinstance(body, dict) or body.get("assertion") in (None, ""):
+                result.abstained.append(modifier)
                 continue
-            value = self._validate(attribute, body, request)
+            value = self._validate(modifier, body, request)
             if value is None:
-                result.abstained.append(attribute)
+                result.abstained.append(modifier)
                 result.notes.append(
-                    f"{attribute}: the response did not validate against the "
+                    f"{modifier}: the response did not validate against the "
                     f"catalogue or its span did not match the text, so it was "
                     f"discarded rather than accepted"
                 )
                 continue
-            result.values[attribute] = value
+            result.values[modifier] = value
         return result
 
     def _validate(
-        self, attribute: str, body: dict[str, Any], request: ExtractionRequest
+        self, modifier: str, body: dict[str, Any], request: ExtractionRequest
     ) -> Attribute[str] | None:
-        catalogue = self.catalog.attributes.get(attribute)
-        raw = str(body["value"]).strip()
-        value = raw if catalogue and raw in catalogue.values else (
-            catalogue.normalize(raw) if catalogue else None
-        )
-        if value is None:
+        assertion = str(body.get("assertion") or "").strip().lower()
+        if assertion not in ASSERTIONS:
             return None
+        catalogue = self.catalog.modifiers.get(modifier)
+        raw = body.get("value")
+        value: str | None = None
+        if raw not in (None, ""):
+            text = str(raw).strip()
+            value = (
+                text if catalogue and text in catalogue.values
+                else (catalogue.normalize(text) if catalogue else None)
+            )
+            if value is None:
+                # A value outside the declared space is not a near miss to be
+                # rounded off. The response is discarded whole.
+                return None
         try:
             start, end = int(body["start"]), int(body["end"])
         except (KeyError, TypeError, ValueError):
@@ -195,16 +236,16 @@ class LLMBackend:
         if not (0 <= start < end <= len(request.text)):
             return None
         span = Span(
-            doc_id=request.doc_id, start=start, end=end, field=attribute,
-            extracted_value=value, text=request.text[start:end], kind="text",
+            doc_id=request.doc_id, start=start, end=end, field=modifier,
+            extracted_value=value or assertion, text=request.text[start:end],
+            kind="text",
         )
         return Attribute[str].extracted(
-            value, request.source_variable, [span],
+            assertion,  # type: ignore[arg-type]
+            request.source_variable, [span], value=value,
             source=request.source_kind,  # type: ignore[arg-type]
             confidence=float(body.get("confidence") or 0.8),
-            extractor_version=self.extractor_version,
-            model_version=self.model_version or None,
-            prompt_version=self.prompt_version,
+            versions=self.versions(),
             note="returned by the LLM backend and validated against the catalogue",
         )
 
@@ -218,7 +259,7 @@ class LLMBackend:
                 model=self.model_version or "claude-sonnet-5",
                 max_tokens=512,
                 system=self.SYSTEM.format(
-                    vocabulary=self.vocabulary(request.attributes)
+                    vocabulary=self.vocabulary(request.modifiers)
                 ),
                 messages=[{"role": "user", "content": request.text}],
             )
@@ -249,7 +290,7 @@ def select_backend(
             "an LLM backend was available and selected automatically"
         ]
     notes.append(
-        "the model path is the offline rules baseline: lexicons and scope "
-        "rules from config/, not a trained clinical NLP model"
+        "the model path is the offline rules baseline: lexicons and cue scoping "
+        "from config/, not a trained clinical NLP model"
     )
     return RulesBackend(catalog, config, extractor_version), notes

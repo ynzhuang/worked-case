@@ -20,16 +20,13 @@ from pydantic import ValidationError
 from .. import paths
 from ..catalog import ConceptCatalog, load_yaml
 from ..hashing import hash_file, hash_payload
-from ..models import METHODS, PhenotypeDefinition, VERDICTS
+from ..models import METHODS, SOURCE_KINDS, VERDICTS, PhenotypeDefinition
 
 FILENAME_RE = re.compile(r"^(?P<id>[a-z0-9_]+)\.v(?P<version>\d+)\.ya?ml$")
 
-#: Attributes a definition may require. An episode carries these; anything else
-#: is a typo, and a typo that selects nobody is worse than an error.
-REQUIRABLE = (
-    "location", "laterality", "pattern", "severity", "seriousness",
-    "relatedness", "outcome", "action_taken", "onset",
-)
+#: Criteria a definition may name in a temporal rule's anchor. An anchor that
+#: nothing resolves is a definition that silently reviews everybody.
+KNOWN_ANCHORS = ("first_exposure", "dose_escalation")
 
 
 class DefinitionError(ValueError):
@@ -39,19 +36,34 @@ class DefinitionError(ValueError):
 def validate_definition(
     definition: PhenotypeDefinition, catalog: ConceptCatalog | None, where: str
 ) -> None:
-    """Everything the schema cannot express on its own."""
-    if catalog is not None and definition.concept.primary not in catalog.concepts:
-        raise DefinitionError(
-            f"{where}: unknown primary concept {definition.concept.primary!r}"
-        )
-    if catalog is not None and definition.concept.group is not None:
-        catalog.expand_group(definition.concept.group)
+    """Everything the schema cannot express on its own.
 
-    for requirement in definition.required_attributes:
-        if requirement.name not in REQUIRABLE:
+    Strict on purpose. A requirement naming a modifier nothing produces, or a
+    concept outside the catalogue, is a definition that will silently select
+    nobody — and silence is the failure mode worth spending code on.
+    """
+    if catalog is not None:
+        unknown = sorted(
+            c for c in (*definition.concept_set.include, *definition.concept_set.exclude)
+            if c not in catalog.concepts
+        )
+        if unknown:
             raise DefinitionError(
-                f"{where}: requirement {requirement.name!r} is not an attribute "
-                f"an episode carries; known: {list(REQUIRABLE)}"
+                f"{where}: concept set names {unknown}, which the catalogue does "
+                f"not define, so nothing could ever match them"
+            )
+        target = definition.concept_set.dictionary_target
+        if target is not None and target not in catalog.dictionary_versions:
+            raise DefinitionError(
+                f"{where}: dictionary_target {target!r} is not a version this "
+                f"catalogue knows ({list(catalog.dictionary_versions)})"
+            )
+
+    for requirement in definition.modifiers:
+        if catalog is not None and requirement.name not in catalog.modifiers:
+            raise DefinitionError(
+                f"{where}: requirement {requirement.name!r} is not a configured "
+                f"modifier; known: {sorted(catalog.modifiers)}"
             )
         unknown_methods = sorted(set(requirement.accept_methods) - set(METHODS))
         if unknown_methods:
@@ -59,43 +71,35 @@ def validate_definition(
                 f"{where}: requirement {requirement.name!r} accepts unknown "
                 f"methods {unknown_methods}; known: {list(METHODS)}"
             )
-        if requirement.allowed and catalog is not None:
-            catalogue = catalog.attributes.get(requirement.name)
-            if catalogue is not None:
-                unknown = sorted(set(requirement.allowed) - set(catalogue.values))
-                if unknown:
-                    raise DefinitionError(
-                        f"{where}: requirement {requirement.name!r} allows "
-                        f"values {unknown} that are not in the {requirement.name} "
-                        f"catalogue, so nothing could ever satisfy it"
-                    )
-        if requirement.window is not None and requirement.name != "onset":
+        if "derived" in requirement.accept_methods:
             raise DefinitionError(
-                f"{where}: a window belongs on the onset requirement, not on "
-                f"{requirement.name!r}"
+                f"{where}: requirement {requirement.name!r} accepts method "
+                f"'derived', but a modifier is read from a source, not computed "
+                f"across domains"
             )
-        if (
-            requirement.min_confidence is not None
-            and not 0.0 <= requirement.min_confidence <= 1.0
-        ):
+        if requirement.accept_sources is not None:
+            unknown_sources = sorted(
+                set(requirement.accept_sources) - set(SOURCE_KINDS)
+            )
+            if unknown_sources:
+                raise DefinitionError(
+                    f"{where}: requirement {requirement.name!r} names unknown "
+                    f"source kinds {unknown_sources}"
+                )
+
+    if definition.temporal is not None:
+        if definition.temporal.anchor not in KNOWN_ANCHORS:
             raise DefinitionError(
-                f"{where}: min_confidence for {requirement.name!r} must be "
-                f"between 0 and 1"
+                f"{where}: temporal anchor {definition.temporal.anchor!r} is not "
+                f"one of {list(KNOWN_ANCHORS)}; an offset needs something real "
+                f"to be relative to"
             )
 
-    onset = definition.requirement("onset")
-    if onset is not None and onset.window is not None and definition.anchor is None:
+    if set(definition.verdicts) != set(VERDICTS):
         raise DefinitionError(
-            f"{where}: the onset requirement has a window but the definition "
-            f"declares no anchor; an offset needs something to be relative to"
+            f"{where}: the verdicts block declares {sorted(definition.verdicts)}, "
+            f"but the evaluator returns {sorted(VERDICTS)}"
         )
-    if definition.verdicts is not None:
-        declared = set(definition.verdicts.model_dump())
-        if declared != set(VERDICTS):
-            raise DefinitionError(
-                f"{where}: the verdicts block declares {sorted(declared)}, but "
-                f"the evaluator returns {sorted(VERDICTS)}"
-            )
 
 
 def load_definition(

@@ -1,28 +1,28 @@
 """Core data models for the evidence layer.
 
-Three ideas carry most of the weight.
+Four ideas carry the weight.
 
-**The same clinical fact arrives by different routes, and the route is part of
-the fact.**  Every clinical value is an ``Attribute[T]``: the value, the kind of
-source it came from, the *named variable* it came from, and the ``method`` that
-produced it — ``direct`` from a standard structured field, ``normalized`` from a
-sponsor variable or codelist mapping, or ``extracted`` from language.  A
-phenotype rule can then be route-agnostic on purpose, while every number it
-produces still says which route supplied the evidence.
+**Assertion and availability are orthogonal, and merging them is the error this
+whole layer exists to prevent.** ``assertion`` is what the source *says* —
+present, absent, uncertain. ``availability`` is whether the source says anything
+at all — observed, not collected, not applicable, pending, unresolved. "The
+investigator recorded no mucosal involvement" and "nobody was ever asked" look
+identical once they are both a null, and every incidence estimate downstream
+inherits that confusion.
 
-**A blank is not a value.**  ``availability`` says which kind of empty: never
-collected by the protocol, made inapplicable by a gate, still pending, not
-representable in the study's codelist, or simply unknown.  Flattening those to
-``None`` throws away the only thing that says whether absence is evidence.
+**The route is part of the fact.** Every value carries the kind of source it
+came from, the named variable, and the ``method`` that produced it — ``direct``
+from a structured field, ``derived`` by governed computation across domains, or
+``extracted`` from language. A phenotype rule can then be route-agnostic on
+purpose while every number still says which route supplied it.
 
-**Two levels, and the lower one is never destroyed.**  A ``CanonicalAERecord``
-is source-faithful: one per source record, never merged, never overwritten.
-Episodes and trajectories derive above it and can be recomputed.
+**Nothing overwrites a coded value.** ``Rash`` and ``Rash erythematous`` are
+both legitimate codings; a concept set decides which qualify. There is no code
+path that edits a coded field, and a test asserts it.
 
-There is deliberately no ``inferred`` method.  A value the system worked out for
-itself, with nothing in the source to point at, is not an attribute of a
-patient; the enum has no way to express it and a test asserts the word appears
-nowhere in the codebase.
+**There is no ``inferred`` method.** A value the system worked out for itself,
+with nothing in the source to point at, is not an attribute of a patient. The
+enum cannot express it and a test asserts the word appears nowhere.
 """
 
 from __future__ import annotations
@@ -39,58 +39,57 @@ T = TypeVar("T")
 # Provenance vocabulary
 # --------------------------------------------------------------------------
 
+#: What the source says about the attribute.
+Assertion = Literal["present", "absent", "uncertain"]
+ASSERTIONS: tuple[str, ...] = ("present", "absent", "uncertain")
+
+#: Whether the source says anything at all. Never merged with `assertion`.
+Availability = Literal[
+    "observed",         # the source addressed it, and `assertion` says what it found
+    "not_collected",    # the study never asked
+    "not_applicable",   # a parent gate made the question inapplicable
+    "pending",          # the answer does not exist yet
+    "unresolved",       # asked, or askable, and nothing settled it
+]
+AVAILABILITIES: tuple[str, ...] = (
+    "observed", "not_collected", "not_applicable", "pending", "unresolved",
+)
+
 #: How a value was produced. There is no fourth member: see the module
 #: docstring on why a value the system worked out for itself is not one.
-Method = Literal["direct", "normalized", "extracted"]
-METHODS: tuple[str, ...] = ("direct", "normalized", "extracted")
+Method = Literal["direct", "derived", "extracted"]
+METHODS: tuple[str, ...] = ("direct", "derived", "extracted")
 
 #: What kind of place the value came from.
 SourceKind = Literal[
     "structured_standard",   # a standard domain variable, e.g. AELOC
-    "structured_sponsor",    # a sponsor-defined supplemental variable
+    "structured_sponsor",    # a sponsor-defined supplemental qualifier
+    "linked_form",           # a separate form linked to the AE record
     "reported_term",         # the investigator's own words, e.g. AETERM
     "comment",               # a comment record pointing at the AE record
-    "linked_form",           # a separate form linked to the AE record
-    "derived",               # computed above the records, e.g. an episode field
+    "cross_domain",          # computed across domains, e.g. AE onset against EX
 ]
 SOURCE_KINDS: tuple[str, ...] = (
-    "structured_standard", "structured_sponsor", "reported_term", "comment",
-    "linked_form", "derived",
+    "structured_standard", "structured_sponsor", "linked_form", "reported_term",
+    "comment", "cross_domain",
 )
 
-#: Which kind of empty a blank is. These are not interchangeable.
-Availability = Literal[
-    "collected",
-    "not_collected_by_protocol",   # the CRF never asked
-    "not_applicable_gated",        # a parent gate was answered No
-    "pending_ongoing",             # the event has not ended yet
-    "not_representable",           # the concept exists, the codelist cannot express it
-    "unknown",                     # asked, not answered, or nothing in the text
-]
-AVAILABILITY_VALUES: tuple[str, ...] = (
-    "collected", "not_collected_by_protocol", "not_applicable_gated",
-    "pending_ongoing", "not_representable", "unknown",
-)
-
-#: Availabilities that are never, on their own, evidence that something did not
-#: happen. Everything except `collected`.
-NOT_EVIDENCE_OF_ABSENCE: frozenset[str] = frozenset(
-    v for v in AVAILABILITY_VALUES if v != "collected"
-)
-
-#: Source kinds that the deterministic path owns outright. A value from one of
-#: these is settled, and `guards.py` refuses to send it to a model.
+#: Source kinds the deterministic path owns outright. A value from one of these
+#: is settled, and `guards.py` refuses to send it to a model.
 STRUCTURED_SOURCES: frozenset[str] = frozenset(
-    {"structured_standard", "structured_sponsor"}
+    {"structured_standard", "structured_sponsor", "linked_form"}
 )
+
+#: Availabilities that carry no assertion. Exactly the complement of `observed`.
+SILENT: frozenset[str] = frozenset(a for a in AVAILABILITIES if a != "observed")
 
 
 # --------------------------------------------------------------------------
 # Clinical vocabulary
 # --------------------------------------------------------------------------
 
-Severity = Literal["mild", "moderate", "severe"]
 SEVERITY_VALUES: tuple[str, ...] = ("mild", "moderate", "severe")
+GRADES: tuple[int, ...] = (1, 2, 3, 4, 5)
 
 SERIOUSNESS_CRITERIA: tuple[str, ...] = (
     "death", "life_threatening", "hospitalisation", "disability",
@@ -101,7 +100,7 @@ RELATEDNESS_VALUES: tuple[str, ...] = (
     "not_related", "unlikely", "possible", "probable", "definite", "unknown",
 )
 
-ACTION_TAKEN_VALUES: tuple[str, ...] = (
+ACTION_VALUES: tuple[str, ...] = (
     "dose_not_changed", "dose_reduced", "drug_interrupted", "drug_withdrawn",
     "not_applicable", "unknown",
 )
@@ -111,11 +110,14 @@ OUTCOME_VALUES: tuple[str, ...] = (
     "fatal", "unknown",
 )
 
-#: Four verdicts. `not_ascertainable` is the one that earns its place: a
-#: required modifier that nobody recorded is not a negative finding and not a
-#: review item, because no reviewer can resolve it either.
-Verdict = Literal["case", "not_case", "not_ascertainable", "review"]
-VERDICTS: tuple[str, ...] = ("case", "not_case", "not_ascertainable", "review")
+#: Four verdicts. `non_case` exists so a denominator can be stated at all;
+#: `not_ascertainable` exists because an event nobody can evaluate is neither a
+#: case nor a negative, and folding it into either one biases the estimate.
+Verdict = Literal["case", "non_case", "review", "not_ascertainable"]
+VERDICTS: tuple[str, ...] = ("case", "non_case", "review", "not_ascertainable")
+
+#: Verdicts that put a subject in the denominator.
+ASCERTAINED: frozenset[str] = frozenset({"case", "non_case"})
 
 DefinitionStatus = Literal["draft", "frozen", "superseded"]
 
@@ -159,78 +161,93 @@ class Span(BaseModel):
 
 
 class Attribute(BaseModel, Generic[T]):
-    """One clinical value, with the route that produced it.
+    """One clinical value, what the source asserted, and how it got here.
 
     The invariants below are enforced here rather than checked downstream,
-    because every one of them is a claim the rest of the system relies on:
-
-    - an extracted value must point at the text it came from
-    - a ``direct`` value must come from a standard structured variable, and
-      nothing but the deterministic path may set it
-    - a value only exists where the attribute was actually available
+    because every one of them is a claim the rest of the system relies on.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     value: T | None = None
+    #: What the source says. None exactly when the source says nothing.
+    assertion: Assertion | None = None
+    availability: Availability = "unresolved"
     source: SourceKind | None = None
     #: The variable this came from, by its real name: "AELOC", "AETERM",
-    #: "SUPPAE.RASHSITE", "CO.COVAL". Two studies can carry the same fact under
-    #: different names, and a reader has to be able to see which.
+    #: "SUPPAE.MUCOSAL", "CO.COVAL", "AE+EX". Two studies can carry the same
+    #: fact under different names, and a reader must be able to see which.
     source_variable: str | None = None
     method: Method | None = None
     evidence: list[Span] = _PydanticField(default_factory=list)
-    availability: Availability = "unknown"
     confidence: float | None = None
-    #: Set only where a model path produced the value.
-    extractor_version: str | None = None
-    model_version: str | None = None
-    prompt_version: str | None = None
+    #: Dictionary, extractor, prompt — whichever produced this value.
+    versions: dict[str, str] = _PydanticField(default_factory=dict)
     note: str = ""
     #: What the deterministic path left behind, where a later route filled the
-    #: attribute. Recovering a location from text does not make the CRF column
+    #: attribute. Recovering a modifier from prose does not make the CRF column
     #: collected, and both facts are worth keeping.
     prior_availability: Availability | None = None
 
     @model_validator(mode="after")
     def _invariants(self) -> "Attribute[T]":
+        if self.availability == "observed":
+            if self.assertion is None:
+                raise ValueError(
+                    "availability 'observed' means the source said something, so "
+                    "it must carry an assertion"
+                )
+        elif self.assertion is not None:
+            raise ValueError(
+                f"availability {self.availability!r} means the source is silent, "
+                f"so it cannot assert {self.assertion!r}; assertion and "
+                f"availability are orthogonal and must never be merged"
+            )
         if self.method == "extracted" and not self.evidence:
             raise ValueError(
                 "an extracted value must carry at least one span: a value with "
                 "no text behind it cannot be checked by anyone"
             )
-        if self.method == "direct" and self.source != "structured_standard":
+        if self.method == "direct" and self.source not in STRUCTURED_SOURCES:
             raise ValueError(
-                f"method 'direct' means a standard structured variable, but "
-                f"source is {self.source!r}"
+                f"method 'direct' means a structured variable, but source is "
+                f"{self.source!r}"
             )
-        if self.availability != "collected" and self.value is not None:
+        if self.method == "derived" and self.source != "cross_domain":
+            raise ValueError(
+                f"method 'derived' means a governed computation across domains, "
+                f"but source is {self.source!r}"
+            )
+        if self.value is not None and self.availability != "observed":
             raise ValueError(
                 f"availability {self.availability!r} carries a value "
-                f"{self.value!r}; only a collected attribute has one"
-            )
-        if self.availability == "collected" and self.value is None:
-            raise ValueError(
-                "availability 'collected' with no value: say which kind of "
-                "empty it is instead"
-            )
-        if self.extractor_version and self.method != "extracted":
-            raise ValueError(
-                f"extractor_version is set on a {self.method!r} value; only the "
-                f"model path stamps it"
+                f"{self.value!r}; only an observed attribute has one"
             )
         return self
 
     # -- reading ------------------------------------------------------------
 
     @property
-    def populated(self) -> bool:
-        return self.value is not None
+    def observed(self) -> bool:
+        return self.availability == "observed"
 
     @property
-    def is_evidence_of_absence(self) -> bool:
-        """Can an empty reading here be taken as "it did not happen"?"""
-        return self.availability == "collected"
+    def present(self) -> bool:
+        """The source addressed it and found it."""
+        return self.availability == "observed" and self.assertion == "present"
+
+    @property
+    def documented_negative(self) -> bool:
+        """The source addressed it and found it absent.
+
+        Different from silence in every way that matters: a documented negative
+        puts the subject in the denominator, and silence does not.
+        """
+        return self.availability == "observed" and self.assertion == "absent"
+
+    @property
+    def silent(self) -> bool:
+        return self.availability in SILENT
 
     @property
     def structured_availability(self) -> Availability:
@@ -242,93 +259,122 @@ class Attribute(BaseModel, Generic[T]):
         return self.method == "extracted"
 
     def has_provenance(self) -> bool:
-        return (not self.populated) or bool(self.evidence)
+        return (not self.observed) or bool(self.evidence)
 
     def describe_route(self) -> str:
-        if not self.populated:
-            return f"{self.availability}"
-        return f"{self.value!r} via {self.method} from {self.source_variable}"
+        if not self.observed:
+            return self.availability
+        return (
+            f"{self.assertion}"
+            + (f"={self.value!r}" if self.value is not None else "")
+            + f" via {self.method} from {self.source_variable}"
+        )
 
     # -- constructing -------------------------------------------------------
 
     @classmethod
     def direct(
-        cls, value: T, variable: str, evidence: list[Span] | None = None,
+        cls, assertion: Assertion, variable: str, evidence: list[Span] | None = None,
+        value: T | None = None, source: SourceKind = "structured_standard",
+        versions: dict[str, str] | None = None, note: str = "",
     ) -> "Attribute[T]":
-        """Read straight from a standard structured variable."""
+        """Read straight from a structured variable."""
         return cls(
-            value=value, source="structured_standard", source_variable=variable,
-            method="direct", evidence=list(evidence or []), availability="collected",
+            value=value, assertion=assertion, availability="observed",
+            source=source, source_variable=variable, method="direct",
+            evidence=list(evidence or []), versions=dict(versions or {}), note=note,
         )
 
     @classmethod
-    def normalized(
-        cls, value: T, variable: str, source: SourceKind = "structured_sponsor",
-        evidence: list[Span] | None = None, note: str = "",
+    def derived(
+        cls, value: T, variable: str, evidence: list[Span] | None = None,
+        assertion: Assertion = "present", note: str = "",
     ) -> "Attribute[T]":
-        """Mapped deterministically — a sponsor codelist, a unit, a spelling."""
+        """Computed across domains by governed code, never by model reasoning."""
         return cls(
-            value=value, source=source, source_variable=variable,
-            method="normalized", evidence=list(evidence or []),
-            availability="collected", note=note,
+            value=value, assertion=assertion, availability="observed",
+            source="cross_domain", source_variable=variable, method="derived",
+            evidence=list(evidence or []), note=note,
         )
 
     @classmethod
     def extracted(
-        cls, value: T, variable: str, evidence: list[Span],
-        source: SourceKind = "reported_term", confidence: float | None = None,
-        extractor_version: str | None = None, note: str = "",
-        prior_availability: Availability | None = None,
-        model_version: str | None = None, prompt_version: str | None = None,
+        cls, assertion: Assertion, variable: str, evidence: list[Span],
+        value: T | None = None, source: SourceKind = "reported_term",
+        confidence: float | None = None, versions: dict[str, str] | None = None,
+        note: str = "", prior_availability: Availability | None = None,
     ) -> "Attribute[T]":
         """Read out of language, with the span that supports it."""
         return cls(
-            value=value, source=source, source_variable=variable,
-            method="extracted", evidence=list(evidence), availability="collected",
-            confidence=confidence, extractor_version=extractor_version, note=note,
-            prior_availability=prior_availability, model_version=model_version,
-            prompt_version=prompt_version,
+            value=value, assertion=assertion, availability="observed",
+            source=source, source_variable=variable, method="extracted",
+            evidence=list(evidence), confidence=confidence,
+            versions=dict(versions or {}), note=note,
+            prior_availability=prior_availability,
         )
 
     @classmethod
-    def unavailable(
+    def silent_because(
         cls, availability: Availability, *, variable: str | None = None,
         source: SourceKind | None = None, note: str = "",
         prior_availability: Availability | None = None,
     ) -> "Attribute[T]":
-        """An empty attribute that says which kind of empty it is.
+        """An attribute the source says nothing about, and why.
 
         Abstention is a valid answer and is recorded as one; a guess is a defect.
         """
-        if availability == "collected":
-            raise ValueError("an unavailable attribute cannot be 'collected'")
+        if availability == "observed":
+            raise ValueError(
+                "'observed' means the source said something: use direct(), "
+                "derived() or extracted() and state the assertion"
+            )
         return cls(
-            value=None, source=source, source_variable=variable,
-            availability=availability, note=note,
+            value=None, assertion=None, availability=availability, source=source,
+            source_variable=variable, note=note,
             prior_availability=prior_availability,
         )
 
 
-class Modifier(BaseModel):
-    """A modifier mention found in text, before it is promoted to an attribute."""
+class CodedTerm(BaseModel):
+    """A coded value exactly as the study recorded it, plus any reconciliation.
+
+    The original is never modified. Where cross-study analysis needs a common
+    dictionary version, ``reconciled_to`` records what the code maps to under
+    the target version and ``reconciliation`` says how that was decided —
+    mechanically, or flagged for a human. A model never recodes anything.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["location", "laterality", "pattern", "quality"]
-    value: str
-    surface: str
-    span: Span
-    confidence: float = 0.0
-    normalized_from: str = ""
+    code: str
+    dictionary: str = ""
+    dictionary_version: str = ""
+    concept_id: str | None = None
+    reconciled_to: str | None = None
+    reconciled_version: str | None = None
+    reconciliation: Literal[
+        "unchanged", "remapped_mechanically", "flagged_for_review", "not_attempted"
+    ] = "not_attempted"
+    note: str = ""
+
+    @property
+    def effective_code(self) -> str:
+        """The code to compare against a concept set. Never a rewrite."""
+        return self.reconciled_to or self.code
 
 
 # --------------------------------------------------------------------------
-# Level 1 — the source-faithful record
+# Records
 # --------------------------------------------------------------------------
 
 
 class CanonicalAERecord(BaseModel):
-    """One per source record. Never merged, never overwritten."""
+    """One per source record. Immutable, never merged, never overwritten.
+
+    This is the grain the study actually collected. Episode derivation, where a
+    study evidences one, happens above it and is optional; the source-record
+    grain is what everything traces back to.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -339,55 +385,53 @@ class CanonicalAERecord(BaseModel):
     source_form_id: str = "AE"
     profile: str = ""
 
-    coded_event: Attribute[str] = _PydanticField(default_factory=Attribute)
+    coded_event: CodedTerm | None = None
     reported_term: Attribute[str] = _PydanticField(default_factory=Attribute)
-    dictionary: str | None = None
-    dictionary_version: str | None = None
-    standardized_concept: str | None = _PydanticField(
-        default=None,
-        description="Catalogue concept for this record, by explicit membership.",
-    )
+    concept_id: str | None = None
 
-    location: Attribute[str] = _PydanticField(default_factory=Attribute)
-    laterality: Attribute[str] = _PydanticField(default_factory=Attribute)
-    pattern: Attribute[str] = _PydanticField(default_factory=Attribute)
+    #: Configured clinical modifiers, keyed by name. The worked example uses
+    #: `mucosal_involvement`; the model does not know that name.
+    modifiers: dict[str, Attribute[str]] = _PydanticField(default_factory=dict)
+
+    onset: Attribute[_dt.date] = _PydanticField(default_factory=Attribute)
+    end: Attribute[_dt.date] = _PydanticField(default_factory=Attribute)
+    #: Days from the anchor exposure to onset. Cross-domain, method `derived`.
+    exposure_relation: Attribute[int] = _PydanticField(default_factory=Attribute)
 
     severity: Attribute[str] = _PydanticField(default_factory=Attribute)
+    grade: Attribute[int] = _PydanticField(default_factory=Attribute)
     seriousness: Attribute[bool] = _PydanticField(default_factory=Attribute)
     seriousness_criteria: dict[str, Attribute[bool]] = _PydanticField(
         default_factory=dict
     )
     relatedness: Attribute[str] = _PydanticField(default_factory=Attribute)
-    action_taken: Attribute[str] = _PydanticField(default_factory=Attribute)
+    action: Attribute[str] = _PydanticField(default_factory=Attribute)
     outcome: Attribute[str] = _PydanticField(default_factory=Attribute)
-    onset: Attribute[_dt.date] = _PydanticField(default_factory=Attribute)
-    end: Attribute[_dt.date] = _PydanticField(default_factory=Attribute)
 
     comment_doc_id: str | None = None
     linked_form_ids: list[str] = _PydanticField(default_factory=list)
-    continuation_of: str | None = None
 
-    modifiers: list[Modifier] = _PydanticField(default_factory=list)
     normalizer_version: str = ""
     extractor_version: str = ""
 
-    #: Attribute names that are `Attribute[...]` instances on this model.
-    ATTRIBUTES: tuple[str, ...] = (
-        "coded_event", "reported_term", "location", "laterality", "pattern",
-        "severity", "seriousness", "relatedness", "action_taken", "outcome",
-        "onset", "end",
+    SCALAR_ATTRIBUTES: tuple[str, ...] = (
+        "reported_term", "onset", "end", "exposure_relation", "severity",
+        "grade", "seriousness", "relatedness", "action", "outcome",
     )
 
     def attributes(self) -> dict[str, Attribute[Any]]:
-        """Every attribute on the record, including the criteria vector."""
+        """Every attribute on the record, modifiers and criteria included."""
         out: dict[str, Attribute[Any]] = {
-            name: getattr(self, name) for name in self.ATTRIBUTES
+            name: getattr(self, name) for name in self.SCALAR_ATTRIBUTES
         }
+        out.update(self.modifiers)
         for criterion, attribute in self.seriousness_criteria.items():
             out[f"seriousness_criteria.{criterion}"] = attribute
         return out
 
     def attribute(self, name: str) -> Attribute[Any] | None:
+        if name in self.modifiers:
+            return self.modifiers[name]
         if name.startswith("seriousness_criteria."):
             return self.seriousness_criteria.get(name.split(".", 1)[1])
         value = getattr(self, name, None)
@@ -396,13 +440,11 @@ class CanonicalAERecord(BaseModel):
     def availabilities(self) -> dict[str, str]:
         return {n: a.availability for n, a in self.attributes().items()}
 
-    def sources(self) -> dict[str, str | None]:
-        return {
-            n: a.source_variable for n, a in self.attributes().items() if a.populated
-        }
+    def assertions(self) -> dict[str, str | None]:
+        return {n: a.assertion for n, a in self.attributes().items()}
 
     def missing_provenance(self) -> list[str]:
-        """Populated attributes that carry no span. Every one is a defect."""
+        """Observed attributes that carry no span. Every one is a defect."""
         return sorted(
             name for name, attribute in self.attributes().items()
             if not attribute.has_provenance()
@@ -420,257 +462,139 @@ class CanonicalAERecord(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# Level 2 — derived
-# --------------------------------------------------------------------------
-
-LinkageRule = Literal[
-    "single_record", "explicit_continuation", "declared_convention",
-    "temporal_overlap", "gap_within_tolerance", "recurrence_split",
-]
-
-
-class CanonicalAEEpisode(BaseModel):
-    """A clinical episode derived over one or more records.
-
-    Derivation is additive: the records it was built from are untouched and
-    remain the authority. Where the linkage rule cannot decide, the episode is
-    flagged rather than silently resolved.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    episode_id: str
-    study_id: str
-    subject_id: str
-    profile: str = ""
-    standardized_concept: str | None = None
-
-    episode_start: Attribute[_dt.date] = _PydanticField(default_factory=Attribute)
-    episode_end: Attribute[_dt.date] = _PydanticField(default_factory=Attribute)
-    source_record_ids: list[str] = _PydanticField(default_factory=list)
-
-    location: Attribute[str] = _PydanticField(default_factory=Attribute)
-    laterality: Attribute[str] = _PydanticField(default_factory=Attribute)
-    pattern: Attribute[str] = _PydanticField(default_factory=Attribute)
-    severity: Attribute[str] = _PydanticField(default_factory=Attribute)
-    seriousness: Attribute[bool] = _PydanticField(default_factory=Attribute)
-    relatedness: Attribute[str] = _PydanticField(default_factory=Attribute)
-    outcome: Attribute[str] = _PydanticField(default_factory=Attribute)
-    action_taken: Attribute[str] = _PydanticField(default_factory=Attribute)
-
-    coded_events: list[str] = _PydanticField(default_factory=list)
-    reported_terms: list[str] = _PydanticField(default_factory=list)
-    dictionary_versions: list[str] = _PydanticField(default_factory=list)
-    severity_trajectory: list[tuple[_dt.date | None, str]] = _PydanticField(
-        default_factory=list
-    )
-
-    onset_offset_days: Attribute[int] = _PydanticField(default_factory=Attribute)
-    anchor_event: str | None = None
-    anchor_date: _dt.date | None = None
-
-    linked_evidence: list[Span] = _PydanticField(default_factory=list)
-    linkage_rule: LinkageRule = "single_record"
-    linkage_confidence: float = 1.0
-    linkage_review_required: bool = False
-    linkage_note: str = ""
-
-    episode_provenance: dict[str, Any] = _PydanticField(default_factory=dict)
-
-    #: Discovery results are candidates and may not enter a cohort directly.
-    candidate: bool = False
-
-    EPISODE_ATTRIBUTES: tuple[str, ...] = (
-        "episode_start", "episode_end", "location", "laterality", "pattern",
-        "severity", "seriousness", "relatedness", "outcome", "action_taken",
-        "onset_offset_days",
-    )
-
-    def attributes(self) -> dict[str, Attribute[Any]]:
-        return {name: getattr(self, name) for name in self.EPISODE_ATTRIBUTES}
-
-    def attribute(self, name: str) -> Attribute[Any] | None:
-        value = getattr(self, name, None)
-        return value if isinstance(value, Attribute) else None
-
-    def availabilities(self) -> dict[str, str]:
-        return {n: a.availability for n, a in self.attributes().items()}
-
-    @property
-    def peak_severity(self) -> str | None:
-        ranked = [s for _when, s in self.severity_trajectory if s in SEVERITY_VALUES]
-        if not ranked:
-            return None
-        return max(ranked, key=lambda s: SEVERITY_VALUES.index(s))
-
-    def attribute_sources(self) -> dict[str, str]:
-        """Which named variable supplied each populated attribute."""
-        return {
-            name: attribute.source_variable or "?"
-            for name, attribute in self.attributes().items()
-            if attribute.populated and attribute.source_variable
-        }
-
-
-# --------------------------------------------------------------------------
-# Trajectory
-# --------------------------------------------------------------------------
-
-
-class TrajectoryEvent(BaseModel):
-    """One dated thing that happened to a subject, in a comparable shape."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    kind: Literal["exposure", "episode"]
-    identifier: str
-    date: _dt.date
-    label: str = ""
-    detail: dict[str, Any] = _PydanticField(default_factory=dict)
-    offset_days: int | None = None
-
-
-class Trajectory(BaseModel):
-    """A subject's exposures and episodes in one ordered sequence.
-
-    Deliberately not a progression model. It is the ordered structure the
-    phenotype window and the "time since exposure" question both need, and
-    nothing more.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    subject_id: str
-    study_id: str
-    profile: str = ""
-    anchor_event: str | None = None
-    anchor_date: _dt.date | None = None
-    events: list[TrajectoryEvent] = _PydanticField(default_factory=list)
-
-    def exposures(self) -> list[TrajectoryEvent]:
-        return [e for e in self.events if e.kind == "exposure"]
-
-    def episodes(self) -> list[TrajectoryEvent]:
-        return [e for e in self.events if e.kind == "episode"]
-
-    def offset_of(self, identifier: str) -> int | None:
-        for event in self.events:
-            if event.identifier == identifier:
-                return event.offset_days
-        return None
-
-
-# --------------------------------------------------------------------------
 # Phenotype definition
 # --------------------------------------------------------------------------
 
 
-class ConceptSelector(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class ConceptSet(BaseModel):
+    """Which coded concepts qualify, and under which dictionary version.
 
-    primary: str
-    group: str | None = None
-    bridge_dictionary_versions: bool = True
-    include_coded_terms: bool = True
-    include_lexicon: bool = True
-
-
-class AnchorSpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    event: str = "first_exposure"
-    source_domain: str = "EX"
-    index_rule: Literal["first_occurrence", "most_recent_before_onset"] = (
-        "first_occurrence"
-    )
-
-
-class WindowSpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    unit: Literal["days"] = "days"
-    min: int = 0
-    max: int = 14
-    anchor: str = "first_exposure"
-
-    @model_validator(mode="after")
-    def _ordered(self) -> "WindowSpec":
-        if self.max < self.min:
-            raise ValueError(f"window max {self.max} precedes min {self.min}")
-        return self
-
-    def contains(self, offset: int) -> bool:
-        return self.min <= offset <= self.max
-
-
-class AttributeRequirement(BaseModel):
-    """One attribute a definition requires, and what to do when it is missing.
-
-    ``accept_methods`` is the heart of it. A rule that lists all three methods
-    is saying: I do not care whether the location came from ``AELOC`` or from
-    the investigator's own words, only that it is present and points at
-    something. A rule that lists only ``direct`` is a different, narrower
-    scientific claim, and the difference is now visible in the file.
+    Listing both ``RASH`` and ``RASH_ERYTHEMATOUS`` is the point: they are
+    different legitimate codings of the same clinical situation, and the
+    definition decides they both qualify rather than anything merging them.
     """
 
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(extra="forbid")
+
+    include: list[str]
+    exclude: list[str] = _PydanticField(default_factory=list)
+    dictionary_target: str | None = None
+
+    @model_validator(mode="after")
+    def _not_empty(self) -> "ConceptSet":
+        if not self.include:
+            raise ValueError("a concept set that includes nothing selects nobody")
+        overlap = sorted(set(self.include) & set(self.exclude))
+        if overlap:
+            raise ValueError(f"concepts {overlap} are both included and excluded")
+        return self
+
+
+class ModifierRequirement(BaseModel):
+    """One modifier a definition requires, and what to do when it is missing."""
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str
-    allowed: list[str] | None = _PydanticField(default=None, alias="in")
+    require_assertion: Assertion = "present"
+    #: Route-agnostic by design: the rule does not know or care which study
+    #: field supplied the evidence, only that it is there and points at
+    #: something.
     accept_methods: list[Method] = _PydanticField(
-        default_factory=lambda: ["direct", "normalized", "extracted"]
+        default_factory=lambda: ["direct", "extracted"]
     )
     accept_sources: list[SourceKind] | None = None
-    min_confidence: float | None = None
-    window: WindowSpec | None = None
-    on_unavailable: Literal["not_ascertainable", "review", "not_case"] = (
+    on_unavailable: Literal["not_ascertainable", "review", "non_case"] = (
         "not_ascertainable"
     )
-    on_unresolved: Literal["review", "not_ascertainable", "not_case"] = "review"
-    on_low_confidence: Literal["review", "not_ascertainable", "not_case"] = "review"
     description: str = ""
 
     @model_validator(mode="after")
-    def _has_a_test(self) -> "AttributeRequirement":
-        if self.allowed is None and self.window is None:
-            raise ValueError(
-                f"requirement {self.name!r} tests nothing: give it `in` or a window"
-            )
+    def _usable(self) -> "ModifierRequirement":
         if not self.accept_methods:
             raise ValueError(
-                f"requirement {self.name!r} accepts no method, so nothing can "
-                f"ever satisfy it"
+                f"modifier {self.name!r} accepts no method, so nothing can ever "
+                f"satisfy it"
             )
         return self
 
 
-class VerdictSpec(BaseModel):
-    """What each verdict means, stated in the definition file.
+class TemporalRule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
-    The evaluator implements these semantics; the block exists so the file is
-    readable on its own, and a test asserts its keys are exactly the four
-    verdicts the code can return.
-    """
+    anchor: str = "first_exposure"
+    window: dict[str, Any] = _PydanticField(
+        default_factory=lambda: {"min": 0, "max": 30, "unit": "days"}
+    )
+    on_unresolved: Literal["review", "not_ascertainable", "non_case"] = (
+        "not_ascertainable"
+    )
+
+    @property
+    def minimum(self) -> int:
+        return int(self.window.get("min", 0))
+
+    @property
+    def maximum(self) -> int:
+        return int(self.window.get("max", 30))
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "TemporalRule":
+        if self.maximum < self.minimum:
+            raise ValueError(
+                f"window max {self.maximum} precedes min {self.minimum}"
+            )
+        if self.window.get("unit", "days") != "days":
+            raise ValueError("only day windows are supported")
+        return self
+
+    def contains(self, offset: int) -> bool:
+        return self.minimum <= offset <= self.maximum
+
+
+class EvidencePolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    extracted_requires_span: bool = True
+    min_confidence: float = _PydanticField(default=0.7, ge=0.0, le=1.0)
+    below_threshold: Literal["review", "not_ascertainable", "non_case"] = "review"
+
+
+class AscertainabilityPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    missing_required_modifier: Literal["not_ascertainable", "review", "non_case"] = (
+        "not_ascertainable"
+    )
+    uncertain_assertion: Literal["review", "not_ascertainable", "non_case"] = "review"
+
+
+class GradeRule(BaseModel):
+    """A graded-toxicity criterion, for the second shipped definition."""
 
     model_config = ConfigDict(extra="forbid")
 
-    case: str
-    not_case: str
-    not_ascertainable: str
-    review: str
+    attribute: str = "grade"
+    minimum: int = _PydanticField(default=3, ge=1, le=5)
+    on_unavailable: Literal["not_ascertainable", "review", "non_case"] = (
+        "not_ascertainable"
+    )
 
 
-class ReportingSpec(BaseModel):
+class CumulativeExposureRule(BaseModel):
+    """Total exposure before onset, in the study's own dose units."""
+
     model_config = ConfigDict(extra="forbid")
 
-    counts_by_verdict: bool = True
-    counts_by_attribute_source: bool = True
-    require_evidence_span_for_extracted: bool = True
-    report_not_ascertainable_separately: bool = True
+    minimum: float = 0.0
+    unit: str = "mg"
+    on_unresolved: Literal["review", "not_ascertainable", "non_case"] = (
+        "not_ascertainable"
+    )
 
 
 class PhenotypeDefinition(BaseModel):
-    """A versioned scientific artifact, evaluated over episodes."""
+    """A versioned scientific artifact. Frozen versions are never edited."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -679,91 +603,175 @@ class PhenotypeDefinition(BaseModel):
     status: DefinitionStatus = "draft"
     label: str
     description: str = ""
-    operates_on: Literal["episode"] = "episode"
     supersedes: str | None = None
     authors: list[str] = _PydanticField(default_factory=list)
     created: _dt.date | None = None
 
-    concept: ConceptSelector
-    required_attributes: list[AttributeRequirement]
-    anchor: AnchorSpec | None = None
-    episode_linkage_confidence: float = _PydanticField(default=0.8, ge=0.0, le=1.0)
-    on_linkage_review: Literal["case", "review", "not_ascertainable"] = "review"
-    verdicts: VerdictSpec | None = None
-    reporting: ReportingSpec = _PydanticField(default_factory=ReportingSpec)
+    concept_set: ConceptSet
+    modifiers: list[ModifierRequirement] = _PydanticField(default_factory=list)
+    temporal: TemporalRule | None = None
+    grade: GradeRule | None = None
+    cumulative_exposure: CumulativeExposureRule | None = None
+    evidence_policy: EvidencePolicy = _PydanticField(default_factory=EvidencePolicy)
+    ascertainability: AscertainabilityPolicy = _PydanticField(
+        default_factory=AscertainabilityPolicy
+    )
+    verdicts: list[Verdict] = _PydanticField(
+        default_factory=lambda: list(VERDICTS)
+    )
 
     definition_hash: str = ""
     source_path: str = ""
 
     @model_validator(mode="after")
-    def _requirements_are_usable(self) -> "PhenotypeDefinition":
-        if not self.required_attributes:
-            raise ValueError("a definition needs at least one required attribute")
-        names = [r.name for r in self.required_attributes]
+    def _usable(self) -> "PhenotypeDefinition":
+        if not (self.modifiers or self.temporal or self.grade
+                or self.cumulative_exposure):
+            raise ValueError(
+                "a definition needs at least one criterion beyond its concept "
+                "set, or it selects every event of that concept"
+            )
+        names = [m.name for m in self.modifiers]
         duplicates = sorted({n for n in names if names.count(n) > 1})
         if duplicates:
-            raise ValueError(f"duplicate required attributes: {duplicates}")
+            raise ValueError(f"duplicate modifier requirements: {duplicates}")
+        if set(self.verdicts) != set(VERDICTS):
+            raise ValueError(
+                f"the verdicts block declares {sorted(self.verdicts)}, but the "
+                f"evaluator returns {sorted(VERDICTS)}"
+            )
         return self
 
     @property
     def key(self) -> str:
         return f"{self.id}.v{self.version}"
 
-    def requirement(self, name: str) -> AttributeRequirement | None:
-        return next((r for r in self.required_attributes if r.name == name), None)
+    def modifier(self, name: str) -> ModifierRequirement | None:
+        return next((m for m in self.modifiers if m.name == name), None)
+
+    def accepted_methods(self) -> list[str]:
+        return sorted({m for r in self.modifiers for m in r.accept_methods})
 
 
 # --------------------------------------------------------------------------
-# Assignment, manifest, trace
+# Assignment and denominators
 # --------------------------------------------------------------------------
 
 
-class AttributeFinding(BaseModel):
-    """How one required attribute came out, for one episode."""
+class CriterionFinding(BaseModel):
+    """How one criterion came out, for one record."""
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
     satisfied: bool
+    verdict: Verdict
+    assertion: Assertion | None = None
+    availability: Availability = "unresolved"
     value: Any = None
     method: Method | None = None
     source: SourceKind | None = None
     source_variable: str | None = None
-    availability: Availability = "unknown"
+    confidence: float | None = None
     reason: str = ""
     spans: list[Span] = _PydanticField(default_factory=list)
 
 
 class CaseAssignment(BaseModel):
-    """One row per episode.
+    """One row per source record.
 
-    ``reason`` names what decided it. When a clinician disputes a case, that is
-    the first question asked, and the answer has to be in the row.
+    ``reason`` names what decided it. When a clinician disputes a verdict, that
+    is the first question asked, and the answer has to be in the row.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    episode_id: str
+    record_id: str
     subject_id: str
     study_id: str
     profile: str = ""
     verdict: Verdict
-    deciding_attribute: str | None = None
+    deciding_criterion: str | None = None
     reason: str
-    findings: list[AttributeFinding] = _PydanticField(default_factory=list)
-    source_record_ids: list[str] = _PydanticField(default_factory=list)
+    findings: list[CriterionFinding] = _PydanticField(default_factory=list)
     evidence_spans: list[Span] = _PydanticField(default_factory=list)
     attribute_sources: dict[str, str] = _PydanticField(default_factory=dict)
     attribute_methods: dict[str, str] = _PydanticField(default_factory=dict)
     definition_id: str
     definition_version: int
     definition_hash: str
-    linkage_review_required: bool = False
-    review_reasons: list[str] = _PydanticField(default_factory=list)
+
+    @property
+    def ascertained(self) -> bool:
+        return self.verdict in ASCERTAINED
 
     @property
     def used_text_extraction(self) -> bool:
         return "extracted" in self.attribute_methods.values()
+
+
+class Denominator(BaseModel):
+    """What a study contributes, and how much of it is answerable at all.
+
+    The ascertainable fraction is reported as a study characteristic beside
+    every incidence figure. Silently dropping unascertainable subjects makes the
+    denominator vary with collection convention, which is the quiet way an
+    estimate becomes a comparison of CRFs rather than of patients.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    study_id: str
+    profile: str = ""
+    n_total: int = 0
+    n_case: int = 0
+    n_non_case: int = 0
+    n_review: int = 0
+    n_not_ascertainable: int = 0
+
+    @property
+    def n_ascertainable(self) -> int:
+        return self.n_case + self.n_non_case
+
+    @property
+    def ascertainable_fraction(self) -> float:
+        return round(self.n_ascertainable / self.n_total, 4) if self.n_total else 0.0
+
+    @property
+    def incidence(self) -> float | None:
+        """Within the ascertainable population, or None if there is none."""
+        if not self.n_ascertainable:
+            return None
+        return round(self.n_case / self.n_ascertainable, 4)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "study_id": self.study_id,
+            "profile": self.profile,
+            "n_total": self.n_total,
+            "n_case": self.n_case,
+            "n_non_case": self.n_non_case,
+            "n_review": self.n_review,
+            "n_not_ascertainable": self.n_not_ascertainable,
+            "n_ascertainable": self.n_ascertainable,
+            "ascertainable_fraction": self.ascertainable_fraction,
+            "incidence_within_ascertainable": self.incidence,
+        }
+
+
+DENOMINATOR_NOTE = (
+    "Incidence is computed within the ascertainable population (case + "
+    "non_case). Subjects whose required evidence was never collected enter "
+    "neither the numerator nor the denominator, and the ascertainable fraction "
+    "is reported beside every rate as a study characteristic: dropping them "
+    "silently would make the denominator vary with collection convention "
+    "rather than with the patients."
+)
+
+
+# --------------------------------------------------------------------------
+# Manifest, trace, agent
+# --------------------------------------------------------------------------
 
 
 class Manifest(BaseModel):
@@ -782,21 +790,21 @@ class Manifest(BaseModel):
     question: str = ""
     specification: dict[str, Any] = _PydanticField(default_factory=dict)
 
-    phenotype_definition_id: str
-    phenotype_definition_version: int
+    definition_id: str
+    definition_version: int
     definition_hash: str
     definition_status: DefinitionStatus = "frozen"
 
+    study_scope: list[str] = _PydanticField(default_factory=list)
     cohort_specification: dict[str, Any] = _PydanticField(default_factory=dict)
     data_snapshot_id: str
-    terminology_versions: dict[str, str] = _PydanticField(default_factory=dict)
+    dictionary_versions: dict[str, str] = _PydanticField(default_factory=dict)
     normalizer_version: str = ""
     extractor_version: str = ""
     model_version: str | None = None
     prompt_version: str | None = None
 
-    analysis_method: str = "phenotype_evaluation"
-    parameters: dict[str, Any] = _PydanticField(default_factory=dict)
+    method_parameters: dict[str, Any] = _PydanticField(default_factory=dict)
     validation_status: Literal[
         "unvalidated", "internally_validated", "externally_validated"
     ] = "unvalidated"
@@ -804,9 +812,9 @@ class Manifest(BaseModel):
     output_pointer: str = ""
     results_hash: str = ""
     counts_by_verdict: dict[str, int] = _PydanticField(default_factory=dict)
-    #: Which routes supplied the evidence behind this cohort. A later reader can
-    #: see that the cohort depended on text extraction rather than having to
-    #: re-derive it.
+    denominators: list[dict[str, Any]] = _PydanticField(default_factory=list)
+    #: Which routes supplied the evidence behind this cohort, so a later reader
+    #: can see it depended on text extraction without re-deriving it.
     attribute_sources: dict[str, int] = _PydanticField(default_factory=dict)
     attribute_methods: dict[str, int] = _PydanticField(default_factory=dict)
     deterministic: bool = True
@@ -815,12 +823,10 @@ class Manifest(BaseModel):
 
 
 class TraceLink(BaseModel):
-    """One hop in the chain from a reported number back to source text."""
-
     model_config = ConfigDict(extra="forbid")
 
     level: Literal[
-        "number", "analysis", "cohort", "definition", "episode", "record", "span"
+        "result", "analysis", "cohort", "definition", "attribute", "record", "span"
     ]
     identifier: str
     detail: str = ""
@@ -845,30 +851,51 @@ class Trace(BaseModel):
         return [link.level for link in self.links]
 
 
-class PhenotypeQuerySpec(BaseModel):
-    """The compiled, inspectable plan an agent execution runs."""
+class QuerySpec(BaseModel):
+    """The compiled, inspectable plan an agent execution runs.
+
+    It **binds** a definition version. The agent never invents phenotype
+    parameters: a question implying a different window is a conflict to be
+    raised, not a parameter to override.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     question: str
     definition_id: str
     definition_version: int
+    definition_hash: str = ""
     studies: list[str] = _PydanticField(default_factory=list)
-    concept: str | None = None
-    window: tuple[int, int] | None = None
-    anchor: str | None = None
     verdicts: list[Verdict] = _PydanticField(default_factory=lambda: ["case"])
     accept_methods: list[Method] = _PydanticField(default_factory=list)
-    retrieval_mode: Literal["precise", "discovery", "hybrid"] = "precise"
-    top_k: int = 20
     notes: list[str] = _PydanticField(default_factory=list)
     backend: Literal["deterministic", "llm"] = "deterministic"
 
 
-class Clarification(BaseModel):
+class Conflict(BaseModel):
+    """A question that cannot be run against the definition it names."""
+
     model_config = ConfigDict(extra="forbid")
 
     question: str
-    ambiguity: str
+    conflict: str
+    bound_definition: str | None = None
     effect: str
     options: list[str] = _PydanticField(default_factory=list)
+
+
+class Supportability(BaseModel):
+    """Whether a study can answer the question at all, decided on metadata.
+
+    Run before any patient-level query. A study that cannot ascertain the
+    required modifier is worth knowing about before a cohort is built, not
+    after.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    study_id: str
+    profile: str = ""
+    status: Literal["supported", "supported_via_extraction", "cannot_ascertain"]
+    reason: str
+    modifier_homes: dict[str, list[str]] = _PydanticField(default_factory=dict)

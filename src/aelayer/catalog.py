@@ -1,12 +1,19 @@
-"""Configuration: the concept catalogue, the attribute catalogues, extraction.
+"""Configuration: concepts, modifier catalogues, dictionary versions, extraction.
 
-The catalogue is the shared value space. Every route into the system — a
-standard variable, a sponsor codelist, an investigator's phrase, a comment —
-resolves into the *same* normalized value, which is the only reason a phenotype
-rule can accept all of them without caring which one it got.
+Three separate normalization problems live here, and the code keeps them
+separate because they fail differently:
 
-Everything is loaded from ``config/`` and hashed by content, so a version string
-changes exactly when the thing it names changes.
+**Language variation.** "oral mucosal involvement" and "mucosal lesions of the
+mouth" resolve to one modifier value. Handled by the modifier catalogue's
+surface forms, read by the model path.
+
+**Coded-concept variation.** ``Rash`` and ``Rash erythematous`` are both
+legitimate codings. Nothing merges them; a phenotype's concept set decides which
+qualify, and no code path rewrites a coded value.
+
+**Terminology-version variation.** A code recorded under one dictionary version
+is reconciled to a target version only where the mapping is mechanical. What
+does not persist is flagged for review, never auto-recoded.
 """
 
 from __future__ import annotations
@@ -14,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field as _dc_field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -26,6 +33,11 @@ class ConfigError(ValueError):
     """Raised when a config file is structurally invalid."""
 
 
+Reconciliation = Literal[
+    "unchanged", "remapped_mechanically", "flagged_for_review", "not_attempted"
+]
+
+
 # --------------------------------------------------------------------------
 # Concepts
 # --------------------------------------------------------------------------
@@ -35,90 +47,64 @@ class ConfigError(ValueError):
 class Concept:
     concept_id: str
     label: str
-    coded_terms: dict[str, Any]
-    lexicon: tuple[str, ...]
-    abbreviations: tuple[str, ...]
-    recurrence_expected: bool = True
-    #: Whether the coded term for this concept can carry a body site. False for
-    #: every concept here, which is why the site has to survive somewhere else.
-    carries_body_site: bool = False
+    codes: dict[str, str]          # dictionary version -> coded string
+    lexicon: tuple[str, ...] = ()
 
-    def all_coded_terms(self) -> list[str]:
-        terms: set[str] = set()
-        for key, value in self.coded_terms.items():
-            if key == "by_dictionary_version":
-                for version_terms in (value or {}).values():
-                    terms.update(version_terms or [])
-            else:
-                terms.update(value or [])
-        return sorted(terms)
+    def code_in(self, version: str | None) -> str | None:
+        return self.codes.get(version or "")
 
-    def coded_terms_for_version(self, version: str | None) -> list[str]:
-        """The terms this concept carried under one dictionary version.
-
-        Falls back to the version-independent lists where a study's version is
-        unknown or not enumerated — which is a real situation, not an error.
-        """
-        by_version = self.coded_terms.get("by_dictionary_version") or {}
-        if version and version in by_version:
-            return sorted(by_version[version] or [])
-        flat: set[str] = set()
-        for key, value in self.coded_terms.items():
-            if key != "by_dictionary_version":
-                flat.update(value or [])
-        return sorted(flat)
+    def versions(self) -> list[str]:
+        return sorted(self.codes)
 
 
 @dataclass(frozen=True)
-class AttributeValue:
-    """One permissible value of an attribute, and how it appears in text."""
-
+class ModifierValue:
     value_id: str
     label: str
     surface_forms: tuple[str, ...]
-    region: str | None = None
 
 
 @dataclass(frozen=True)
-class AttributeCatalogue:
-    """The normalized value space for one attribute."""
+class ModifierCatalogue:
+    """The normalized value space for one modifier."""
 
     name: str
     label: str
-    values: dict[str, AttributeValue]
-    regions: dict[str, tuple[str, ...]] = _dc_field(default_factory=dict)
+    description: str
+    values: dict[str, ModifierValue]
 
     def value_ids(self) -> list[str]:
         return sorted(self.values)
 
-    def normalize(self, surface: str) -> str | None:
-        """Map a surface form onto a catalogue value.
-
-        Exact declared forms only. A phrase nobody wrote into the catalogue
-        returns None, and the extractor abstains rather than inventing a value.
-        """
-        folded = " ".join(surface.strip().lower().replace("-", " ").split())
-        for value in self.values.values():
-            for form in value.surface_forms:
-                if folded == " ".join(form.lower().replace("-", " ").split()):
-                    return value.value_id
-        return None
-
     def surface_index(self) -> dict[str, str]:
-        """Every declared surface form, mapped to its value id."""
+        """Every declared surface form, mapped to its value id, longest first."""
         index: dict[str, str] = {}
         for value in self.values.values():
             for form in value.surface_forms:
                 index[" ".join(form.lower().replace("-", " ").split())] = value.value_id
         return index
 
-    def in_region(self, region: str) -> list[str]:
-        if region not in self.regions:
-            raise ConfigError(
-                f"unknown region {region!r} for {self.name}; "
-                f"known: {sorted(self.regions)}"
-            )
-        return list(self.regions[region])
+    def normalize(self, surface: str) -> str | None:
+        """Map a surface form onto a catalogue value.
+
+        Declared forms only. A phrase nobody wrote into the catalogue returns
+        None, and the extractor abstains rather than inventing a value.
+        """
+        folded = " ".join(surface.strip().lower().replace("-", " ").split())
+        return self.surface_index().get(folded)
+
+
+@dataclass(frozen=True)
+class ReconciledCode:
+    """The result of reconciling one coded value to a target version."""
+
+    code: str
+    source_version: str
+    target_version: str
+    concept_id: str | None
+    reconciled_to: str | None
+    outcome: Reconciliation
+    note: str = ""
 
 
 class ConceptCatalog:
@@ -129,18 +115,22 @@ class ConceptCatalog:
         self.source_path = source_path
         self._validate(raw)
 
-        self.terminology: dict[str, Any] = raw.get("terminology") or {}
-        self.concepts: dict[str, Concept] = {}
-        for cid, body in (raw.get("concepts") or {}).items():
-            self.concepts[cid] = Concept(
+        self.dictionaries: dict[str, Any] = raw.get("dictionaries") or {}
+        self.dictionary_name: str = self.dictionaries.get("name", "")
+        self.dictionary_versions: tuple[str, ...] = tuple(
+            self.dictionaries.get("versions") or []
+        )
+        self.target_version: str = self.dictionaries.get("target", "")
+
+        self.concepts: dict[str, Concept] = {
+            cid: Concept(
                 concept_id=cid,
                 label=body.get("label", cid),
-                coded_terms=body.get("coded_terms") or {},
+                codes={str(k): str(v) for k, v in (body.get("codes") or {}).items()},
                 lexicon=tuple(body.get("lexicon") or []),
-                abbreviations=tuple(body.get("abbreviations") or []),
-                recurrence_expected=bool(body.get("recurrence_expected", True)),
-                carries_body_site=bool(body.get("carries_body_site", False)),
             )
+            for cid, body in (raw.get("concepts") or {}).items()
+        }
 
         self.concept_groups: dict[str, list[str]] = {}
         for gid, body in (raw.get("concept_groups") or {}).items():
@@ -152,38 +142,27 @@ class ConceptCatalog:
                 )
             self.concept_groups[gid] = members
 
-        self.attributes: dict[str, AttributeCatalogue] = {}
-        for name, body in (raw.get("attribute_catalogues") or {}).items():
-            values = {
-                vid: AttributeValue(
-                    value_id=vid,
-                    label=vbody.get("label", vid),
-                    surface_forms=tuple(vbody.get("surface_forms") or []),
-                    region=vbody.get("region"),
-                )
-                for vid, vbody in (body.get("values") or {}).items()
-            }
-            regions = {
-                region: tuple(members)
-                for region, members in (body.get("regions") or {}).items()
-            }
-            unknown = sorted(
-                {m for members in regions.values() for m in members} - set(values)
-            )
-            if unknown:
-                raise ConfigError(
-                    f"attribute {name!r} places unknown values in regions: {unknown}"
-                )
-            self.attributes[name] = AttributeCatalogue(
-                name=name, label=body.get("label", name), values=values, regions=regions
+        self.modifiers: dict[str, ModifierCatalogue] = {}
+        for name, body in (raw.get("modifiers") or {}).items():
+            self.modifiers[name] = ModifierCatalogue(
+                name=name,
+                label=body.get("label", name),
+                description=(body.get("description") or "").strip(),
+                values={
+                    vid: ModifierValue(
+                        value_id=vid,
+                        label=vbody.get("label", vid),
+                        surface_forms=tuple(vbody.get("surface_forms") or []),
+                    )
+                    for vid, vbody in (body.get("values") or {}).items()
+                },
             )
 
-        self.symptom_lexicon: dict[str, list[str]] = {
-            k: list(v) for k, v in (raw.get("symptom_lexicon") or {}).items()
-        }
-        self.episode_reconciliation: dict[str, Any] = (
-            raw.get("episode_reconciliation") or {}
-        )
+        # code string -> (concept_id, version), for reading a coded value back
+        self._by_code: dict[tuple[str, str], str] = {}
+        for concept in self.concepts.values():
+            for version, code in concept.codes.items():
+                self._by_code[(code.casefold(), version)] = concept.concept_id
 
     # -- validation ---------------------------------------------------------
 
@@ -193,17 +172,29 @@ class ConceptCatalog:
             raise ConfigError("concepts.yaml must be a mapping")
         if not raw.get("concepts"):
             raise ConfigError("concepts.yaml must define at least one concept")
+        dictionaries = raw.get("dictionaries") or {}
+        versions = set(dictionaries.get("versions") or [])
+        if not versions:
+            raise ConfigError("concepts.yaml must declare dictionary versions")
+        if dictionaries.get("target") not in versions:
+            raise ConfigError(
+                f"the target dictionary version "
+                f"{dictionaries.get('target')!r} is not one of {sorted(versions)}"
+            )
         for cid, body in raw["concepts"].items():
-            if not isinstance(body, dict):
-                raise ConfigError(f"concept {cid!r} must be a mapping")
-            if not body.get("lexicon") and not body.get("coded_terms"):
+            codes = body.get("codes") or {}
+            if not codes:
+                raise ConfigError(f"concept {cid!r} declares no coded strings")
+            unknown = sorted(set(codes) - versions)
+            if unknown:
                 raise ConfigError(
-                    f"concept {cid!r} needs a lexicon or coded terms to be matchable"
+                    f"concept {cid!r} declares codes under unknown dictionary "
+                    f"versions {unknown}"
                 )
-        for name, body in (raw.get("attribute_catalogues") or {}).items():
+        for name, body in (raw.get("modifiers") or {}).items():
             values = body.get("values") or {}
             if not values:
-                raise ConfigError(f"attribute catalogue {name!r} defines no values")
+                raise ConfigError(f"modifier {name!r} defines no values")
             for vid, vbody in values.items():
                 if not vbody.get("surface_forms"):
                     raise ConfigError(
@@ -225,29 +216,79 @@ class ConceptCatalog:
         except KeyError:
             raise ConfigError(f"unknown concept group {group_id!r}") from None
 
-    def attribute(self, name: str) -> AttributeCatalogue:
+    def modifier(self, name: str) -> ModifierCatalogue:
         try:
-            return self.attributes[name]
+            return self.modifiers[name]
         except KeyError:
             raise ConfigError(
-                f"unknown attribute catalogue {name!r}; "
-                f"known: {sorted(self.attributes)}"
+                f"unknown modifier {name!r}; known: {sorted(self.modifiers)}"
             ) from None
 
-    def normalize(self, attribute: str, surface: str) -> str | None:
-        return self.attribute(attribute).normalize(surface)
-
-    def concept_for_coded_term(self, term: str | None) -> str | None:
-        if not term:
+    def concept_for_code(self, code: str | None, version: str | None) -> str | None:
+        """Which concept a coded string belongs to, under its own version."""
+        if not code:
             return None
-        folded = term.strip().casefold()
-        for concept in self.concepts.values():
-            if folded in {t.casefold() for t in concept.all_coded_terms()}:
-                return concept.concept_id
+        folded = code.strip().casefold()
+        if version and (folded, version) in self._by_code:
+            return self._by_code[(folded, version)]
+        for (candidate, _version), concept_id in self._by_code.items():
+            if candidate == folded:
+                return concept_id
         return None
 
-    def dictionary_versions(self) -> list[str]:
-        return list(self.terminology.get("versions") or [])
+    # -- terminology-version reconciliation --------------------------------
+
+    def reconcile(
+        self, code: str, source_version: str, target_version: str | None = None
+    ) -> ReconciledCode:
+        """Reconcile one coded value to a target dictionary version.
+
+        Mechanical only. A code that persists across versions remaps; one that
+        does not is **flagged for review, never auto-recoded**. Nothing here
+        consults a model, and the original code is never modified — the result
+        is an additional field, not a replacement.
+        """
+        target = target_version or self.target_version
+        concept_id = self.concept_for_code(code, source_version)
+        if concept_id is None:
+            return ReconciledCode(
+                code=code, source_version=source_version, target_version=target,
+                concept_id=None, reconciled_to=None, outcome="flagged_for_review",
+                note=(
+                    f"{code!r} is not a code this catalogue knows under "
+                    f"{source_version}, so no mechanical mapping exists"
+                ),
+            )
+        concept = self.concepts[concept_id]
+        if source_version == target:
+            return ReconciledCode(
+                code=code, source_version=source_version, target_version=target,
+                concept_id=concept_id, reconciled_to=code, outcome="unchanged",
+                note="already recorded under the target version",
+            )
+        mapped = concept.code_in(target)
+        if mapped is None:
+            return ReconciledCode(
+                code=code, source_version=source_version, target_version=target,
+                concept_id=concept_id, reconciled_to=None,
+                outcome="flagged_for_review",
+                note=(
+                    f"{concept_id} has no code under {target}; a human decides "
+                    f"what it becomes, and no model recodes it"
+                ),
+            )
+        if mapped == code:
+            return ReconciledCode(
+                code=code, source_version=source_version, target_version=target,
+                concept_id=concept_id, reconciled_to=mapped, outcome="unchanged",
+                note=f"the code is identical under {target}",
+            )
+        return ReconciledCode(
+            code=code, source_version=source_version, target_version=target,
+            concept_id=concept_id, reconciled_to=mapped,
+            outcome="remapped_mechanically",
+            note=f"{code!r} is {mapped!r} under {target}; the mapping is 1:1",
+        )
 
 
 # --------------------------------------------------------------------------
@@ -258,7 +299,7 @@ class ConceptCatalog:
 class ExtractionConfig:
     """Read-only view over ``extraction.yaml``."""
 
-    REQUIRED = ("modifiers", "readable_sources", "extractable_attributes")
+    REQUIRED = ("readable_sources", "extractable_modifiers", "assertion")
 
     def __init__(self, raw: dict[str, Any], source_path: Path | None = None):
         if not isinstance(raw, dict):
@@ -268,48 +309,56 @@ class ExtractionConfig:
                 raise ConfigError(f"extraction.yaml is missing section {section!r}")
         self.raw = raw
         self.source_path = source_path
-        self.version: str = raw.get("version", "extract-3.0.0")
+        self.version: str = raw.get("version", "extract-4.0.0")
         self.readable_sources: tuple[str, ...] = tuple(raw["readable_sources"])
-        self.extractable_attributes: tuple[str, ...] = tuple(
-            raw["extractable_attributes"]
+        self.extractable_modifiers: tuple[str, ...] = tuple(
+            raw["extractable_modifiers"]
         )
-        self.modifiers: dict[str, Any] = raw["modifiers"]
-        self.quality_lexicon: dict[str, list[str]] = raw.get("quality_lexicon") or {}
-        self.severity: dict[str, list[str]] = raw.get("severity") or {}
+        self.assertion: dict[str, Any] = raw["assertion"]
+        self.confidence: dict[str, float] = raw.get("confidence") or {}
         self.anchors: dict[str, Any] = raw.get("anchors") or {}
         self.default_anchor: str | None = raw.get("default_anchor")
-        self.confidence: dict[str, float] = raw.get("confidence") or {}
         self._validate()
 
     def _validate(self) -> None:
-        from .models import SOURCE_KINDS
+        from .models import ASSERTIONS, SOURCE_KINDS, STRUCTURED_SOURCES
 
         unknown = sorted(set(self.readable_sources) - set(SOURCE_KINDS))
         if unknown:
             raise ConfigError(f"readable_sources names unknown source kinds: {unknown}")
-        forbidden = sorted(
-            set(self.readable_sources)
-            & {"structured_standard", "structured_sponsor"}
-        )
+        forbidden = sorted(set(self.readable_sources) & STRUCTURED_SOURCES)
         if forbidden:
             raise ConfigError(
                 f"readable_sources includes {forbidden}: a value the CRF already "
                 f"settled is not a question for a model, and the guard would "
                 f"refuse it anyway"
             )
-        scope = self.modifiers.get("scope", "sentence")
+        for assertion_class in (self.assertion.get("cues") or {}):
+            if assertion_class not in ASSERTIONS:
+                raise ConfigError(
+                    f"unknown assertion class in cues: {assertion_class!r}"
+                )
+        if self.assertion.get("default", "present") not in ASSERTIONS:
+            raise ConfigError(
+                f"default assertion {self.assertion.get('default')!r} is not one "
+                f"of {list(ASSERTIONS)}"
+            )
+        scope = self.assertion.get("scope", "sentence")
         if scope not in ("sentence", "window"):
-            raise ConfigError(f"modifier scope must be sentence|window, got {scope!r}")
+            raise ConfigError(f"assertion scope must be sentence|window, got {scope!r}")
+
+    def cue_lists(self, assertion_class: str) -> tuple[list[str], list[str]]:
+        """``(pre_cues, post_cues)`` for one assertion class."""
+        body = (self.assertion.get("cues") or {}).get(assertion_class)
+        if body is None:
+            return [], []
+        if isinstance(body, list):
+            return list(body), []
+        return list(body.get("pre") or []), list(body.get("post") or [])
 
     def confidence_for(self, key: str, default: float = 0.5) -> float:
         value = self.confidence.get(key)
-        if value is None:
-            value = (self.modifiers.get("confidence") or {}).get(key)
         return float(default if value is None else value)
-
-    @property
-    def review_below(self) -> float:
-        return self.confidence_for("review_below", 0.6)
 
 
 # --------------------------------------------------------------------------
@@ -319,15 +368,13 @@ class ExtractionConfig:
 
 @dataclass(frozen=True)
 class Configs:
-    """Everything loaded from `config/`, with the versions they imply."""
-
     catalog: ConceptCatalog
     extraction: ExtractionConfig
     profiles: Any
     extractor_version: str
     normalizer_version: str
 
-    def terminology_versions(self) -> dict[str, str]:
+    def dictionary_versions(self) -> dict[str, str]:
         return self.profiles.dictionary_versions()
 
 
@@ -344,12 +391,8 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 
 @lru_cache(maxsize=16)
 def _load_cached(
-    concepts_path: str,
-    extraction_path: str,
-    profiles_path: str,
-    _concepts_hash: str,
-    _extraction_hash: str,
-    _profiles_hash: str,
+    concepts_path: str, extraction_path: str, profiles_path: str,
+    _concepts_hash: str, _extraction_hash: str, _profiles_hash: str,
 ) -> Configs:
     from .profiles import StudyProfiles
 

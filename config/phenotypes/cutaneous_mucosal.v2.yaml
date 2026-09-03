@@ -1,0 +1,54 @@
+id: cutaneous_mucosal
+version: 2
+status: frozen
+label: Cutaneous event with mucosal involvement, structured evidence only
+description: >
+  As v1, but the modifier must come from a structured route. This is a
+  narrower scientific claim, not a bug fix: it says the study's own coded
+  qualifier is the only acceptable evidence of mucosal involvement. Comparing
+  it against v1 is what the value ablation measures.
+supersedes: cutaneous_mucosal.v1
+authors: ["clinical-evidence-prototype"]
+created: 2026-09-03
+
+# 1 · which coded concepts qualify
+concept_set:
+  # Three legitimate codings of the same clinical situation. The definition
+  # decides they all qualify; nothing merges or rewrites them. Membership is
+  # decided by concept, so a record still qualifies when its code has no
+  # mechanical mapping to the target version — that record is flagged for
+  # review at reconciliation, not silently recoded and not silently dropped.
+  include: [RASH, RASH_ERYTHEMATOUS, RASH_MACULOPAPULAR]
+  dictionary_target: "D-21.0"
+
+# 2 · required attributes
+modifiers:
+  - name: mucosal_involvement
+    require_assertion: present
+    # Route-agnostic by design: the rule does not know or care which study
+    # field supplied the evidence, only that it is present and points at
+    # something a reader can check.
+    accept_methods: [direct]
+    on_unavailable: not_ascertainable
+    description: >
+      An observed absence is a non_case; silence is not. The two are different
+      fields on the attribute and the evaluator reads both.
+
+# 3 · when, relative to what
+temporal:
+  anchor: first_exposure
+  window: {min: 0, max: 30, unit: days}
+  on_unresolved: review
+
+# 4 · what counts as support
+evidence_policy:
+  extracted_requires_span: true
+  min_confidence: 0.7
+  below_threshold: review
+
+# 5 · what happens when evidence is missing
+ascertainability:
+  missing_required_modifier: not_ascertainable
+  uncertain_assertion: review
+
+verdicts: [case, non_case, review, not_ascertainable]

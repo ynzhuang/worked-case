@@ -1,417 +1,211 @@
-"""Episode reconciliation.
+"""Episode grouping — deliberately demoted.
 
-An evolving event may be recorded as several source records under some
-collection conventions and as one under others. Deriving an episode lets an
-analysis reason about the clinical event; keeping the records untouched
-underneath means the derivation can be redone when the assumption changes.
+An evolving event may be written as several source records under one collection
+convention and as a single record under another. Grouping them lets an analysis
+talk about the clinical event rather than the paperwork.
 
-**Reconciliation is a declared assumption, not a solved problem.** The default
-rule — same subject, same concept, intervals overlapping or close — is wrong for
-recurrent conditions, so the catalogue declares ``recurrence_expected`` per
-concept and anything the rules cannot settle is flagged rather than quietly
-resolved.
+In this version that grouping is **secondary**, and the demotion is the design
+decision, not an omission:
 
-Promoting an attribute from records to the episode keeps its route. Where two
-records disagree, the more authoritative route wins — a value the CRF settled
-outranks one read out of prose — and the losing value is recorded in the note
-rather than discarded silently.
+* Nothing evaluates a phenotype at the episode grain. Verdicts, denominators,
+  the silver standard and the ablation all run on source records, because the
+  source record is the thing the study actually collected and the only grain
+  every claim can be traced back to.
+* No attribute is promoted from a record onto an episode. Promotion means
+  choosing between two records that disagree, and that choice would sit
+  underneath every downstream number while being invisible in it.
+* An episode is therefore a **grouping with a stated rule and a confidence**,
+  and nothing more. It is offered as a view; anything it cannot settle it
+  reports rather than resolves.
+
+The earlier version of this layer put episodes at the centre and derived cases
+from them. That made a declared linkage assumption — one that is simply wrong
+for recurrent conditions — load-bearing for every rate the system produced. The
+records are the grain now, and this module sits above them.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
-from dataclasses import dataclass
+from dataclasses import dataclass, field as _dc_field
 from typing import Any, Iterable, Sequence
 
-from .anchors import AnchorResolver
-from .catalog import ConceptCatalog
-from .models import (
-    Attribute,
-    CanonicalAEEpisode,
-    CanonicalAERecord,
-    LinkageRule,
-    Span,
+from .models import CanonicalAERecord
+
+#: How the grouping rules are named in output. `single_record` is by far the
+#: most common and is not a fallback: most studies write one record per event.
+LINKAGE_RULES = (
+    "single_record",
+    "explicit_continuation",
+    "gap_within_tolerance",
+    "flagged_for_review",
 )
-from .profiles import StudyProfiles
-
-#: How much a route is trusted when two records disagree. Not a claim that
-#: extraction is unreliable — a claim that a value the study itself coded is the
-#: study's own answer, and outranks a reading of its prose.
-METHOD_RANK = {"direct": 3, "normalized": 2, "extracted": 1, None: 0}
-
-
-@dataclass(frozen=True)
-class LinkageDecision:
-    attach: bool
-    rule: LinkageRule
-    confidence: float
-    review_required: bool
-    note: str
 
 
 @dataclass
-class ReconciliationConfig:
-    overlap_tolerance_days: int = 3
-    recurrence_gap_days: int = 7
-    confidence: dict[str, float] = None  # type: ignore[assignment]
+class Episode:
+    """A group of source records believed to describe one clinical event.
 
-    def __post_init__(self) -> None:
-        self.confidence = self.confidence or {}
-
-    @classmethod
-    def from_catalog(cls, catalog: ConceptCatalog) -> "ReconciliationConfig":
-        body = catalog.episode_reconciliation or {}
-        return cls(
-            overlap_tolerance_days=int(body.get("overlap_tolerance_days", 3)),
-            recurrence_gap_days=int(body.get("recurrence_gap_days", 7)),
-            confidence=dict(body.get("confidence") or {}),
-        )
-
-    def score(self, rule: str, default: float) -> float:
-        return float(self.confidence.get(rule, default))
-
-
-class EpisodeReconciler:
-    def __init__(
-        self,
-        catalog: ConceptCatalog,
-        profiles: StudyProfiles,
-        config: ReconciliationConfig | None = None,
-        anchor_resolver: AnchorResolver | None = None,
-        default_anchor: str | None = None,
-    ):
-        self.catalog = catalog
-        self.profiles = profiles
-        self.config = config or ReconciliationConfig.from_catalog(catalog)
-        self.resolver = anchor_resolver
-        self.default_anchor = default_anchor
-
-    # -- the decision -------------------------------------------------------
-
-    def decide(
-        self, previous: CanonicalAERecord, candidate: CanonicalAERecord,
-        concept: str | None,
-    ) -> LinkageDecision:
-        """Does ``candidate`` continue the episode ``previous`` belongs to?"""
-        if candidate.continuation_of == previous.source_record_id:
-            return LinkageDecision(
-                True, "explicit_continuation",
-                self.config.score("explicit_continuation", 1.0), False,
-                f"the CRF declares continuation of {previous.source_record_id}",
-            )
-
-        start = candidate.onset.value
-        previous_start = previous.onset.value
-        previous_end = previous.end.value
-
-        if start is None or previous_start is None:
-            return LinkageDecision(
-                False, "single_record", 0.4, True,
-                "onset is not resolvable on one of the records, so temporal "
-                "linkage cannot be evaluated either way",
-            )
-
-        profile = self.profiles.for_study(candidate.study_id)
-        if profile.splits_on_severity_change():
-            same_window = abs((start - previous_start).days) <= max(
-                self.config.overlap_tolerance_days, 7
-            )
-            if same_window:
-                return LinkageDecision(
-                    True, "declared_convention",
-                    self.config.score("declared_convention", 0.95), False,
-                    f"{profile.profile_id} declares that it splits an evolving "
-                    f"event across records on severity change",
-                )
-
-        if previous_end is not None and start <= previous_end:
-            return LinkageDecision(
-                True, "temporal_overlap",
-                self.config.score("temporal_overlap", 0.9), False,
-                f"onset {start.isoformat()} falls inside the previous record's "
-                f"interval, which ends {previous_end.isoformat()}",
-            )
-
-        reference = previous_end or previous_start
-        gap = (start - reference).days
-        recurs = self._recurrence_expected(concept)
-        if gap <= self.config.overlap_tolerance_days and not recurs:
-            return LinkageDecision(
-                True, "gap_within_tolerance",
-                self.config.score("gap_within_tolerance", 0.75), True,
-                f"a {gap}-day gap, and {concept} is not a concept where "
-                f"recurrence is expected, so the records are read as one "
-                f"condition changing — flagged because the rule is a judgement",
-            )
-        return LinkageDecision(
-            False, "recurrence_split",
-            self.config.score("recurrence_split", 0.9), False,
-            f"a {gap}-day gap"
-            + (
-                f", and recurrence is expected for {concept}, so these are "
-                f"separate episodes"
-                if recurs else ", which is beyond the tolerance for merging"
-            ),
-        )
-
-    def _recurrence_expected(self, concept: str | None) -> bool:
-        if not concept:
-            return True
-        try:
-            return self.catalog.concept(concept).recurrence_expected
-        except Exception:
-            return True
-
-    # -- assembly -----------------------------------------------------------
-
-    def reconcile(
-        self, records: Iterable[CanonicalAERecord]
-    ) -> list[CanonicalAEEpisode]:
-        records = list(records)
-        component = _continuation_components(records)
-
-        # A continuation record often carries nothing that standardizes, so it
-        # inherits the concept of the chain the CRF put it in rather than being
-        # stranded on its own.
-        component_concept: dict[str, str | None] = {}
-        for record in records:
-            root = component[record.source_record_id]
-            if component_concept.get(root) is None:
-                component_concept[root] = record.standardized_concept
-
-        grouped: dict[tuple[str, str, str], list[CanonicalAERecord]] = {}
-        for record in records:
-            root = component[record.source_record_id]
-            concept = record.standardized_concept or component_concept.get(root)
-            grouped.setdefault(
-                (record.study_id, record.subject_id, concept or f"UNMAPPED::{root}"),
-                [],
-            ).append(record)
-
-        episodes: list[CanonicalAEEpisode] = []
-        for (study_id, subject_id, concept_key), chain in sorted(grouped.items()):
-            chain.sort(key=lambda r: (r.onset.value or _dt.date.min, r.source_record_id))
-            concept = None if concept_key.startswith("UNMAPPED::") else concept_key
-            current: list[CanonicalAERecord] = [chain[0]]
-            decision = LinkageDecision(
-                True, "single_record", self.config.score("single_record", 1.0),
-                False, "a single source record",
-            )
-            for record in chain[1:]:
-                verdict = self.decide(current[-1], record, concept)
-                if verdict.attach:
-                    current.append(record)
-                    decision = verdict
-                else:
-                    episodes.append(self._build(
-                        study_id, subject_id, concept, current, decision,
-                        len(episodes),
-                    ))
-                    current = [record]
-                    decision = LinkageDecision(
-                        True, "single_record",
-                        self.config.score("single_record", 1.0), False,
-                        f"a new episode: {verdict.note}",
-                    )
-            episodes.append(
-                self._build(study_id, subject_id, concept, current, decision,
-                            len(episodes))
-            )
-        return sorted(episodes, key=lambda e: e.episode_id)
-
-    def _build(
-        self, study_id: str, subject_id: str, concept: str | None,
-        chain: Sequence[CanonicalAERecord], decision: LinkageDecision, index: int,
-    ) -> CanonicalAEEpisode:
-        first, last = chain[0], chain[-1]
-        profile = self.profiles.for_study(study_id)
-        episode_id = (
-            f"{subject_id}::{concept or 'UNMAPPED'}::{first.source_record_id}"
-        )
-        spans: list[Span] = []
-        for record in chain:
-            spans.extend(record.spans())
-
-        offset, anchor_event, anchor_date = self._anchor(
-            subject_id, first.onset.value
-        )
-
-        return CanonicalAEEpisode(
-            episode_id=episode_id,
-            study_id=study_id,
-            subject_id=subject_id,
-            profile=profile.profile_id,
-            standardized_concept=concept,
-            episode_start=_carry(first.onset),
-            episode_end=_carry(last.end),
-            source_record_ids=[r.source_record_id for r in chain],
-            location=_promote(chain, "location"),
-            laterality=_promote(chain, "laterality"),
-            pattern=_promote(chain, "pattern"),
-            severity=_promote(chain, "severity"),
-            seriousness=_promote(chain, "seriousness"),
-            relatedness=_promote(chain, "relatedness"),
-            outcome=_carry(last.outcome),
-            action_taken=_promote(chain, "action_taken"),
-            coded_events=sorted(
-                {r.coded_event.value for r in chain if r.coded_event.populated}
-            ),
-            reported_terms=sorted(
-                {r.reported_term.value for r in chain if r.reported_term.populated}
-            ),
-            dictionary_versions=sorted(
-                {r.dictionary_version for r in chain if r.dictionary_version}
-            ),
-            severity_trajectory=[
-                (r.onset.value, r.severity.value)
-                for r in chain if r.severity.populated
-            ],
-            onset_offset_days=offset,
-            anchor_event=anchor_event,
-            anchor_date=anchor_date,
-            linked_evidence=_dedupe(spans),
-            linkage_rule=decision.rule if len(chain) > 1 else "single_record",
-            linkage_confidence=(
-                decision.confidence if len(chain) > 1
-                else self.config.score("single_record", 1.0)
-            ),
-            linkage_review_required=decision.review_required and len(chain) > 1,
-            linkage_note=decision.note,
-            episode_provenance={
-                "record_count": len(chain),
-                "source_record_ids": [r.source_record_id for r in chain],
-                "normalizer_versions": sorted({r.normalizer_version for r in chain}),
-                "extractor_versions": sorted(
-                    {r.extractor_version for r in chain if r.extractor_version}
-                ),
-                "profile": profile.profile_id,
-            },
-        )
-
-    def _anchor(
-        self, subject_id: str, start: _dt.date | None
-    ) -> tuple[Attribute[int], str | None, _dt.date | None]:
-        """The offset from the study's anchor, so a window can be applied.
-
-        Unresolvable is a state, not a zero: with no exposure record to measure
-        from, the offset stays unknown and says why rather than defaulting to a
-        number a filter would silently trust.
-        """
-        if self.resolver is None or self.default_anchor is None:
-            return Attribute[int].unavailable(
-                "unknown", note="no anchor configuration to resolve an offset"
-            ), None, None
-        if start is None:
-            return Attribute[int].unavailable(
-                "unknown", note="the episode has no resolvable start"
-            ), None, None
-        hit = self.resolver.resolve(
-            subject_id, self.default_anchor, onset_date=start
-        )
-        if hit is None:
-            return Attribute[int].unavailable(
-                "unknown",
-                note=f"no {self.default_anchor} occurrence in this subject's "
-                     f"exposure record",
-            ), None, None
-        return (
-            Attribute[int](
-                value=(start - hit.date).days, availability="collected",
-                method="normalized", source="derived",
-                source_variable=f"EX.{self.default_anchor}",
-                note=f"{self.default_anchor} on {hit.date.isoformat()} ({hit.detail})",
-            ),
-            self.default_anchor,
-            hit.date,
-        )
-
-
-# --------------------------------------------------------------------------
-
-
-def _continuation_components(
-    records: Sequence[CanonicalAERecord],
-) -> dict[str, str]:
-    """Union-find over declared continuation chains.
-
-    A chain the CRF itself declares outranks everything, including whether the
-    records in it could be standardized — otherwise two records the study linked
-    land in different episodes because neither coded to a catalogue term.
+    Carries no attributes of its own. To read a value, read it off one of the
+    records — where they disagree, that disagreement is a finding, not
+    something for this class to average away.
     """
-    parent: dict[str, str] = {r.source_record_id: r.source_record_id for r in records}
 
-    def find(node: str) -> str:
-        while parent[node] != node:
-            parent[node] = parent[parent[node]]
-            node = parent[node]
-        return node
+    episode_id: str
+    subject_id: str
+    study_id: str
+    concept_id: str | None
+    record_ids: list[str] = _dc_field(default_factory=list)
+    rule: str = "single_record"
+    confidence: float = 1.0
+    review_required: bool = False
+    note: str = ""
 
+    @property
+    def size(self) -> int:
+        return len(self.record_ids)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "episode_id": self.episode_id,
+            "subject_id": self.subject_id,
+            "study_id": self.study_id,
+            "concept_id": self.concept_id,
+            "record_ids": list(self.record_ids),
+            "n_records": self.size,
+            "rule": self.rule,
+            "confidence": self.confidence,
+            "review_required": self.review_required,
+            "note": self.note,
+        }
+
+
+@dataclass
+class EpisodeView:
+    """Every episode over one snapshot, plus what could not be settled."""
+
+    episodes: list[Episode] = _dc_field(default_factory=list)
+    note: str = (
+        "Episodes are a derived view. Source records are unmodified beneath "
+        "them, no attribute is promoted onto an episode, and no phenotype is "
+        "evaluated at this grain."
+    )
+
+    def rules(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for episode in self.episodes:
+            counts[episode.rule] = counts.get(episode.rule, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def flagged(self) -> list[Episode]:
+        return [e for e in self.episodes if e.review_required]
+
+    def for_record(self, record_id: str) -> Episode | None:
+        return next(
+            (e for e in self.episodes if record_id in e.record_ids), None
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "n_episodes": len(self.episodes),
+            "n_records": sum(e.size for e in self.episodes),
+            "rules": self.rules(),
+            "n_flagged": len(self.flagged()),
+            "note": self.note,
+        }
+
+
+def _onset(record: CanonicalAERecord) -> _dt.date | None:
+    return record.onset.value if record.onset.observed else None
+
+
+def _end(record: CanonicalAERecord) -> _dt.date | None:
+    return record.end.value if record.end.observed else None
+
+
+def group_records(
+    records: Iterable[CanonicalAERecord], *, gap_tolerance_days: int = 3
+) -> EpisodeView:
+    """Group records into episodes under one declared rule.
+
+    Same subject, same study, same concept, and intervals that touch or sit
+    within the tolerance. Records whose dates cannot be read are never merged
+    on a guess: they stand alone and say why.
+    """
+    view = EpisodeView()
+    buckets: dict[tuple[str, str, str | None], list[CanonicalAERecord]] = {}
     for record in records:
-        target = record.continuation_of
-        if target and target in parent:
-            a, b = find(record.source_record_id), find(target)
-            if a != b:
-                parent[max(a, b)] = min(a, b)
-    return {r.source_record_id: find(r.source_record_id) for r in records}
+        key = (record.study_id, record.subject_id, record.concept_id)
+        buckets.setdefault(key, []).append(record)
+
+    for (study_id, subject_id, concept_id), group in sorted(buckets.items()):
+        group.sort(key=lambda r: (_onset(r) or _dt.date.max, r.record_id))
+        current: list[CanonicalAERecord] = []
+        rule = "single_record"
+        review = False
+        note = ""
+
+        def flush() -> None:
+            nonlocal current, rule, review, note
+            if not current:
+                return
+            view.episodes.append(Episode(
+                episode_id=(
+                    f"{study_id}::{subject_id}::{concept_id or 'UNCODED'}::"
+                    f"{len(view.episodes) + 1:02d}"
+                ),
+                subject_id=subject_id,
+                study_id=study_id,
+                concept_id=concept_id,
+                record_ids=[r.record_id for r in current],
+                rule=("single_record" if len(current) == 1 else rule),
+                confidence=(1.0 if len(current) == 1 else 0.7),
+                review_required=review and len(current) > 1,
+                note=note,
+            ))
+            current, rule, review, note = [], "single_record", False, ""
+
+        for record in group:
+            if not current:
+                current = [record]
+                continue
+            previous = current[-1]
+            previous_end = _end(previous) or _onset(previous)
+            this_onset = _onset(record)
+            if previous_end is None or this_onset is None:
+                # One of the two has no readable date. Merging would be a
+                # guess, so they stay apart and the reason is on the record.
+                flush()
+                current = [record]
+                note = (
+                    "not merged with the preceding record: one of the two has "
+                    "no readable onset or end date, and merging on a guess "
+                    "would put an assumption underneath every later number"
+                )
+                continue
+            gap = (this_onset - previous_end).days
+            if gap <= gap_tolerance_days:
+                current.append(record)
+                rule = "gap_within_tolerance"
+                review = gap > 0
+                note = (
+                    f"records {gap} day(s) apart, within the declared tolerance "
+                    f"of {gap_tolerance_days}; a recurrent condition would need "
+                    f"a different rule and this one is declared, not inferred"
+                )
+            else:
+                flush()
+                current = [record]
+        flush()
+    return view
 
 
-def _promote(
-    chain: Sequence[CanonicalAERecord], name: str
-) -> Attribute[Any]:
-    """Lift one attribute from the records to the episode, keeping its route.
-
-    The most authoritative populated value wins. Where a less authoritative
-    route disagreed, the note says so: a disagreement between the CRF and the
-    investigator's own words is a finding, not noise to be dropped.
-    """
-    populated = [
-        (r, r.attribute(name)) for r in chain
-        if r.attribute(name) and r.attribute(name).populated
-    ]
-    if not populated:
-        # Keep the most informative reason for the emptiness.
-        for record in chain:
-            attribute = record.attribute(name)
-            if attribute and attribute.availability != "unknown":
-                return attribute.model_copy(deep=True)
-        attribute = chain[0].attribute(name)
-        return (
-            attribute.model_copy(deep=True) if attribute
-            else Attribute[Any].unavailable("unknown")
-        )
-
-    populated.sort(
-        key=lambda pair: (
-            METHOD_RANK.get(pair[1].method, 0), pair[1].confidence or 0.0
-        ),
-        reverse=True,
-    )
-    best = populated[0][1]
-    others = {p[1].value for p in populated[1:] if p[1].value != best.value}
-    if not others:
-        return best.model_copy(deep=True)
-    note = (
-        f"{best.note + '; ' if best.note else ''}records in this episode "
-        f"disagree: {sorted(others)} also recorded, and the "
-        f"{best.method} value from {best.source_variable} was taken as the "
-        f"study's own answer"
-    )
-    return best.model_copy(deep=True, update={"note": note})
-
-
-def _carry(attribute: Attribute[Any]) -> Attribute[Any]:
-    return attribute.model_copy(deep=True)
-
-
-def _dedupe(spans: Sequence[Span]) -> list[Span]:
-    seen: dict[tuple, Span] = {}
-    for span in spans:
-        seen.setdefault(span.key(), span)
-    return sorted(seen.values(), key=lambda s: (s.field, s.doc_id, s.start, s.end))
+def episode_table(view: EpisodeView) -> list[dict[str, Any]]:
+    return [episode.to_dict() for episode in view.episodes]
 
 
 def reconcile_records(
-    records: Iterable[CanonicalAERecord], catalog: ConceptCatalog,
-    profiles: StudyProfiles,
-) -> list[CanonicalAEEpisode]:
-    return EpisodeReconciler(catalog, profiles).reconcile(records)
+    records: Sequence[CanonicalAERecord], *, gap_tolerance_days: int = 3
+) -> EpisodeView:
+    """Alias kept for callers that read as "reconcile"; the same grouping."""
+    return group_records(records, gap_tolerance_days=gap_tolerance_days)

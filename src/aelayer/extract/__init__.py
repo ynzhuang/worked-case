@@ -1,10 +1,16 @@
-"""The model path: modifiers expressed in language."""
+"""The model path: modifiers expressed in language, and nothing else."""
 
-from .backends import ExtractionRequest, ExtractionResult, RulesBackend, select_backend
-from .engine import ExtractionEngine, enrich_records
-from .modifiers import ModifierExtractor, ModifierHit
+from .assertion import AssertionCall, AssertionClassifier
+from .backends import (
+    LANGUAGE_VARIATION, ExtractionRequest, ExtractionResult, LLMBackend,
+    RulesBackend, select_backend,
+)
+from .engine import ExtractionEngine, ExtractionStats, enrich_records
+from .mentions import MentionFinder, ModifierMention
 
 __all__ = [
-    "ExtractionEngine", "ExtractionRequest", "ExtractionResult", "ModifierExtractor",
-    "ModifierHit", "RulesBackend", "enrich_records", "select_backend",
+    "LANGUAGE_VARIATION", "AssertionCall", "AssertionClassifier",
+    "ExtractionEngine", "ExtractionRequest", "ExtractionResult",
+    "ExtractionStats", "LLMBackend", "MentionFinder", "ModifierMention",
+    "RulesBackend", "enrich_records", "select_backend",
 ]

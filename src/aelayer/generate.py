@@ -4,21 +4,20 @@ Everything here is computer generated. No real patient data, and nothing
 derived from real patient data, is present anywhere in this repository.
 
 The generator samples a ``ClinicalTruth`` — what happened to a patient — and
-then renders that same truth under each study profile. The truth does not
-change; where its attributes end up does. That is the entire subject of the
-prototype, and it is why the gold labels distinguish three different things:
+renders that same truth under seven study profiles. The truth does not change;
+where its modifier ends up, and whether it can be read at all, does.
 
-``true_location``
-    what was actually the case
-``availability``
-    whether this rendering could record it at all
-``true_verdict``
-    what the phenotype should conclude *from this rendering*, which is
-    ``not_ascertainable`` wherever the location had nowhere to live
+Three of the profiles exist to make a specific distinction testable:
 
-A fraction of events are genuinely generalised. Those are recorded as
-``GENERALISED`` and are a real negative — which is what makes "no truncal
-location" and "no location recorded" separable in the answer key.
+``P_both``
+    the modifier in a structured qualifier *and* in the reported term, which is
+    the evaluation set the silver standard is built from
+``P_negated``
+    the reported term states the modifier is **absent** — the only way to prove
+    the system tells a documented negative from silence
+``P_absent``
+    the modifier nowhere, so a qualifying event with qualifying timing still
+    cannot be evaluated
 """
 
 from __future__ import annotations
@@ -26,6 +25,7 @@ from __future__ import annotations
 import csv
 import datetime as _dt
 import json
+import hashlib
 import random
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -38,90 +38,66 @@ from .profiles import StudyProfile, StudyProfiles
 SYNTHETIC_FLAG = "Y"
 DOC_HEADER = "*** SYNTHETIC RECORD - COMPUTER GENERATED - NOT REAL PATIENT DATA ***"
 
-#: Truncal locations are the ones te_truncal_rash asks about.
-TRUNCAL = ("CHEST", "ABDOMEN", "BACK")
-NON_TRUNCAL = ("ARM", "LEG", "FACE")
+CUTANEOUS = ("RASH", "RASH_ERYTHEMATOUS", "RASH_MACULOPAPULAR")
+DISTRACTORS = ("PRURITUS", "NAUSEA", "NEUTROPENIA")
 
-#: Distractor concepts, so the corpus is not all rash.
-DISTRACTORS = ("NAUSEA", "HEADACHE", "ANAEMIA", "PRURITUS", "URTICARIA")
-
-#: Coded terms the generator assigns, by concept. None of them carries a site.
-CODED_TERMS = {
-    "RASH": ["Rash", "Skin rash", "Eruption"],
-    "URTICARIA": ["Urticaria", "Hives"],
-    "PRURITUS": ["Pruritus", "Itching"],
-    "NAUSEA": ["Nausea"],
-    "HEADACHE": ["Headache"],
-    "ANAEMIA": ["Anaemia", "Anemia"],
+#: Phrasings a site writes for mucosal involvement, by catalogue value. Several
+#: per value, so normalization is doing real work rather than matching one
+#: canned string.
+MUCOSAL_PHRASES = {
+    "ORAL": ["oral mucosal involvement", "mucosal lesions of the mouth",
+             "oral ulceration", "buccal erosions", "stomatitis"],
+    "OCULAR": ["ocular involvement", "conjunctival involvement"],
+    "GENITAL": ["genital erosions", "genital involvement"],
+    "UNSPECIFIED": ["mucosal involvement", "mucous membrane involvement",
+                    "mucosal erosions"],
 }
 
-#: What a site writes when the CRF gives it a free-text term box. Several
-#: phrasings per location, so normalization is doing real work in the silver
-#: standard rather than matching one canned string.
-LOCATION_PHRASES = {
-    "CHEST": ["chest", "anterior chest", "chest wall"],
-    "ABDOMEN": ["abdomen", "periumbilical area", "flank"],
-    "BACK": ["back", "upper back", "lower back"],
-    "ARM": ["arm", "forearm", "upper arm"],
-    "LEG": ["leg", "thigh", "calf"],
-    "FACE": ["face", "cheek", "forehead"],
-    "GENERALISED": ["generalised", "widespread", "diffuse"],
+#: Phrasings no catalogue value covers. The extractor meets these and abstains,
+#: which is the behaviour the abstention rate exists to measure.
+UNLEXICONED = ["involvement of the wet surfaces", "erosive changes internally",
+               "lining tissue affected"]
+
+NEGATION_TEMPLATES = [
+    "{event} without {modifier}",
+    "{event}, no {modifier}",
+    "{event}; {modifier} was absent",
+    "{event}, {modifier} was not present",
+]
+
+UNCERTAIN_TEMPLATES = [
+    "{event} with possible {modifier}",
+    "{event}, query {modifier}",
+    "{event}; {modifier} cannot be excluded",
+]
+
+PRESENT_TEMPLATES = [
+    "{event} with {modifier}",
+    "{event} and {modifier}",
+    "{event}, {modifier} noted",
+]
+
+COMMENT_TEMPLATES = {
+    "present": [
+        "Investigator comment: {modifier} confirmed at the study visit.",
+        "Site clarification: the eruption was accompanied by {modifier}.",
+    ],
+    "absent": [
+        "Investigator comment: no {modifier} was seen at any visit.",
+        "Site clarification: the mucosa was examined and spared.",
+    ],
+    "uncertain": [
+        "Investigator comment: possible {modifier}, not confirmed.",
+    ],
 }
 
-#: Adjectival forms only: these qualify the event term ("maculopapular rash"),
-#: so a plural noun would not read as English.
-PATTERN_PHRASES = {
-    "MACULAR": ["macular"],
-    "PAPULAR": ["papular"],
-    "MACULOPAPULAR": ["maculopapular", "morbilliform"],
-    "URTICARIAL": ["urticarial"],
-    "VESICULAR": ["vesicular"],
-}
-
-#: A study whose CRF offers a fixed list of terms and nothing else. None of
-#: these can carry a site, which is the point.
-PRESPECIFIED_TERMS = ["Rash", "Skin disorder", "Dermatitis", "Skin reaction"]
-
-#: Real reported terms contain site words nobody wrote into a lexicon. These
-#: are deliberately absent from concepts.yaml, so the extractor meets them and
-#: abstains — which is the behaviour the abstention rate is there to measure.
-UNLEXICONED_SITES = {
-    "CHEST": ["torso", "upper trunk"],
-    "ABDOMEN": ["midriff", "tummy"],
-    "BACK": ["shoulder blade area", "dorsum"],
-    "ARM": ["limb", "extremity"],
-    "LEG": ["lower limb", "extremity"],
-    "FACE": ["visage", "head and neck"],
-    "GENERALISED": ["multiple sites", "several areas"],
-}
-
-#: How a rich reported term can differ from what the structured qualifier says.
-#: Real records disagree with themselves, and a silver standard with no
-#: disagreements demonstrates nothing about adjudication.
-TEXT_STATED = "stated"
-TEXT_OMITTED = "omitted"
-TEXT_UNLEXICONED = "unlexiconed"
-TEXT_DISCREPANT = "discrepant"
-
-CONNECTORS = ["on", "over", "affecting", "involving"]
-
-#: Sites that read as a region rather than a named part, so they take no
-#: article: "rash affecting widespread areas" is not English, "generalised rash"
-#: is. Keeping the generator's prose grammatical matters because the extractor
-#: reads it.
-NO_ARTICLE = {"generalised", "generalized", "widespread", "diffuse"}
-
-
-def site_phrase(connector: str, site: str) -> str:
-    """Join a connector to a site phrase without producing "over the the chest"."""
-    if site in NO_ARTICLE:
-        return f"{connector} {site} areas"
-    return f"{connector} the {site}"
-
-#: US and UK spellings of the same words, chosen per profile.
-SPELLINGS = {
-    "us": {"generalised": "generalized", "oedema": "edema", "anaemia": "anemia"},
-    "uk": {},
+EVENT_WORDS = {
+    "RASH": ["rash", "skin rash", "eruption"],
+    "RASH_ERYTHEMATOUS": ["erythematous rash", "red rash"],
+    "RASH_MACULOPAPULAR": ["maculopapular rash", "morbilliform rash"],
+    "PRURITUS": ["pruritus", "itching"],
+    "NAUSEA": ["nausea"],
+    "NEUTROPENIA": ["neutropenia"],
 }
 
 
@@ -136,47 +112,50 @@ class ClinicalTruth:
 
     truth_id: str
     concept: str
-    location: str | None            # a catalogue value, or None for "no site"
-    pattern: str | None
-    onset_offset_days: int          # from first exposure
+    #: What was actually the case about the modifier. "unknown" means nobody
+    #: looked — distinct from "absent", which means somebody looked and found
+    #: nothing.
+    mucosal: str                   # present | absent | uncertain | unknown
+    mucosal_site: str | None       # a catalogue value, when present
+    onset_offset_days: int         # from first exposure
     duration_days: int
-    severity_steps: list[tuple[int, str]]
+    severity: str
+    grade: int
     seriousness: bool
     seriousness_criteria: list[str]
     relatedness: str
-    action_taken: str
+    action: str
     outcome: str
-    quality: list[str] = field(default_factory=list)
+    daily_dose: int
     note: str = ""
 
     @property
-    def peak_severity(self) -> str:
-        order = ["mild", "moderate", "severe"]
-        return max((s for _d, s in self.severity_steps), key=order.index)
-
-    @property
     def onset_in_window(self) -> bool:
-        return 0 <= self.onset_offset_days <= 14
+        return 0 <= self.onset_offset_days <= 30
 
     @property
-    def location_is_truncal(self) -> bool:
-        return self.location in TRUNCAL
+    def cumulative_exposure(self) -> float:
+        """Total dose taken before onset, in the study's own units."""
+        return float(self.daily_dose * max(self.onset_offset_days, 0))
 
-    def verdict_under(self, location_available: bool) -> str:
-        """The verdict te_truncal_rash v1 should reach for this rendering.
+    def verdict_under_v1(self, mucosal_readable: bool) -> str:
+        """The verdict cutaneous_mucosal v1 should reach for this rendering.
 
-        Precedence, mirroring the evaluator: a requirement that is present and
-        fails settles the case as a negative, whatever else is missing. Only
-        when nothing has failed does an unavailable requirement make the
-        episode unascertainable.
+        Precedence mirrors the evaluator: a criterion that is present and fails
+        settles the record as a negative whatever else is missing. Only when
+        nothing has failed does an unreadable modifier make it unascertainable.
         """
-        if self.concept != "RASH":
-            return "not_case"
+        if self.concept not in CUTANEOUS:
+            return "non_case"
         if not self.onset_in_window:
-            return "not_case"
-        if location_available:
-            return "case" if self.location_is_truncal else "not_case"
-        return "not_ascertainable"
+            return "non_case"
+        if not mucosal_readable:
+            return "not_ascertainable"
+        if self.mucosal == "present":
+            return "case"
+        if self.mucosal == "absent":
+            return "non_case"
+        return "review"          # uncertain, as the definition asks
 
 
 # --------------------------------------------------------------------------
@@ -189,8 +168,7 @@ class GeneratedCorpus:
     tables: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     documents: list[dict[str, Any]] = field(default_factory=list)
     truths: list[dict[str, Any]] = field(default_factory=list)
-    gold_records: list[dict[str, Any]] = field(default_factory=list)
-    gold_episodes: list[dict[str, Any]] = field(default_factory=list)
+    gold: list[dict[str, Any]] = field(default_factory=list)
     manifest: dict[str, Any] = field(default_factory=dict)
 
 
@@ -200,7 +178,7 @@ class CorpusGenerator:
         seed: int = 7,
         profiles: Iterable[str] | None = None,
         shared_truths: int = 24,
-        extra_per_profile: int = 14,
+        extra_per_profile: int = 12,
         catalog: ConceptCatalog | None = None,
         study_profiles: StudyProfiles | None = None,
     ):
@@ -213,10 +191,10 @@ class CorpusGenerator:
         self.shared_truths = shared_truths
         self.extra_per_profile = extra_per_profile
 
-    # -- sampling -----------------------------------------------------------
-
     def _pick(self, options):
         return options[self.rng.randrange(len(options))]
+
+    # -- sampling -----------------------------------------------------------
 
     def sample_truth(self, truth_id: str, kind: str) -> ClinicalTruth:
         """One clinical truth of a requested kind.
@@ -225,33 +203,38 @@ class CorpusGenerator:
         to measure, rather than whatever a uniform sample happened to produce.
         """
         concept = "RASH"
-        pattern = self._pick(sorted(PATTERN_PHRASES))
-        if kind == "truncal_in_window":
-            location, offset = self._pick(TRUNCAL), self.rng.randint(0, 14)
-        elif kind == "truncal_out_of_window":
-            location, offset = self._pick(TRUNCAL), self.rng.randint(20, 90)
-        elif kind == "non_truncal":
-            location, offset = self._pick(NON_TRUNCAL), self.rng.randint(0, 14)
-        elif kind == "generalised":
-            # A real negative: the site was recorded, and it is not truncal.
-            location, offset = "GENERALISED", self.rng.randint(0, 14)
+        site = None
+        if kind == "mucosal_in_window":
+            mucosal, offset = "present", self.rng.randint(0, 30)
+            site = self._pick(["ORAL", "ORAL", "OCULAR", "UNSPECIFIED", "GENITAL"])
+        elif kind == "mucosal_out_of_window":
+            mucosal, offset = "present", self.rng.randint(40, 120)
+            site = self._pick(["ORAL", "UNSPECIFIED"])
+        elif kind == "documented_negative":
+            # Somebody looked and found nothing. A non_case, not silence.
+            mucosal, offset = "absent", self.rng.randint(0, 30)
+        elif kind == "uncertain":
+            mucosal, offset = "uncertain", self.rng.randint(0, 30)
+            site = "UNSPECIFIED"
+        elif kind == "never_examined":
+            mucosal, offset = "unknown", self.rng.randint(0, 30)
         elif kind == "distractor":
             concept = self._pick(DISTRACTORS)
-            location = self._pick(TRUNCAL) if concept in ("URTICARIA", "PRURITUS") else None
-            offset = self.rng.randint(0, 30)
-            pattern = None
+            mucosal, offset = "unknown", self.rng.randint(0, 60)
         else:
             raise ValueError(f"unknown truth kind {kind!r}")
 
-        serious = self.rng.random() < 0.12
+        serious = self.rng.random() < 0.15
+        grade = self.rng.choice([1, 2, 2, 3, 3, 4])
         return ClinicalTruth(
             truth_id=truth_id,
             concept=concept,
-            location=location,
-            pattern=pattern,
+            mucosal=mucosal,
+            mucosal_site=site,
             onset_offset_days=offset,
-            duration_days=self.rng.randint(1, 21),
-            severity_steps=self._severity_steps(),
+            duration_days=self.rng.randint(2, 28),
+            severity=["mild", "moderate", "severe"][min(grade, 3) - 1],
+            grade=grade,
             seriousness=serious,
             seriousness_criteria=(
                 [self._pick(["hospitalisation", "other_medically_important"])]
@@ -260,260 +243,122 @@ class CorpusGenerator:
             relatedness=self._pick(
                 ["not_related", "unlikely", "possible", "possible", "probable"]
             ),
-            action_taken=self._pick(
+            action=self._pick(
                 ["dose_not_changed", "dose_not_changed", "dose_reduced",
                  "drug_interrupted", "drug_withdrawn"]
             ),
-            outcome=self._pick(
-                ["recovered", "recovered", "recovering", "not_recovered"]
-            ),
-            quality=(
-                [self._pick(["itchy", "painful", "spreading", "confluent"])]
-                if self.rng.random() < 0.5 else []
-            ),
+            outcome=self._pick(["recovered", "recovered", "recovering",
+                                "not_recovered"]),
+            daily_dose=self._pick([10, 20, 50]),
             note=kind,
         )
 
-    def _severity_steps(self) -> list[tuple[int, str]]:
-        first = self._pick(["mild", "mild", "moderate", "severe"])
-        if self.rng.random() < 0.3 and first != "severe":
-            worse = "severe" if first == "moderate" else "moderate"
-            return [(0, first), (self.rng.randint(1, 5), worse)]
-        return [(0, first)]
-
     # -- text ---------------------------------------------------------------
 
-    def _spell(self, text: str, profile: StudyProfile) -> str:
-        for uk, us in SPELLINGS.get(profile.conventions.get("spelling", "uk"), {}).items():
-            text = text.replace(uk, us)
-        return text
+    def _modifier_phrase(self, truth: ClinicalTruth) -> tuple[str | None, str | None]:
+        """A phrasing for the modifier, and the value it resolves to.
 
-    def _text_site(self, truth: ClinicalTruth) -> tuple[str | None, str | None, str]:
-        """What a free-text field says about the site, and what it resolves to.
-
-        Four outcomes, in the proportions a real corpus has them: the site
-        stated plainly; the site omitted; the site written in words no lexicon
-        carries; and the site disagreeing with the study's own structured
-        qualifier. The last is seeded only *within* a verdict class — a truncal
-        site is confused with another truncal site — so that disagreements show
-        up in the silver numbers without contaminating the phenotype numbers.
-        That is a deliberate corpus design choice, and the README says so.
+        Sometimes the phrasing is one no catalogue covers, which is how the
+        corpus contains text the extractor should decline rather than guess at.
         """
-        if truth.location is None:
-            return None, None, TEXT_OMITTED
-        draw = self.rng.random()
-        if draw < 0.12:
-            return None, None, TEXT_OMITTED
-        if draw < 0.22:
-            return self._pick(UNLEXICONED_SITES[truth.location]), None, TEXT_UNLEXICONED
-        if draw < 0.30:
-            pool = (
-                [v for v in TRUNCAL if v != truth.location]
-                if truth.location in TRUNCAL
-                else [v for v in NON_TRUNCAL if v != truth.location]
-            )
-            if pool:
-                other = self._pick(pool)
-                return self._pick(LOCATION_PHRASES[other]), other, TEXT_DISCREPANT
-        return self._pick(LOCATION_PHRASES[truth.location]), truth.location, TEXT_STATED
+        if truth.mucosal == "unknown":
+            return None, None
+        if truth.mucosal == "absent":
+            return self._pick(MUCOSAL_PHRASES["UNSPECIFIED"]), None
+        if self.rng.random() < 0.12:
+            return self._pick(UNLEXICONED), None
+        site = truth.mucosal_site or "UNSPECIFIED"
+        return self._pick(MUCOSAL_PHRASES[site]), site
 
     def reported_term(
         self, truth: ClinicalTruth, profile: StudyProfile
-    ) -> tuple[str, str | None, str]:
-        """What the investigator typed into the term box.
+    ) -> tuple[str, str | None, str | None]:
+        """The investigator's own words.
 
-        Returns the text, the location it actually states (or None), and which
-        of the four text outcomes produced it. Under a rich style the phrase
-        carries the site, because that is what a site writes when the coded term
-        cannot. Under a terse style it does not, and the site has to live
-        somewhere else or nowhere.
+        Returns the text, the assertion it actually states (or None), and the
+        modifier value it resolves to.
         """
+        event = self._pick(EVENT_WORDS[truth.concept])
         style = profile.reported_term_style
-        base = {
-            "RASH": "rash", "URTICARIA": "urticaria", "PRURITUS": "pruritus",
-            "NAUSEA": "nausea", "HEADACHE": "headache", "ANAEMIA": "anaemia",
-        }[truth.concept]
+        homes = profile.home_ids("mucosal_involvement")
 
-        if style == "prespecified":
-            term = (
-                self._pick(PRESPECIFIED_TERMS) if truth.concept == "RASH"
-                else base.capitalize()
-            )
-            return term, None, TEXT_OMITTED
-        if style == "terse" or truth.location is None:
-            return self._spell(base, profile), None, TEXT_OMITTED
+        if style == "terse" or "reported_term" not in homes:
+            return event, None, None
 
-        site, resolved, kind = self._text_site(truth)
-        parts = []
-        if truth.pattern and self.rng.random() < 0.5:
-            parts.append(self._pick(PATTERN_PHRASES[truth.pattern]))
-        # "skin rash" is a phrasing sites use; "skin pruritus" is not.
-        if truth.concept == "RASH" and self.rng.random() < 0.4:
-            parts.append("skin " + base)
-        else:
-            parts.append(base)
-        phrase = " ".join(parts)
-        if site is None:
-            return self._spell(phrase, profile), None, kind
-        connector = self._pick(CONNECTORS)
-        return (
-            self._spell(f"{phrase} {site_phrase(connector, site)}", profile),
-            resolved,
-            kind,
-        )
+        # The text styles differ in exactly one way, and it is the distinction
+        # the whole `assertion` field exists for.
+        #
+        # `rich`    — the site writes the modifier down when it is there, and
+        #             says nothing when it is not. An absence then looks
+        #             identical to never having looked, which is the trap.
+        # `negated` — the convention is to state the modifier either way, so an
+        #             absence is *documented* and the subject belongs in the
+        #             denominator as a non_case.
+        # `mixed`   — what most real sites do: presence always written down,
+        #             absence written down sometimes. Without this style the
+        #             one profile a silver standard can be built from would
+        #             contain no documented negatives at all, and the class
+        #             that decides the denominator would be unmeasurable.
+        if truth.mucosal not in ("present", "uncertain"):
+            if style == "rich":
+                return event, None, None
+            if style == "mixed" and self.rng.random() < 0.45:
+                return event, None, None
+
+        phrase, value = self._modifier_phrase(truth)
+        if phrase is None:
+            return event, None, None
+
+        if truth.mucosal == "absent":
+            template = self._pick(NEGATION_TEMPLATES)
+            return template.format(event=event, modifier=phrase), "absent", None
+        if truth.mucosal == "uncertain":
+            template = self._pick(UNCERTAIN_TEMPLATES)
+            return template.format(event=event, modifier=phrase), "uncertain", value
+        template = self._pick(PRESENT_TEMPLATES)
+        return template.format(event=event, modifier=phrase), "present", value
 
     def comment_text(
-        self, truth: ClinicalTruth, profile: StudyProfile
-    ) -> tuple[str, str | None, str]:
-        """A comment written about one AE record, and what site it states."""
-        site, resolved, kind = self._text_site(truth)
-        if site is None:
-            body = self._pick([
-                "Investigator comment: event reviewed, no change to study drug.",
-                "Site clarification: the event was documented at the study visit.",
-            ])
-            return self._spell(body, profile), None, kind
-        connector = self._pick(["on", "over", "involving"])
-        lead = self._pick([
-            "Site clarification: rash noted {where}.",
-            "Investigator comment: eruption {where}, no other areas involved.",
-            "Additional detail: the rash was {where} at the study visit.",
-        ])
-        body = lead.format(where=site_phrase(connector, site))
-        if truth.quality:
-            body += f" Described as {self._pick(truth.quality)}."
-        return self._spell(body, profile), resolved, kind
+        self, truth: ClinicalTruth
+    ) -> tuple[str | None, str | None, str | None]:
+        if truth.mucosal == "unknown":
+            return None, None, None
+        phrase, value = self._modifier_phrase(truth)
+        if phrase is None:
+            return None, None, None
+        assertion = truth.mucosal
+        template = self._pick(COMMENT_TEMPLATES.get(assertion, COMMENT_TEMPLATES["present"]))
+        return template.format(modifier=phrase), assertion, (
+            value if assertion == "present" else None
+        )
 
     # -- one subject --------------------------------------------------------
 
     def _subject_rows(
         self, profile: StudyProfile, subject_id: str, corpus: GeneratedCorpus,
-        first_dose: _dt.date,
-    ) -> _dt.date:
+        first_dose: _dt.date, truth: ClinicalTruth,
+    ) -> None:
         corpus.tables["dm"].append({
             "STUDYID": profile.study_id, "USUBJID": subject_id,
-            "AGE": self.rng.randint(24, 78),
-            "SEX": self._pick(["M", "F"]),
-            "ARM": self._pick(["Drug 10 mg", "Drug 20 mg", "Placebo"]),
+            "AGE": self.rng.randint(21, 82), "SEX": self._pick(["M", "F"]),
+            "ARM": self._pick(["Drug 10 mg", "Drug 20 mg", "Drug 50 mg"]),
             "RFSTDTC": first_dose.isoformat(),
             "COUNTRY": self._pick(["USA", "GBR", "DEU", "JPN"]),
-            "PROFILE": profile.profile_id,
-            "SYNTHETIC": SYNTHETIC_FLAG,
+            "PROFILE": profile.profile_id, "SYNTHETIC": SYNTHETIC_FLAG,
         })
-        dose = self._pick([10, 20])
-        for index in range(self.rng.randint(2, 4)):
+        # Monthly exposure records at a constant daily dose, so cumulative
+        # exposure before onset is a governed computation rather than a guess.
+        for index in range(4):
             start = first_dose + _dt.timedelta(days=28 * index)
-            if index and self.rng.random() < 0.5:
-                dose *= 2
             corpus.tables["ex"].append({
                 "STUDYID": profile.study_id, "USUBJID": subject_id,
-                "EXSEQ": index + 1, "EXTRT": "STUDY DRUG", "EXDOSE": dose,
-                "EXDOSU": "mg", "EXSTDTC": start.isoformat(),
-                "EXENDTC": (start + _dt.timedelta(days=27)).isoformat(),
+                "EXSEQ": index + 1, "EXTRT": "STUDY DRUG",
+                "EXDOSE": truth.daily_dose,
+                "EXDOSU": profile.conventions.get("dose_unit", "mg"),
+                "EXSTDTC": self._date(start, profile),
+                "EXENDTC": self._date(start + _dt.timedelta(days=27), profile),
                 "SYNTHETIC": SYNTHETIC_FLAG,
             })
-        return first_dose
-
-    def render(
-        self, truth: ClinicalTruth, profile: StudyProfile, subject_id: str,
-        first_dose: _dt.date, corpus: GeneratedCorpus, event_index: int,
-    ) -> dict[str, Any]:
-        """Write one truth into one study's tables, and record the answer key."""
-        onset = first_dose + _dt.timedelta(days=truth.onset_offset_days)
-        end = onset + _dt.timedelta(days=truth.duration_days)
-        split = profile.splits_on_severity_change() and len(truth.severity_steps) > 1
-        # A study that does not split records the whole event as one row, which
-        # starts when the event started and carries the worst severity reached.
-        # Taking the last step's day offset here would move the onset, and the
-        # onset is the one thing every window in the corpus is measured from.
-        steps = truth.severity_steps if split else [(0, truth.peak_severity)]
-
-        # The reported term is written once per event, not once per record: a
-        # study that splits on severity change repeats the investigator's own
-        # words across the rows it splits into.
-        term, text_location, text_kind = self.reported_term(truth, profile)
-        comment_location, comment_kind = None, TEXT_OMITTED
-
-        record_ids: list[str] = []
-        previous_id: str | None = None
-        for step_index, (day_offset, severity) in enumerate(steps):
-            record_id = f"{subject_id}-AE-{event_index:02d}{step_index + 1}"
-            record_start = onset + _dt.timedelta(days=day_offset)
-            record_end = (
-                end if step_index == len(steps) - 1
-                else onset + _dt.timedelta(days=steps[step_index + 1][0])
-            )
-            terminal = truth.outcome in ("recovered", "recovered_with_sequelae", "fatal")
-            row = self._ae_row(
-                truth, profile, subject_id, record_id, severity, term,
-                record_start,
-                record_end if terminal or step_index < len(steps) - 1 else None,
-                previous_id,
-            )
-            corpus.tables["ae"].append(row)
-            comment_location, comment_kind = self._supplemental(
-                truth, profile, subject_id, record_id, corpus
-            )
-            in_text = self._text_location(
-                profile, text_location, text_kind, comment_location, comment_kind
-            )
-            gold = self._gold_record(
-                truth, profile, row, severity, record_start, in_text,
-            )
-            corpus.gold_records.append(gold)
-            record_ids.append(record_id)
-            previous_id = record_id
-
-        in_text = self._text_location(
-            profile, text_location, text_kind, comment_location, comment_kind
-        )
-        return {
-            "record_ids": record_ids, "onset": onset, "end": end,
-            "text_location": in_text["text_location"],
-            "text_outcome": in_text["text_outcome"],
-            "location_available": self._location_available(truth, profile, in_text),
-        }
-
-    def _ae_row(
-        self, truth: ClinicalTruth, profile: StudyProfile, subject_id: str,
-        record_id: str, severity: str, term: str, start: _dt.date,
-        end: _dt.date | None, continuation_of: str | None,
-    ) -> dict[str, Any]:
-        coded = self._pick(CODED_TERMS[truth.concept])
-        homes = profile.home_kinds("location")
-        pattern_homes = profile.home_kinds("pattern")
-
-        def cell(variable: str, value: Any) -> Any:
-            return value if profile.collects_variable(variable) else ""
-
-        location_cell = ""
-        if "AELOC" in homes and truth.location:
-            location_cell = truth.location
-        pattern_cell = ""
-        if "AEPATT" in pattern_homes and truth.pattern:
-            pattern_cell = truth.pattern
-
-        return {
-            "STUDYID": profile.study_id,
-            "USUBJID": subject_id,
-            "AESEQ": int(record_id.rsplit("-", 1)[-1]),
-            "AESPID": record_id,
-            "AETERM": term,
-            "AEDECOD": cell("AEDECOD", coded),
-            "AEDICTVER": profile.dictionary_version,
-            "AELOC": cell("AELOC", location_cell),
-            "AEPATT": cell("AEPATT", pattern_cell),
-            "AESEV": cell("AESEV", severity),
-            "AESER": cell("AESER", "Y" if truth.seriousness else "N"),
-            "AESCAT": "|".join(truth.seriousness_criteria) if truth.seriousness else "",
-            "AEREL": cell("AEREL", truth.relatedness),
-            "AEACN": cell("AEACN", truth.action_taken),
-            "AEOUT": cell("AEOUT", truth.outcome),
-            "AESTDTC": cell("AESTDTC", self._date(start, profile)),
-            "AEENDTC": cell("AEENDTC", self._date(end, profile) if end else ""),
-            "AECONTRP": continuation_of or "",
-            "SYNTHETIC": SYNTHETIC_FLAG,
-        }
 
     @staticmethod
     def _date(value: _dt.date | None, profile: StudyProfile) -> str:
@@ -523,182 +368,222 @@ class CorpusGenerator:
             return value.strftime("%d-%b-%Y")
         return value.isoformat()
 
-    def _supplemental(
+    def render(
         self, truth: ClinicalTruth, profile: StudyProfile, subject_id: str,
-        record_id: str, corpus: GeneratedCorpus,
-    ) -> tuple[str | None, str]:
-        homes = profile.home_kinds("location")
-        if "sponsor_variable" in homes and truth.location:
-            corpus.tables["suppae"].append({
-                "STUDYID": profile.study_id, "RDOMAIN": "AE",
-                "USUBJID": subject_id, "IDVAR": "AESPID", "IDVARVAL": record_id,
-                "QNAM": profile.sponsor_variable_name or "RASHSITE",
-                "QLABEL": "Rash site",
-                "QVAL": profile.sponsor_code_for(truth.location) or "",
-                "SYNTHETIC": SYNTHETIC_FLAG,
-            })
-        if "comment" not in homes or truth.location is None:
-            return None, TEXT_OMITTED
-        doc_id = f"{record_id}-CO"
-        text, resolved, kind = self.comment_text(truth, profile)
-        corpus.tables["co"].append({
-            "STUDYID": profile.study_id, "RDOMAIN": "AE",
-            "USUBJID": subject_id, "IDVAR": "AESPID", "IDVARVAL": record_id,
-            "COSEQ": 1, "COVAL": text, "DOCID": doc_id,
-            "SYNTHETIC": SYNTHETIC_FLAG,
-        })
-        corpus.documents.append({
-            "doc_id": doc_id, "study_id": profile.study_id,
-            "subject_id": subject_id, "source_record_id": record_id,
-            "kind": "comment", "header": DOC_HEADER, "text": text,
-        })
-        return resolved, kind
-
-    # -- the answer key -----------------------------------------------------
-
-    def _text_location(
-        self, profile: StudyProfile, term_location: str | None, term_kind: str,
-        comment_location: str | None, comment_kind: str,
+        first_dose: _dt.date, corpus: GeneratedCorpus, cohort: str,
     ) -> dict[str, Any]:
-        """What the free text of this record actually states about the site.
+        """Write one truth into one study's tables, and record the answer key."""
+        onset = first_dose + _dt.timedelta(days=truth.onset_offset_days)
+        end = onset + _dt.timedelta(days=truth.duration_days)
+        record_id = f"{subject_id}-AE-01"
+        homes = profile.home_ids("mucosal_involvement")
 
-        Only the homes this profile uses count: a rich reported term in a study
-        whose location home is a structured variable is still text a reader
-        could use, but it is not where the study keeps the answer.
-        """
-        homes = profile.home_kinds("location")
+        # Which concept this study codes the event to. A study with several
+        # declared codings spreads its records across them deterministically:
+        # one clinical situation, several legitimate codes, which is what the
+        # concept set and the version reconciliation both exist to handle.
+        concept = truth.concept
+        if concept == "RASH" and profile.prefer_concept:
+            concept = profile.prefer_concept[
+                _stable_index(f"{profile.profile_id}|{subject_id}",
+                              len(profile.prefer_concept))
+            ]
+        code = self.catalog.concept(concept).code_in(profile.dictionary_version)
+        if code is None:
+            # A concept with no code under this study's version stays as it was
+            # coded under the version the study actually used.
+            fallback = next(iter(self.catalog.concept(concept).codes.items()))
+            code = fallback[1]
+
+        term, term_assertion, term_value = self.reported_term(truth, profile)
+        comment, comment_assertion, comment_value = (None, None, None)
         if "comment" in homes:
-            return {"text_location": comment_location, "text_outcome": comment_kind}
-        if "reported_term" in homes:
-            return {"text_location": term_location, "text_outcome": term_kind}
-        return {"text_location": None, "text_outcome": TEXT_OMITTED}
+            comment, comment_assertion, comment_value = self.comment_text(truth)
 
-    def _structured_location(
-        self, truth: ClinicalTruth, profile: StudyProfile
-    ) -> str | None:
-        homes = profile.home_kinds("location")
-        if truth.location is None:
-            return None
-        return truth.location if {"AELOC", "sponsor_variable"} & set(homes) else None
+        structured = None
+        if profile.structured_home("mucosal_involvement") is not None \
+                and truth.mucosal != "unknown":
+            structured = {
+                "present": "Y", "absent": "N", "uncertain": "U",
+            }[truth.mucosal]
 
-    def _location_available(
-        self, truth: ClinicalTruth, profile: StudyProfile, in_text: dict[str, Any]
-    ) -> bool:
-        """Could this rendering carry the location *and* did it?
+        home = profile.structured_home("mucosal_involvement")
+        row = {
+            "STUDYID": profile.study_id, "USUBJID": subject_id,
+            "AESEQ": 1, "AESPID": record_id,
+            "AETERM": term,
+            "AEDECOD": code if profile.collects_variable("AEDECOD") else "",
+            "AEDICTVER": profile.dictionary_version,
+            "AEMUCOS": (
+                structured or ""
+                if home is not None and home.variable == "AEMUCOS" else ""
+            ),
+            "AESEV": truth.severity if profile.collects_variable("AESEV") else "",
+            "AEGRADE": truth.grade if profile.collects_variable("AEGRADE") else "",
+            "AESER": "Y" if truth.seriousness else "N",
+            "AESCAT": "|".join(truth.seriousness_criteria) if truth.seriousness else "",
+            "AEREL": truth.relatedness,
+            "AEACN": truth.action,
+            "AEOUT": truth.outcome,
+            "AESTDTC": self._date(onset, profile),
+            "AEENDTC": self._date(end, profile),
+            "SYNTHETIC": SYNTHETIC_FLAG,
+        }
+        corpus.tables["ae"].append(row)
 
-        Not the same question as whether the profile collects it. A study whose
-        only home is the reported term did not record a site if the
-        investigator did not write one, and a phrase no lexicon carries is a
-        site nobody downstream can read.
-        """
-        if truth.location is None or not profile.collects_attribute("location"):
-            return False
-        if self._structured_location(truth, profile) is not None:
-            return True
-        return in_text["text_location"] is not None
+        if home is not None and home.variable == "SC.MUCOSAL" and structured:
+            corpus.tables["sc"].append({
+                "STUDYID": profile.study_id, "USUBJID": subject_id,
+                "IDVAR": "AESPID", "IDVARVAL": record_id,
+                "SCTESTCD": "MUCOSAL", "SCTEST": "Mucosal involvement",
+                "SCORRES": structured, "SYNTHETIC": SYNTHETIC_FLAG,
+            })
 
-    def _availability(
-        self, truth: ClinicalTruth, profile: StudyProfile, attribute: str,
-        in_text: dict[str, Any] | None = None,
-    ) -> str:
-        value = truth.location if attribute == "location" else truth.pattern
-        if not profile.collects_attribute(attribute):
-            return "not_collected_by_protocol"
-        if value is None:
-            return "unknown"
-        if attribute == "location" and in_text is not None:
-            return "collected" if self._location_available(truth, profile, in_text) \
-                else "unknown"
-        return "collected"
+        doc_id = None
+        if comment:
+            doc_id = f"{record_id}-CO"
+            corpus.tables["co"].append({
+                "STUDYID": profile.study_id, "USUBJID": subject_id,
+                "IDVAR": "AESPID", "IDVARVAL": record_id, "COSEQ": 1,
+                "COVAL": comment, "DOCID": doc_id, "SYNTHETIC": SYNTHETIC_FLAG,
+            })
+            corpus.documents.append({
+                "doc_id": doc_id, "study_id": profile.study_id,
+                "subject_id": subject_id, "source_record_id": record_id,
+                "kind": "comment", "header": DOC_HEADER, "text": comment,
+            })
 
-    def _gold_record(
-        self, truth: ClinicalTruth, profile: StudyProfile, row: dict[str, Any],
-        severity: str, start: _dt.date, in_text: dict[str, Any],
+        readable = self._readable(
+            profile, structured, term_assertion, comment_assertion
+        )
+        gold = self._gold(
+            truth, profile, record_id, subject_id, onset, cohort, structured,
+            term_assertion, term_value, comment_assertion, comment_value, readable,
+            concept, code,
+        )
+        corpus.gold.append(gold)
+        return gold
+
+    def _readable(
+        self, profile: StudyProfile, structured: str | None,
+        term_assertion: str | None, comment_assertion: str | None,
     ) -> dict[str, Any]:
-        homes = profile.home_kinds("location")
-        structured = self._structured_location(truth, profile)
+        """What each route holds, and whether the modifier can be read at all.
+
+        The routes are kept apart rather than collapsed into one boolean
+        because the value ablation adds them one at a time, and each stage
+        needs to know what a system limited to that stage could have seen.
+        """
+        from_structured = structured is not None
+        from_term = term_assertion is not None
+        from_comment = comment_assertion is not None
+        from_text = from_term or from_comment
         return {
-            "source_record_id": row["AESPID"],
+            "in_structured": from_structured,
+            "in_reported_term": from_term,
+            "in_comment": from_comment,
+            "in_text": from_text,
+            "readable": from_structured or from_text,
+            "text_only": from_text and not from_structured,
+        }
+
+    def _gold(
+        self, truth: ClinicalTruth, profile: StudyProfile, record_id: str,
+        subject_id: str, onset: _dt.date, cohort: str, structured: str | None,
+        term_assertion: str | None, term_value: str | None,
+        comment_assertion: str | None, comment_value: str | None,
+        readable: dict[str, Any], coded_concept: str, coded_code: str,
+    ) -> dict[str, Any]:
+        text_assertion = term_assertion or comment_assertion
+        return {
+            "source_record_id": record_id,
+            "subject_id": subject_id,
             "study_id": profile.study_id,
             "profile": profile.profile_id,
             "truth_id": truth.truth_id,
+            "cohort": cohort,
             "concept": truth.concept,
-            "true_location": truth.location,
-            "true_pattern": truth.pattern,
-            "location_homes": homes,
-            "pattern_homes": profile.home_kinds("pattern"),
-            # Where the location can be read from in *this* record, which is
-            # what the silver standard masks and what the extractor must find.
-            # What each route holds for this record. The silver standard
-            # compares the last two against each other, and they are allowed to
-            # disagree — that is why it is a silver standard.
-            "structured_location": structured,
-            "text_location": in_text["text_location"],
-            "text_outcome": in_text["text_outcome"],
-            "location_in_structured": structured is not None,
-            "location_in_text": in_text["text_location"] is not None,
-            "availability": {
-                "location": self._availability(truth, profile, "location", in_text),
-                "pattern": self._availability(truth, profile, "pattern"),
-            },
-            "reported_term": row["AETERM"],
-            "severity": severity,
-            "onset": start.isoformat(),
+            "coded_concept": coded_concept,
+            "coded_code": coded_code,
+            "coded_dictionary_version": profile.dictionary_version,
+            "onset": onset.isoformat(),
             "onset_offset_days": truth.onset_offset_days,
+            "grade": truth.grade,
+            "cumulative_exposure": truth.cumulative_exposure,
+            # What was true, what each route holds, and what this rendering
+            # therefore supports. Kept apart on purpose: the difference between
+            # them is what the whole prototype is about.
+            "true_assertion": None if truth.mucosal == "unknown" else truth.mucosal,
+            "true_value": truth.mucosal_site,
+            "true_availability": (
+                "observed" if readable["readable"]
+                else ("not_collected"
+                      if not profile.collects_modifier("mucosal_involvement")
+                      else "unresolved")
+            ),
+            "structured_assertion": {
+                "Y": "present", "N": "absent", "U": "uncertain",
+            }.get(structured or "", None),
+            "text_assertion": text_assertion,
+            "text_value": term_value or comment_value,
+            **readable,
+            "true_verdict": truth.verdict_under_v1(readable["readable"]),
+            # What each cumulative ablation stage could reach. Stage 1 sees
+            # structured variables only; stage 2 adds the reported term; stage
+            # 3 adds linked comment records.
+            "verdict_stage_structured": truth.verdict_under_v1(
+                readable["in_structured"]
+            ),
+            "verdict_stage_reported_term": truth.verdict_under_v1(
+                readable["in_structured"] or readable["in_reported_term"]
+            ),
+            "verdict_stage_comments": truth.verdict_under_v1(readable["readable"]),
+            "verdict_if_readable": truth.verdict_under_v1(True),
         }
 
     # -- the whole corpus ---------------------------------------------------
 
     def generate(self) -> GeneratedCorpus:
         corpus = GeneratedCorpus(
-            tables={"dm": [], "ex": [], "ae": [], "suppae": [], "co": []}
+            tables={"dm": [], "ex": [], "ae": [], "sc": [], "co": []}
         )
-        kinds = ["truncal_in_window", "truncal_in_window", "truncal_out_of_window",
-                 "non_truncal", "generalised", "distractor"]
-
-        # The shared cohort: one truth, rendered under every profile. This is
-        # what representation invariance is measured over.
+        kinds = ["mucosal_in_window", "mucosal_in_window", "documented_negative",
+                 "mucosal_out_of_window", "uncertain", "never_examined",
+                 "distractor"]
         shared = [
             self.sample_truth(f"T{index + 1:04d}", kinds[index % len(kinds)])
             for index in range(self.shared_truths)
         ]
+        profiles = [self.profiles.profile(p) for p in self.profile_ids]
 
-        profiles = [self.profiles.profile(pid) for pid in self.profile_ids]
         for profile in profiles:
             for index, truth in enumerate(shared):
                 subject_id = f"{profile.study_id}-SH-{index + 1:03d}"
-                first_dose = _dt.date(2021, 3, 1) + _dt.timedelta(
-                    days=self.rng.randint(0, 200)
+                first_dose = _dt.date(2022, 2, 1) + _dt.timedelta(
+                    days=self.rng.randint(0, 180)
                 )
-                self._subject_rows(profile, subject_id, corpus, first_dose)
-                emitted = self.render(truth, profile, subject_id, first_dose, corpus, 1)
-                corpus.gold_episodes.append(
-                    self._gold_episode(truth, profile, subject_id, emitted, "shared")
-                )
+                self._subject_rows(profile, subject_id, corpus, first_dose, truth)
+                self.render(truth, profile, subject_id, first_dose, corpus, "shared")
 
-            counter = 0
-            for _ in range(self.extra_per_profile):
-                counter += 1
+            for counter in range(1, self.extra_per_profile + 1):
                 truth = self.sample_truth(
                     f"{profile.profile_id}-B{counter:03d}", self._pick(kinds)
                 )
                 subject_id = f"{profile.study_id}-BG-{counter:03d}"
-                first_dose = _dt.date(2021, 1, 4) + _dt.timedelta(
-                    days=self.rng.randint(0, 300)
+                first_dose = _dt.date(2022, 1, 5) + _dt.timedelta(
+                    days=self.rng.randint(0, 240)
                 )
-                self._subject_rows(profile, subject_id, corpus, first_dose)
-                emitted = self.render(truth, profile, subject_id, first_dose, corpus, 1)
-                corpus.gold_episodes.append(
-                    self._gold_episode(truth, profile, subject_id, emitted, "background")
+                self._subject_rows(profile, subject_id, corpus, first_dose, truth)
+                self.render(truth, profile, subject_id, first_dose, corpus,
+                            "background")
+                corpus.truths.append(
+                    self._truth_row(truth, [profile.profile_id], "background")
                 )
-                corpus.truths.append(self._truth_row(truth, [profile.profile_id],
-                                                     "background"))
 
         for truth in shared:
             corpus.truths.append(
                 self._truth_row(truth, list(self.profile_ids), "shared")
             )
-
         corpus.manifest = self._manifest(profiles, corpus)
         return corpus
 
@@ -707,46 +592,11 @@ class CorpusGenerator:
     ) -> dict[str, Any]:
         return {
             **asdict(truth),
-            "peak_severity": truth.peak_severity,
             "onset_in_window": truth.onset_in_window,
-            "location_is_truncal": truth.location_is_truncal,
-            "verdict_if_location_available": truth.verdict_under(True),
+            "cumulative_exposure": truth.cumulative_exposure,
+            "verdict_if_readable": truth.verdict_under_v1(True),
             "rendered_in": rendered_in,
             "cohort": cohort,
-        }
-
-    def _gold_episode(
-        self, truth: ClinicalTruth, profile: StudyProfile, subject_id: str,
-        emitted: dict[str, Any], cohort: str,
-    ) -> dict[str, Any]:
-        available = emitted["location_available"]
-        structured = self._structured_location(truth, profile)
-        return {
-            "truth_id": truth.truth_id,
-            "study_id": profile.study_id,
-            "profile": profile.profile_id,
-            "subject_id": subject_id,
-            "cohort": cohort,
-            "concept": truth.concept,
-            "source_record_ids": emitted["record_ids"],
-            "n_records": len(emitted["record_ids"]),
-            "episode_start": emitted["onset"].isoformat(),
-            "episode_end": emitted["end"].isoformat(),
-            "onset_offset_days": truth.onset_offset_days,
-            "true_location": truth.location,
-            "true_pattern": truth.pattern,
-            "location_available": available,
-            "structured_location": structured,
-            "text_location": emitted["text_location"],
-            "text_outcome": emitted["text_outcome"],
-            "location_in_structured": structured is not None,
-            "location_in_text": emitted["text_location"] is not None,
-            # The route the location can *only* come from, which is what the
-            # value ablation counts.
-            "text_only": structured is None and emitted["text_location"] is not None,
-            # What this rendering supports, and what the truth was regardless.
-            "true_verdict": truth.verdict_under(available),
-            "verdict_if_location_available": truth.verdict_under(True),
         }
 
     def _manifest(
@@ -760,18 +610,16 @@ class CorpusGenerator:
                 "All records are computer generated. No real patient data is "
                 "present in this repository."
             ),
-            "gold_case_definition": "te_truncal_rash.v1",
+            "gold_definition": "cutaneous_mucosal.v1",
             "shared_truths": self.shared_truths,
             "profiles": {
                 p.profile_id: {
                     "study_id": p.study_id,
                     "label": p.label,
                     "reported_term_style": p.reported_term_style,
-                    "location_home": p.home_kinds("location"),
-                    "pattern_home": p.home_kinds("pattern"),
+                    "modifier_homes": p.home_ids("mucosal_involvement"),
                     "dictionary_version": p.dictionary_version,
-                    "sponsor_variable": p.sponsor_variable_name,
-                    "conventions": p.conventions,
+                    "prefer_concept": p.prefer_concept,
                     "note": p.note,
                 }
                 for p in profiles
@@ -780,9 +628,8 @@ class CorpusGenerator:
                 "profiles": len(profiles),
                 "subjects": len(corpus.tables["dm"]),
                 "ae_records": len(corpus.tables["ae"]),
-                "suppae_records": len(corpus.tables["suppae"]),
+                "linked_form_records": len(corpus.tables["sc"]),
                 "comments": len(corpus.tables["co"]),
-                "episodes_expected": len(corpus.gold_episodes),
             },
         }
 
@@ -797,12 +644,12 @@ TABLE_COLUMNS: dict[str, list[str]] = {
     "ex": ["STUDYID", "USUBJID", "EXSEQ", "EXTRT", "EXDOSE", "EXDOSU",
            "EXSTDTC", "EXENDTC", "SYNTHETIC"],
     "ae": ["STUDYID", "USUBJID", "AESEQ", "AESPID", "AETERM", "AEDECOD",
-           "AEDICTVER", "AELOC", "AEPATT", "AESEV", "AESER", "AESCAT", "AEREL",
-           "AEACN", "AEOUT", "AESTDTC", "AEENDTC", "AECONTRP", "SYNTHETIC"],
-    "suppae": ["STUDYID", "RDOMAIN", "USUBJID", "IDVAR", "IDVARVAL", "QNAM",
-               "QLABEL", "QVAL", "SYNTHETIC"],
-    "co": ["STUDYID", "RDOMAIN", "USUBJID", "IDVAR", "IDVARVAL", "COSEQ",
-           "COVAL", "DOCID", "SYNTHETIC"],
+           "AEDICTVER", "AEMUCOS", "AESEV", "AEGRADE", "AESER", "AESCAT",
+           "AEREL", "AEACN", "AEOUT", "AESTDTC", "AEENDTC", "SYNTHETIC"],
+    "sc": ["STUDYID", "USUBJID", "IDVAR", "IDVARVAL", "SCTESTCD", "SCTEST",
+           "SCORRES", "SYNTHETIC"],
+    "co": ["STUDYID", "USUBJID", "IDVAR", "IDVARVAL", "COSEQ", "COVAL", "DOCID",
+           "SYNTHETIC"],
 }
 
 
@@ -818,8 +665,7 @@ def write_corpus(corpus: GeneratedCorpus, out_dir: str | Path | None = None) -> 
 
     _write_jsonl(root / "documents.jsonl", corpus.documents)
     _write_jsonl(root / "truths.jsonl", corpus.truths)
-    _write_jsonl(root / "gold_records.jsonl", corpus.gold_records)
-    _write_jsonl(root / "gold_episodes.jsonl", corpus.gold_episodes)
+    _write_jsonl(root / "gold.jsonl", corpus.gold)
     (root / "manifest.json").write_text(
         json.dumps(corpus.manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -828,9 +674,8 @@ def write_corpus(corpus: GeneratedCorpus, out_dir: str | Path | None = None) -> 
         "===================\n\n"
         "Every file here is computer generated by aelayer.generate. No real\n"
         "patient data, and nothing derived from real patients, is present.\n\n"
-        "truths.jsonl holds the sampled ground truth; gold_records.jsonl and\n"
-        "gold_episodes.jsonl hold the answer key. All three are read only by\n"
-        "the evaluation harness.\n",
+        "truths.jsonl holds the sampled ground truth and gold.jsonl the answer\n"
+        "key. Both are read only by the evaluation harness.\n",
         encoding="utf-8",
     )
     return root
@@ -849,7 +694,7 @@ def generate_corpus(
     profiles: Iterable[str] | None = None,
     out_dir: str | Path | None = None,
     shared_truths: int = 24,
-    extra_per_profile: int = 14,
+    extra_per_profile: int = 12,
 ) -> tuple[Path, dict[str, Any]]:
     generator = CorpusGenerator(
         seed=seed, profiles=profiles, shared_truths=shared_truths,
@@ -857,3 +702,9 @@ def generate_corpus(
     )
     corpus = generator.generate()
     return write_corpus(corpus, out_dir), corpus.manifest
+
+
+def _stable_index(key: str, modulus: int) -> int:
+    """A deterministic spread that does not move when the RNG stream shifts."""
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % modulus

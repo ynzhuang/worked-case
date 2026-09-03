@@ -1,54 +1,58 @@
 # Extraction configuration.
 #
-# The default backend is a deterministic lexicon-and-pattern extractor, so
+# The default backend is a deterministic lexicon-and-scope extractor, so
 # everything runs offline. Its recall is exactly the surface forms declared in
-# concepts.yaml plus the patterns below — that is a property of the config, not
-# of the method, and the README says so.
+# concepts.yaml plus the cues below — a property of the configuration, not of
+# the method, and the README says so.
 
-version: extract-3.0.0
+version: extract-4.0.0
 
-# Where the model path is allowed to read. Anything not listed here it never
-# sees; `guards.py` enforces it.
+# Where the model path is allowed to read. Anything not listed it never sees;
+# `guards.py` enforces it and a structured source cannot even be declared here.
 readable_sources:
   - reported_term
   - comment
 
-# Attributes the model path may be asked about. A standard structured variable
-# is never on this list: a value the CRF settled is not a question.
-extractable_attributes: [location, laterality, pattern, quality]
+# Modifiers the model path may be asked about. A structured qualifier is never
+# on this list: a value the CRF settled is not a question.
+extractable_modifiers: [mucosal_involvement, photosensitivity]
 
-modifiers:
-  # A modifier mention is anchored to a concept mention in the same text, so
-  # "rash on chest, prior eczema on the back" does not attach `back` to the
-  # rash. `max_distance_tokens` is how far the anchor reaches.
+assertion:
+  # A modifier mention is anchored to a concept mention in the same sentence,
+  # and its assertion is decided by the cues that govern it. Absence of a
+  # negation cue is not evidence of presence — it is the default only because
+  # a clinician writing the phrase at all is asserting it.
   scope: sentence
-  max_distance_tokens: 8
-  connectors: ["on", "over", "of", "across", "involving", "affecting", "to",
-               "at", "in", "along"]
-  # A cue that a following site phrase does NOT belong to this event.
-  disqualifiers: ["history of", "previous", "prior", "resolved", "no rash on",
-                  "denies", "family history of", "unrelated"]
-  confidence:
-    direct_connector: 0.95      # "rash on chest"
-    adjacent: 0.85              # "chest rash"
-    same_sentence: 0.7          # "rash. it was on the chest"
-    comment_record: 0.8
+  default: present
+  max_distance_tokens: 12
+  cues:
+    absent:
+      pre: ["no ", "without", "no evidence of", "absence of", "negative for",
+            "denies", "free of", "sparing of", "not involving", "no associated"]
+      post: ["was absent", "were absent", "was not present", "was spared",
+             "were spared", "not observed", "was excluded"]
+    uncertain:
+      pre: ["possible", "possibly", "suspected", "query", "cannot exclude",
+            "cannot be excluded", "equivocal", "questionable", "?"]
+      post: ["cannot be excluded", "is uncertain", "remains unclear",
+             "could not be confirmed"]
+  # Phrases that contain a cue token but assert nothing about the modifier.
+  pseudo_cues: ["no change", "no dose change", "not otherwise specified",
+                "no further action", "without delay"]
+  terminators: ["but", "however", "although", ";"]
 
-# Quality descriptors are extracted but are not a phenotype criterion here.
-# They exist so the discovery path has something un-normalized to surface.
-quality_lexicon:
-  itchy: [itchy, pruritic, itching]
-  painful: [painful, tender, sore]
-  spreading: [spreading, extending, progressive]
-  confluent: [confluent, coalescing]
+confidence:
+  structured_direct: 1.0
+  linked_form: 1.0
+  # An extraction's confidence reflects how the mention was anchored, not how
+  # plausible the value looks.
+  direct_phrase: 0.95        # "rash with oral mucosal involvement"
+  same_sentence: 0.78        # the mention and the event share a sentence
+  comment_record: 0.85       # a comment written about this record
+  negated: 0.9               # a cue governs the mention explicitly
+  uncertain: 0.55            # the source itself hedges
+  extraction_default: 0.8
 
-severity:
-  mild: ["mild", "mildly", "grade 1", "slight"]
-  moderate: ["moderate", "moderately", "grade 2"]
-  severe: ["severe", "severely", "grade 3", "grade 4", "extensive"]
-
-# Anchors resolve against the exposure record. The window in a phenotype
-# definition is measured from one of these.
 anchors:
   first_exposure:
     domain: EX
@@ -59,11 +63,3 @@ anchors:
     rule: dose_increase
     date_field: EXSTDTC
 default_anchor: first_exposure
-
-confidence:
-  structured_direct: 1.0
-  sponsor_normalized: 0.98
-  extraction_default: 0.8
-  # Below this, a value is reported but routed by the definition's
-  # `on_low_confidence` rather than counted.
-  review_below: 0.6

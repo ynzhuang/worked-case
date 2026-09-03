@@ -1,194 +1,122 @@
-# Concept catalogue.
+# Concept catalogue, modifier catalogues, and dictionary versions.
 #
 # ILLUSTRATIVE PLACEHOLDERS. This repository holds no terminology licence and
-# ships no licensed dictionary content. The coded terms below are stand-ins with
-# the right *shape* — a preferred term, lower-level terms, and different sets
-# under different dictionary versions — so that dictionary-version bridging can
-# be exercised. Replace them with a licensed extract before any real use.
-#
-# The catalogue is also where surface forms are declared. Extraction recall is
-# exactly the surface forms written here, and no more.
+# ships no licensed dictionary content. The coded strings below are stand-ins
+# with the right *shape* — several legitimate codings of one clinical
+# situation, and a code that is renamed between versions while another
+# disappears — so that concept-set membership and version reconciliation can be
+# exercised. Replace them with a licensed extract before any real use.
 
-terminology:
-  dictionary: PLACEHOLDER-MedDRA-like
-  versions: ["24.0", "25.1", "26.0"]
+dictionaries:
+  name: PLACEHOLDER-DICT
+  versions: ["D-19.0", "D-20.0", "D-21.0"]
+  target: "D-21.0"
   notice: >
     Illustrative placeholder terms. Not licensed dictionary content.
 
 concepts:
+  # Two legitimate codings of the same clinical situation. Nothing merges them:
+  # the phenotype's concept set decides that both qualify.
   RASH:
     label: Rash
-    recurrence_expected: true
-    coded_terms:
-      pt: ["Rash"]
-      llt: ["Rash", "Skin rash", "Eruption"]
-      # Terminology moves between versions. A study coded under 24.0 carries a
-      # different set from one coded under 26.0, which is what makes
-      # `bridge_dictionary_versions` a measurable choice rather than a default.
-      by_dictionary_version:
-        "24.0": ["Rash", "Skin rash"]
-        "25.1": ["Rash", "Skin rash", "Eruption"]
-        "26.0": ["Rash", "Skin rash", "Eruption", "Rash generalised"]
+    codes:
+      "D-19.0": "Rash"
+      "D-20.0": "Rash"
+      "D-21.0": "Rash"
     lexicon: [rash, eruption, skin rash, exanthem]
-    abbreviations: []
-    # None of the coded terms above carries a body site. That is the point of
-    # the worked example: where no available term includes both the event and
-    # the site, the event term is selected and the site survives elsewhere.
-    carries_body_site: false
 
-  URTICARIA:
-    label: Urticaria
-    recurrence_expected: true
-    coded_terms:
-      pt: ["Urticaria"]
-      llt: ["Urticaria", "Hives"]
-    lexicon: [urticaria, hives, weals, wheals]
-    abbreviations: []
-    carries_body_site: false
+  RASH_ERYTHEMATOUS:
+    label: Rash erythematous
+    # Renamed between D-20.0 and D-21.0. A code that persists across versions
+    # remaps mechanically; nothing about that decision involves a model.
+    codes:
+      "D-19.0": "Rash erythematous"
+      "D-20.0": "Rash erythematous"
+      "D-21.0": "Erythematous rash"
+    lexicon: [erythematous rash, red rash, erythematous eruption]
+
+  RASH_MACULOPAPULAR:
+    label: Rash maculopapular
+    # Deliberately absent from the target version: this is the code that gets
+    # flagged for review rather than auto-recoded.
+    codes:
+      "D-19.0": "Rash maculopapular"
+      "D-20.0": "Rash maculopapular"
+    lexicon: [maculopapular rash, morbilliform rash]
 
   PRURITUS:
     label: Pruritus
-    recurrence_expected: true
-    coded_terms:
-      pt: ["Pruritus"]
-      llt: ["Pruritus", "Itching"]
+    codes:
+      "D-19.0": "Pruritus"
+      "D-20.0": "Pruritus"
+      "D-21.0": "Pruritus"
     lexicon: [pruritus, itching, itch]
-    abbreviations: []
-    carries_body_site: false
 
   NAUSEA:
     label: Nausea
-    recurrence_expected: true
-    coded_terms:
-      pt: ["Nausea"]
-      llt: ["Nausea", "Feeling sick"]
+    codes:
+      "D-19.0": "Nausea"
+      "D-20.0": "Nausea"
+      "D-21.0": "Nausea"
     lexicon: [nausea, nauseated, feeling sick]
-    abbreviations: []
-    carries_body_site: false
 
-  HEADACHE:
-    label: Headache
-    recurrence_expected: true
-    coded_terms:
-      pt: ["Headache"]
-      llt: ["Headache", "Cephalgia"]
-    lexicon: [headache, cephalgia]
-    abbreviations: []
-    carries_body_site: false
-
-  ANAEMIA:
-    label: Anaemia
-    # Within a study window an anaemia is one condition changing grade, not a
-    # series of separate events. The episode reconciler reads this.
-    recurrence_expected: false
-    coded_terms:
-      pt: ["Anaemia"]
-      llt: ["Anaemia", "Anemia", "Low haemoglobin"]
-    lexicon: [anaemia, anemia, low haemoglobin]
-    abbreviations: []
-    carries_body_site: false
+  NEUTROPENIA:
+    label: Neutropenia
+    codes:
+      "D-19.0": "Neutropenia"
+      "D-20.0": "Neutropenia"
+      "D-21.0": "Neutropenia"
+    lexicon: [neutropenia, low neutrophils, neutrophil count decreased]
 
 concept_groups:
-  SKIN_EVENTS:
-    label: Skin and subcutaneous tissue events
-    members: [RASH, URTICARIA, PRURITUS]
+  CUTANEOUS:
+    label: Cutaneous events
+    members: [RASH, RASH_ERYTHEMATOUS, RASH_MACULOPAPULAR, PRURITUS]
 
 # --------------------------------------------------------------------------
-# Attribute catalogues
+# Modifier catalogues
 #
-# These are the normalized value spaces a phenotype rule is written against.
-# Every route — a standard variable, a sponsor codelist, the reported term, a
-# comment — resolves into the same space, which is what makes a route-agnostic
-# rule possible at all.
+# The normalized value space a phenotype rule is written against. Every route
+# — a structured qualifier, a linked form, the reported term, a comment —
+# resolves into the same space, which is the only reason a route-agnostic rule
+# is possible at all.
 # --------------------------------------------------------------------------
 
-attribute_catalogues:
-  location:
-    label: Anatomical location
+modifiers:
+  mucosal_involvement:
+    label: Mucosal involvement
+    description: >
+      Involvement of a mucous membrane. Its `assertion` is what the source says
+      (present / absent / uncertain); its `value`, where one is stated, is which
+      mucosal site.
     values:
-      CHEST:
-        label: Chest
-        region: trunk
-        # Surface forms are the site itself, never a connector plus the site:
-        # "on the chest" would swallow the connector the anchoring rule needs
-        # to see, and score a well-connected mention as a merely adjacent one.
-        surface_forms: ["chest", "anterior chest", "chest wall", "sternal",
-                        "presternal", "thorax", "thoracic"]
-      ABDOMEN:
-        label: Abdomen
-        region: trunk
-        surface_forms: ["abdomen", "abdominal", "belly", "periumbilical",
-                        "periumbilical area", "flank"]
-      BACK:
-        label: Back
-        region: trunk
-        surface_forms: ["back", "upper back", "lower back", "lumbar",
-                        "scapular", "interscapular"]
-      ARM:
-        label: Arm
-        region: limb
-        surface_forms: ["arm", "arms", "forearm", "upper arm", "elbow",
-                        "antecubital"]
-      LEG:
-        label: Leg
-        region: limb
-        surface_forms: ["leg", "legs", "thigh", "shin", "calf", "knee"]
-      FACE:
-        label: Face
-        region: head
-        surface_forms: ["face", "facial", "cheek", "forehead", "perioral"]
-      GENERALISED:
-        label: Generalised
-        region: whole_body
-        surface_forms: ["generalised", "generalized", "widespread", "diffuse",
-                        "all over", "whole body", "systemic"]
-    regions:
-      trunk: [CHEST, ABDOMEN, BACK]
-      limb: [ARM, LEG]
-      head: [FACE]
-      whole_body: [GENERALISED]
+      ORAL:
+        label: Oral mucosa
+        surface_forms: ["oral mucosal involvement", "oral mucosa",
+                        "mucosal lesions of the mouth", "mucosal involvement of the mouth",
+                        "oral ulceration", "oral ulcers", "buccal erosions",
+                        "mouth ulceration", "stomatitis"]
+      OCULAR:
+        label: Ocular mucosa
+        surface_forms: ["ocular involvement", "conjunctival involvement",
+                        "conjunctivitis", "eye involvement"]
+      GENITAL:
+        label: Genital mucosa
+        surface_forms: ["genital involvement", "genital erosions",
+                        "genital ulceration"]
+      UNSPECIFIED:
+        label: Mucosa, site unspecified
+        surface_forms: ["mucosal involvement", "mucous membrane involvement",
+                        "mucosal lesions", "mucosal erosions",
+                        "mucous membranes involved"]
 
-  laterality:
-    label: Laterality
+  photosensitivity:
+    label: Photosensitivity
+    description: >
+      A second configured modifier, so nothing in the code is specific to
+      mucosal involvement.
     values:
-      LEFT: {label: Left, surface_forms: ["left", "left-sided", "left sided"]}
-      RIGHT: {label: Right, surface_forms: ["right", "right-sided", "right sided"]}
-      BILATERAL:
-        label: Bilateral
-        surface_forms: ["bilateral", "both sides", "bilaterally"]
-
-  pattern:
-    label: Morphological pattern
-    values:
-      MACULAR:
-        label: Macular
-        surface_forms: ["macular", "macules", "flat red patches"]
-      PAPULAR:
-        label: Papular
-        surface_forms: ["papular", "papules", "raised bumps"]
-      MACULOPAPULAR:
-        label: Maculopapular
-        surface_forms: ["maculopapular", "maculo-papular", "morbilliform"]
-      URTICARIAL:
-        label: Urticarial
-        surface_forms: ["urticarial", "hives", "weals", "wheals"]
-      VESICULAR:
-        label: Vesicular
-        surface_forms: ["vesicular", "vesicles", "blistering", "bullous"]
-
-symptom_lexicon:
-  itching: [itching, pruritus, itchy]
-  burning: [burning, stinging]
-  swelling: [swelling, oedema, edema]
-
-# How records are grouped into episodes. Declared, not discovered.
-episode_reconciliation:
-  overlap_tolerance_days: 3
-  recurrence_gap_days: 7
-  confidence:
-    explicit_continuation: 1.0
-    declared_convention: 0.95
-    temporal_overlap: 0.9
-    gap_within_tolerance: 0.75
-    recurrence_split: 0.9
-    single_record: 1.0
+      PRESENT:
+        label: Photosensitive
+        surface_forms: ["photosensitivity", "photosensitive", "sun-exposed areas",
+                        "photodistributed"]

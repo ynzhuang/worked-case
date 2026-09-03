@@ -23,12 +23,12 @@ from typing import Any
 
 #: Bumped by hand when extractor behaviour changes in a way config cannot
 #: express.  Folded into ``extractor_version``.
-EXTRACTOR_CODE_VERSION = "extract-3.0.0"
+EXTRACTOR_CODE_VERSION = "extract-4.0.0"
 
 #: The deterministic path has its own version, separate from the model path,
 #: because a normalizer change and an extractor change have different blast
 #: radii and a result needs to say which one moved.
-NORMALIZER_CODE_VERSION = "normalize-3.0.0"
+NORMALIZER_CODE_VERSION = "normalize-4.0.0"
 
 _HASH_LEN = 16
 

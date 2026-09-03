@@ -1,383 +1,517 @@
-"""Evaluating a definition over episodes, with four verdicts.
+"""Executing a phenotype definition against normalized records.
 
-The fourth verdict is the point of this module.
+Four verdicts, and the fourth is the one that makes the other three honest:
 
 ``case``
-    every required attribute is present and satisfies its rule
-``not_case``
-    a required attribute is present and *fails* its rule
-``not_ascertainable``
-    a required attribute is unavailable and unrecoverable — nobody can evaluate
-    the rule, not the system and not a reviewer, so this is neither a negative
-    nor a review item
+    every criterion satisfied
+``non_case``
+    a criterion was *evaluated* and failed — somebody looked and the answer was
+    no
 ``review``
-    an attribute is present but weakly supported, or an onset could not be
-    resolved against the anchor — a person could settle it
+    the evidence exists but does not settle the question (the source hedges, or
+    the confidence is below the declared threshold)
+``not_ascertainable``
+    the evidence needed to decide was never collected in a form this study can
+    answer from
 
-Precedence: a requirement that is present and fails settles the episode as a
-negative, whatever else is missing. Knowing the rash was on the arm makes it not
-a truncal rash even if the onset date is missing. Only when nothing has failed
-does an unavailable requirement make the episode unascertainable.
+Without an explicit ``non_case`` you cannot state a denominator: a study that
+never asks about the modifier and a study that asks and records "no" would land
+in the same bucket, and the resulting rate would compare CRFs rather than
+patients. The evaluator therefore never turns silence into a negative, and
+never turns a negative into silence.
 
-The evaluator is **route-agnostic where the definition says so**. It never asks
-where a value came from except to check it against ``accept_methods``, and it
-records the route on every assignment so a reader can see what the cohort
-depended on.
+The rule is route-agnostic: it names a modifier and the assertion it wants, and
+it does not know or care which study variable supplied the evidence. That is
+what makes one definition executable across studies that collect the same fact
+in five different places.
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field as _dc_field
 from typing import Any, Iterable, Sequence
 
 from ..catalog import ConceptCatalog
 from ..models import (
+    ASCERTAINED,
     Attribute,
-    AttributeFinding,
-    AttributeRequirement,
-    CanonicalAEEpisode,
+    CanonicalAERecord,
     CaseAssignment,
+    CriterionFinding,
+    Denominator,
     PhenotypeDefinition,
     Span,
-    Verdict,
-)
-
-#: Which verdict wins when requirements disagree. A definite negative outranks
-#: an unascertainable one, which outranks a review, which outranks a case.
-VERDICT_PRECEDENCE: tuple[str, ...] = (
-    "not_case", "not_ascertainable", "review", "case",
 )
 
 
 @dataclass
-class EpisodeVerdict:
-    episode: CanonicalAEEpisode
-    verdict: Verdict
-    reason: str
-    deciding_attribute: str | None = None
-    findings: list[AttributeFinding] = _dc_field(default_factory=list)
-    review_reasons: list[str] = _dc_field(default_factory=list)
-    spans: list[Span] = _dc_field(default_factory=list)
+class EvaluationResult:
+    """Every assignment, plus the denominators they imply."""
 
-    def attribute_sources(self) -> dict[str, str]:
-        return {
-            f.name: f.source_variable for f in self.findings
-            if f.satisfied and f.source_variable
-        }
+    definition: PhenotypeDefinition
+    assignments: list[CaseAssignment] = _dc_field(default_factory=list)
+    notes: list[str] = _dc_field(default_factory=list)
 
-    def attribute_methods(self) -> dict[str, str]:
-        return {
-            f.name: f.method for f in self.findings if f.satisfied and f.method
-        }
+    # -- summaries ----------------------------------------------------------
+
+    def verdicts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for assignment in self.assignments:
+            counts[assignment.verdict] = counts.get(assignment.verdict, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def denominators(self) -> list[Denominator]:
+        """One per study, because the ascertainable fraction is a study fact."""
+        buckets: dict[str, Denominator] = {}
+        for assignment in self.assignments:
+            bucket = buckets.get(assignment.study_id)
+            if bucket is None:
+                bucket = Denominator(
+                    study_id=assignment.study_id, profile=assignment.profile
+                )
+                buckets[assignment.study_id] = bucket
+            bucket.n_total += 1
+            setattr(
+                bucket, f"n_{assignment.verdict}",
+                getattr(bucket, f"n_{assignment.verdict}") + 1,
+            )
+        return [buckets[k] for k in sorted(buckets)]
+
+    def overall(self) -> Denominator:
+        total = Denominator(study_id="ALL", profile="")
+        for bucket in self.denominators():
+            total.n_total += bucket.n_total
+            total.n_case += bucket.n_case
+            total.n_non_case += bucket.n_non_case
+            total.n_review += bucket.n_review
+            total.n_not_ascertainable += bucket.n_not_ascertainable
+        return total
+
+    def cases(self) -> list[CaseAssignment]:
+        return [a for a in self.assignments if a.verdict == "case"]
+
+    def ascertained(self) -> list[CaseAssignment]:
+        return [a for a in self.assignments if a.verdict in ASCERTAINED]
+
+    def by_record(self) -> dict[str, CaseAssignment]:
+        return {a.record_id: a for a in self.assignments}
+
+    def text_dependent_cases(self) -> list[CaseAssignment]:
+        """Cases that exist only because the model path read prose.
+
+        This is the number the value ablation turns into a decision.
+        """
+        return [a for a in self.cases() if a.used_text_extraction]
 
 
 class PhenotypeEvaluator:
-    def __init__(self, definition: PhenotypeDefinition, catalog: ConceptCatalog):
+    """Runs one definition. Holds no state between records."""
+
+    def __init__(
+        self, definition: PhenotypeDefinition,
+        catalog: ConceptCatalog | None = None,
+        exposure_totals: dict[str, float] | None = None,
+    ):
         self.definition = definition
         self.catalog = catalog
-        self.concept_ids = self._concept_ids()
+        #: `subject_id -> cumulative dose before onset`, supplied by the
+        #: normalizer for definitions that need it.
+        self.exposure_totals = exposure_totals or {}
 
-    def _concept_ids(self) -> set[str]:
-        ids = {self.definition.concept.primary}
-        if self.definition.concept.group:
-            ids.update(self.catalog.expand_group(self.definition.concept.group))
-        return ids
+    # -- one record ---------------------------------------------------------
 
-    # -- concept identity ---------------------------------------------------
+    def evaluate(self, record: CanonicalAERecord) -> CaseAssignment | None:
+        """One assignment, or ``None`` when the record is out of scope.
 
-    def concept_terms(self, episode: CanonicalAEEpisode) -> set[str]:
-        """Coded terms that count as this concept for this episode.
-
-        With ``bridge_dictionary_versions`` the union across versions applies,
-        so a study coded under an earlier dictionary still matches. Without it,
-        only the terms that episode's own version carried are eligible — which
-        is how you measure what bridging is worth.
+        A record whose coded concept is not in the set is not a `non_case`: it
+        was never a candidate, and counting it as an evaluated negative would
+        inflate every denominator with unrelated events.
         """
-        concept = self.catalog.concept(self.definition.concept.primary)
-        if self.definition.concept.bridge_dictionary_versions:
-            terms = set(concept.all_coded_terms())
-        else:
-            terms = set()
-            for version in episode.dictionary_versions or [None]:
-                terms.update(concept.coded_terms_for_version(version))
-        return {t.strip().casefold() for t in terms}
+        if not self._in_concept_set(record):
+            return None
 
-    def in_scope(self, episode: CanonicalAEEpisode) -> tuple[bool, str]:
-        if episode.standardized_concept in self.concept_ids:
-            if self.definition.concept.bridge_dictionary_versions:
-                return True, ""
-            eligible = self.concept_terms(episode)
-            matched = [
-                t for t in episode.coded_events if t.strip().casefold() in eligible
-            ]
-            if matched:
-                return True, ""
-            return False, (
-                f"coded terms {episode.coded_events} are not terms for "
-                f"{self.definition.concept.primary} under this episode's "
-                f"dictionary version {episode.dictionary_versions}, and this "
-                f"definition does not bridge versions"
-            )
-        return False, (
-            f"episode concept {episode.standardized_concept!r} is not "
-            f"{sorted(self.concept_ids)}"
-        )
-
-    # -- one requirement ----------------------------------------------------
-
-    def check(
-        self, requirement: AttributeRequirement, episode: CanonicalAEEpisode
-    ) -> tuple[str, AttributeFinding]:
-        """Evaluate one requirement, returning a verdict and what supported it."""
-        attribute = self._attribute_for(requirement, episode)
-        if attribute is None:
-            return "not_ascertainable", AttributeFinding(
-                name=requirement.name, satisfied=False,
-                reason=f"the episode carries no {requirement.name} attribute",
-            )
-
-        finding = AttributeFinding(
-            name=requirement.name,
-            satisfied=False,
-            value=attribute.value,
-            method=attribute.method,
-            source=attribute.source,
-            source_variable=attribute.source_variable,
-            availability=attribute.availability,
-            spans=list(attribute.evidence),
-        )
-
-        if not attribute.populated:
-            # For a window there are two different emptinesses. An episode with
-            # a start date whose anchor could not be resolved is *unresolved* —
-            # a person with the exposure record could settle it. An episode with
-            # no start date at all is unavailable, and nobody can.
-            if requirement.window is not None and episode.episode_start.populated:
-                finding.reason = (
-                    f"the episode starts "
-                    f"{episode.episode_start.value.isoformat()} but the offset "
-                    f"from {requirement.window.anchor} could not be resolved"
-                    + (f" ({attribute.note})" if attribute.note else "")
-                )
-                return requirement.on_unresolved, finding
-            finding.reason = self._unavailable_reason(requirement, attribute)
-            return requirement.on_unavailable, finding
-
-        if attribute.method not in requirement.accept_methods:
-            finding.reason = (
-                f"{requirement.name} came by the {attribute.method!r} route from "
-                f"{attribute.source_variable}, which this definition does not "
-                f"accept (it accepts {requirement.accept_methods})"
-            )
-            return requirement.on_unavailable, finding
-
-        if (
-            requirement.accept_sources
-            and attribute.source not in requirement.accept_sources
-        ):
-            finding.reason = (
-                f"{requirement.name} came from {attribute.source!r}, which this "
-                f"definition does not accept"
-            )
-            return requirement.on_unavailable, finding
-
-        if requirement.window is not None:
-            return self._window(requirement, episode, attribute, finding)
-
-        if requirement.allowed is not None and attribute.value not in requirement.allowed:
-            finding.reason = (
-                f"{requirement.name} is {attribute.value!r}, which is not one of "
-                f"{requirement.allowed}"
-            )
-            return "not_case", finding
-
-        if (
-            requirement.min_confidence is not None
-            and attribute.confidence is not None
-            and attribute.confidence < requirement.min_confidence
-        ):
-            finding.reason = (
-                f"{requirement.name} is {attribute.value!r} but its confidence "
-                f"{attribute.confidence:.2f} is below the definition's threshold "
-                f"{requirement.min_confidence:.2f}"
-            )
-            return requirement.on_low_confidence, finding
-
-        finding.satisfied = True
-        finding.reason = (
-            f"{requirement.name} is {attribute.value!r}, taken by the "
-            f"{attribute.method} route from {attribute.source_variable}"
-        )
-        return "case", finding
-
-    def _attribute_for(
-        self, requirement: AttributeRequirement, episode: CanonicalAEEpisode
-    ) -> Attribute[Any] | None:
-        if requirement.name == "onset":
-            return episode.onset_offset_days
-        return episode.attribute(requirement.name)
-
-    @staticmethod
-    def _unavailable_reason(
-        requirement: AttributeRequirement, attribute: Attribute[Any]
-    ) -> str:
-        detail = f" ({attribute.note})" if attribute.note else ""
-        if attribute.availability == "not_collected_by_protocol":
-            return (
-                f"{requirement.name} was never collected by this study's "
-                f"protocol and is not recoverable from anywhere{detail}"
-            )
-        return (
-            f"{requirement.name} is {attribute.availability}{detail}, so the "
-            f"rule cannot be evaluated on this episode"
-        )
-
-    def _window(
-        self, requirement: AttributeRequirement, episode: CanonicalAEEpisode,
-        attribute: Attribute[Any], finding: AttributeFinding,
-    ) -> tuple[str, AttributeFinding]:
-        window = requirement.window
-        assert window is not None
-        offset = attribute.value
-        if offset is None:
-            finding.reason = "the onset offset could not be resolved"
-            return requirement.on_unresolved, finding
-        if not window.contains(int(offset)):
-            finding.reason = (
-                f"onset is {offset} days from {window.anchor}, outside "
-                f"[{window.min}, {window.max}]"
-            )
-            return "not_case", finding
-        finding.satisfied = True
-        finding.reason = (
-            f"onset is {offset} days from {window.anchor}, inside "
-            f"[{window.min}, {window.max}]"
-        )
-        return "case", finding
-
-    # -- one episode --------------------------------------------------------
-
-    def evaluate_episode(self, episode: CanonicalAEEpisode) -> EpisodeVerdict:
-        if episode.candidate:
-            return EpisodeVerdict(
-                episode=episode, verdict="not_case",
-                deciding_attribute=None,
-                reason=(
-                    "the episode is an unadjudicated discovery candidate and "
-                    "cannot enter a cohort without adjudication or a new "
-                    "definition version"
-                ),
-            )
-
-        in_scope, why = self.in_scope(episode)
-        if not in_scope:
-            return EpisodeVerdict(
-                episode=episode, verdict="not_case", reason=why,
-            )
-
-        review_reasons: list[str] = []
-        if episode.linkage_review_required:
-            review_reasons.append(
-                f"episode linkage was flagged for review: {episode.linkage_note}"
-            )
-        elif episode.linkage_confidence < self.definition.episode_linkage_confidence:
-            review_reasons.append(
-                f"linkage confidence {episode.linkage_confidence:.2f} is below "
-                f"the definition's threshold "
-                f"{self.definition.episode_linkage_confidence:.2f} "
-                f"(rule: {episode.linkage_rule})"
-            )
-
-        findings: list[AttributeFinding] = []
-        outcomes: list[tuple[str, AttributeFinding]] = []
-        for requirement in self.definition.required_attributes:
-            verdict, finding = self.check(requirement, episode)
-            outcomes.append((verdict, finding))
-            findings.append(finding)
-
-        verdict = "case"
-        deciding: str | None = None
-        for candidate in VERDICT_PRECEDENCE:
-            matching = [(v, f) for v, f in outcomes if v == candidate]
-            if matching:
-                verdict = candidate
-                deciding = matching[0][1].name if candidate != "case" else None
-                break
-
-        if verdict == "case" and review_reasons:
-            verdict = self.definition.on_linkage_review
-            deciding = "episode_linkage"
-
-        reasons = [f.reason for v, f in outcomes if v == verdict] or [
-            f.reason for _v, f in outcomes
+        findings = [
+            *self._concept_finding(record),
+            *(self._modifier_finding(record, r) for r in self.definition.modifiers),
         ]
-        reason = "; ".join(r for r in reasons if r)
-        if verdict == "case":
-            reason = "; ".join(f.reason for f in findings if f.satisfied)
-        if review_reasons and verdict == "review":
-            reason = f"{reason}; {review_reasons[0]}" if reason else review_reasons[0]
+        if self.definition.temporal is not None:
+            findings.append(self._temporal_finding(record))
+        if self.definition.grade is not None:
+            findings.append(self._grade_finding(record))
+        if self.definition.cumulative_exposure is not None:
+            findings.append(self._exposure_finding(record))
 
-        return EpisodeVerdict(
-            episode=episode,
-            verdict=verdict,  # type: ignore[arg-type]
-            deciding_attribute=deciding,
+        verdict, deciding, reason = self._decide(findings)
+        return CaseAssignment(
+            record_id=record.record_id,
+            subject_id=record.subject_id,
+            study_id=record.study_id,
+            profile=record.profile,
+            verdict=verdict,
+            deciding_criterion=deciding,
             reason=reason,
             findings=findings,
-            review_reasons=review_reasons,
-            spans=[s for f in findings if f.satisfied for s in f.spans],
+            evidence_spans=[s for f in findings for s in f.spans],
+            attribute_sources={
+                f.name: f.source_variable for f in findings if f.source_variable
+            },
+            attribute_methods={
+                f.name: f.method for f in findings if f.method
+            },
+            definition_id=self.definition.id,
+            definition_version=self.definition.version,
+            definition_hash=self.definition.definition_hash,
         )
 
-    # -- a cohort -----------------------------------------------------------
+    # -- criteria -----------------------------------------------------------
 
-    def evaluate(
-        self, episodes: Iterable[CanonicalAEEpisode]
-    ) -> list[CaseAssignment]:
-        assignments: list[CaseAssignment] = []
-        for episode in sorted(episodes, key=lambda e: e.episode_id):
-            verdict = self.evaluate_episode(episode)
-            assignments.append(CaseAssignment(
-                episode_id=episode.episode_id,
-                subject_id=episode.subject_id,
-                study_id=episode.study_id,
-                profile=episode.profile,
-                verdict=verdict.verdict,
-                deciding_attribute=verdict.deciding_attribute,
-                reason=verdict.reason,
-                findings=verdict.findings,
-                source_record_ids=list(episode.source_record_ids),
-                evidence_spans=sorted(
-                    verdict.spans, key=lambda s: (s.field, s.doc_id, s.start)
-                ),
-                attribute_sources=verdict.attribute_sources(),
-                attribute_methods=verdict.attribute_methods(),
-                definition_id=self.definition.id,
-                definition_version=self.definition.version,
-                definition_hash=self.definition.definition_hash,
-                linkage_review_required=episode.linkage_review_required,
-                review_reasons=verdict.review_reasons,
-            ))
-        return assignments
+    def _in_concept_set(self, record: CanonicalAERecord) -> bool:
+        concept = record.concept_id
+        if concept is None:
+            return False
+        include = set(self.definition.concept_set.include)
+        if self.catalog is not None:
+            expanded: set[str] = set()
+            for name in include:
+                if name in self.catalog.concept_groups:
+                    expanded.update(self.catalog.expand_group(name))
+                else:
+                    expanded.add(name)
+            include = expanded
+        return concept in include and concept not in set(
+            self.definition.concept_set.exclude
+        )
 
-    def evaluate_subjects(
-        self, episodes: Iterable[CanonicalAEEpisode]
-    ) -> dict[str, str]:
-        """Subject-level verdict: the strongest claim across their episodes.
+    def _concept_finding(self, record: CanonicalAERecord) -> list[CriterionFinding]:
+        """The coded event, and how its dictionary version reconciled.
 
-        A subject with one truncal rash is a case whatever else they had; a
-        subject whose only rash cannot be ascertained is unascertainable, not a
-        negative.
+        Membership is decided by concept, not by string, so a record whose code
+        has no mechanical mapping to the target version still qualifies — and
+        the finding says so rather than dropping it.
         """
-        order = ["not_case", "review", "not_ascertainable", "case"]
-        best: dict[str, str] = {}
-        for assignment in self.evaluate(episodes):
-            current = best.get(assignment.subject_id)
-            if current is None or order.index(assignment.verdict) > order.index(current):
-                best[assignment.subject_id] = assignment.verdict
-        return dict(sorted(best.items()))
+        coded = record.coded_event
+        if coded is None:
+            return []
+        note = ""
+        if coded.reconciliation == "flagged_for_review":
+            note = (
+                f"; {coded.code!r} has no mechanical mapping to "
+                f"{self.definition.concept_set.dictionary_target}, so it is "
+                f"flagged for review rather than recoded — the record still "
+                f"qualifies by concept"
+            )
+        elif coded.reconciliation == "remapped_mechanically":
+            note = (
+                f"; {coded.code!r} ({coded.dictionary_version}) remaps "
+                f"mechanically to {coded.reconciled_to!r}, and the original is "
+                f"preserved"
+            )
+        return [CriterionFinding(
+            name="concept",
+            satisfied=True,
+            verdict="case",
+            assertion="present",
+            availability="observed",
+            value=coded.concept_id,
+            method="direct",
+            source="structured_standard",
+            source_variable="AEDECOD",
+            reason=(
+                f"coded {coded.code!r} under {coded.dictionary_version}, "
+                f"concept {coded.concept_id}, which the concept set includes"
+                f"{note}"
+            ),
+            spans=[Span(
+                doc_id=f"AE:{record.source_record_id}:AEDECOD", start=0,
+                end=len(coded.code), field="concept",
+                extracted_value=coded.concept_id or coded.code,
+                text=coded.code, kind="structured",
+            )],
+        )]
+
+    def _modifier_finding(
+        self, record: CanonicalAERecord, requirement
+    ) -> CriterionFinding:
+        """The heart of it: assertion and availability read as separate facts."""
+        attribute: Attribute[Any] | None = record.modifiers.get(requirement.name)
+        policy = self.definition.ascertainability
+        base = dict(
+            name=requirement.name,
+            source_variable=(attribute.source_variable if attribute else None),
+            source=(attribute.source if attribute else None),
+            method=(attribute.method if attribute else None),
+            confidence=(attribute.confidence if attribute else None),
+            spans=list(attribute.evidence) if attribute else [],
+            value=(attribute.value if attribute else None),
+            assertion=(attribute.assertion if attribute else None),
+            availability=(attribute.availability if attribute else "unresolved"),
+        )
+
+        # 1 · nothing was said. Not a negative — nobody looked.
+        if attribute is None or not attribute.observed:
+            availability = attribute.availability if attribute else "unresolved"
+            return CriterionFinding(**{**base, **dict(
+                satisfied=False,
+                verdict=requirement.on_unavailable,
+                reason=(
+                    f"{requirement.name} is {availability}: the source says "
+                    f"nothing, which is not the same as saying no. This record "
+                    f"is {requirement.on_unavailable}, not a non_case"
+                    + (f" ({attribute.note})" if attribute and attribute.note else "")
+                ),
+            )})
+
+        # 2 · the route it arrived by is not one this definition accepts.
+        if attribute.method not in requirement.accept_methods:
+            return CriterionFinding(**{**base, **dict(
+                satisfied=False,
+                verdict=policy.missing_required_modifier,
+                reason=(
+                    f"{requirement.name} was read by method "
+                    f"{attribute.method!r}, which this definition does not "
+                    f"accept ({requirement.accept_methods}); the evidence "
+                    f"exists but this version declines to use it"
+                ),
+            )})
+        if (
+            requirement.accept_sources is not None
+            and attribute.source not in requirement.accept_sources
+        ):
+            return CriterionFinding(**{**base, **dict(
+                satisfied=False,
+                verdict=policy.missing_required_modifier,
+                reason=(
+                    f"{requirement.name} came from {attribute.source!r}, which "
+                    f"this definition does not accept "
+                    f"({requirement.accept_sources})"
+                ),
+            )})
+
+        # 3 · an extracted value with no span cannot be checked by anyone.
+        evidence = self.definition.evidence_policy
+        if (
+            attribute.method == "extracted"
+            and evidence.extracted_requires_span
+            and not attribute.evidence
+        ):
+            return CriterionFinding(**{**base, **dict(
+                satisfied=False,
+                verdict="review",
+                reason=(
+                    f"{requirement.name} was extracted but carries no span, so "
+                    f"no reader can check it"
+                ),
+            )})
+        if (
+            attribute.method == "extracted"
+            and attribute.confidence is not None
+            and attribute.confidence < evidence.min_confidence
+        ):
+            return CriterionFinding(**{**base, **dict(
+                satisfied=False,
+                verdict=evidence.below_threshold,
+                reason=(
+                    f"{requirement.name} was extracted at confidence "
+                    f"{attribute.confidence:.2f}, below the declared threshold "
+                    f"{evidence.min_confidence:.2f}"
+                ),
+            )})
+
+        # 4 · the source addressed it. Now, what did it say?
+        if attribute.assertion == requirement.require_assertion:
+            return CriterionFinding(**{**base, **dict(
+                satisfied=True,
+                verdict="case",
+                reason=(
+                    f"{requirement.name} is {attribute.assertion} "
+                    f"{'(' + str(attribute.value) + ') ' if attribute.value else ''}"
+                    f"via {attribute.method} from {attribute.source_variable}"
+                ),
+            )})
+        if attribute.assertion == "uncertain":
+            return CriterionFinding(**{**base, **dict(
+                satisfied=False,
+                verdict=policy.uncertain_assertion,
+                reason=(
+                    f"{requirement.name}: the source addressed it and hedged, "
+                    f"so it is neither a case nor an evaluated negative"
+                ),
+            )})
+        return CriterionFinding(**{**base, **dict(
+            satisfied=False,
+            verdict="non_case",
+            reason=(
+                f"{requirement.name} is {attribute.assertion} via "
+                f"{attribute.method} from {attribute.source_variable}: this is "
+                f"a documented negative, so the subject is a non_case and "
+                f"belongs in the denominator"
+            ),
+        )})
+
+    def _temporal_finding(self, record: CanonicalAERecord) -> CriterionFinding:
+        rule = self.definition.temporal
+        relation = record.exposure_relation
+        base = dict(
+            name="temporal",
+            source_variable=relation.source_variable,
+            source=relation.source,
+            method=relation.method,
+            spans=list(relation.evidence),
+            value=relation.value,
+            assertion=relation.assertion,
+            availability=relation.availability,
+        )
+        if not relation.observed or relation.value is None:
+            return CriterionFinding(**{**base, **dict(
+                satisfied=False,
+                verdict=rule.on_unresolved,
+                reason=(
+                    f"the offset from {rule.anchor} to onset is "
+                    f"{relation.availability}"
+                    + (f" ({relation.note})" if relation.note else "")
+                    + "; without it the window cannot be evaluated"
+                ),
+            )})
+        offset = int(relation.value)
+        inside = rule.contains(offset)
+        return CriterionFinding(**{**base, **dict(
+            satisfied=inside,
+            verdict="case" if inside else "non_case",
+            reason=(
+                f"onset is {offset} days after {rule.anchor}, "
+                f"{'inside' if inside else 'outside'} the declared window "
+                f"[{rule.minimum}, {rule.maximum}] days"
+            ),
+        )})
+
+    def _grade_finding(self, record: CanonicalAERecord) -> CriterionFinding:
+        rule = self.definition.grade
+        attribute = record.attribute(rule.attribute)
+        base = dict(
+            name=rule.attribute,
+            source_variable=(attribute.source_variable if attribute else None),
+            source=(attribute.source if attribute else None),
+            method=(attribute.method if attribute else None),
+            spans=list(attribute.evidence) if attribute else [],
+            value=(attribute.value if attribute else None),
+            assertion=(attribute.assertion if attribute else None),
+            availability=(attribute.availability if attribute else "unresolved"),
+        )
+        if attribute is None or not attribute.observed or attribute.value is None:
+            return CriterionFinding(**{**base, **dict(
+                satisfied=False,
+                verdict=rule.on_unavailable,
+                reason=(
+                    f"{rule.attribute} is "
+                    f"{attribute.availability if attribute else 'unresolved'}, "
+                    f"so the grade threshold cannot be evaluated"
+                ),
+            )})
+        satisfied = int(attribute.value) >= rule.minimum
+        return CriterionFinding(**{**base, **dict(
+            satisfied=satisfied,
+            verdict="case" if satisfied else "non_case",
+            reason=(
+                f"{rule.attribute} {attribute.value} is "
+                f"{'at or above' if satisfied else 'below'} the declared "
+                f"minimum {rule.minimum}"
+            ),
+        )})
+
+    def _exposure_finding(self, record: CanonicalAERecord) -> CriterionFinding:
+        rule = self.definition.cumulative_exposure
+        total = self.exposure_totals.get(record.record_id)
+        base = dict(
+            name="cumulative_exposure",
+            source_variable="EX",
+            source="cross_domain",
+            method="derived",
+            value=total,
+            spans=[],
+        )
+        if total is None:
+            return CriterionFinding(**{**base, **dict(
+                satisfied=False,
+                verdict=rule.on_unresolved,
+                availability="unresolved",
+                reason=(
+                    "cumulative exposure before onset could not be computed "
+                    "from EX, so the threshold cannot be evaluated"
+                ),
+            )})
+        satisfied = total >= rule.minimum
+        return CriterionFinding(**{**base, **dict(
+            satisfied=satisfied,
+            verdict="case" if satisfied else "non_case",
+            assertion="present",
+            availability="observed",
+            spans=[Span(
+                doc_id=f"EX:{record.subject_id}", start=0, end=0,
+                field="cumulative_exposure",
+                extracted_value=f"{total:g} {rule.unit}",
+                text=f"sum of EX doses before onset = {total:g} {rule.unit}",
+                kind="derived",
+            )],
+            reason=(
+                f"cumulative exposure before onset is {total:g} {rule.unit}, "
+                f"{'at or above' if satisfied else 'below'} the declared "
+                f"minimum {rule.minimum:g} {rule.unit}"
+            ),
+        )})
+
+    # -- combining ----------------------------------------------------------
+
+    #: Worst-first. `not_ascertainable` outranks `review`: a question the study
+    #: cannot answer is not a question a human reviewer can resolve either, and
+    #: sending it to the review queue would waste the queue.
+    PRECEDENCE = ("not_ascertainable", "review", "non_case", "case")
+
+    def _decide(
+        self, findings: Sequence[CriterionFinding]
+    ) -> tuple[str, str | None, str]:
+        for verdict in self.PRECEDENCE:
+            deciding = next(
+                (f for f in findings if f.verdict == verdict and not f.satisfied),
+                None,
+            )
+            if deciding is not None:
+                return verdict, deciding.name, deciding.reason
+        satisfied = [f.name for f in findings if f.satisfied]
+        return "case", None, (
+            f"every criterion is satisfied: {', '.join(satisfied)}"
+        )
+
+    # -- many records -------------------------------------------------------
+
+    def evaluate_all(
+        self, records: Iterable[CanonicalAERecord]
+    ) -> EvaluationResult:
+        result = EvaluationResult(definition=self.definition)
+        for record in records:
+            assignment = self.evaluate(record)
+            if assignment is not None:
+                result.assignments.append(assignment)
+        return result
 
 
 def evaluate_definition(
-    episodes: Iterable[CanonicalAEEpisode], definition: PhenotypeDefinition,
-    catalog: ConceptCatalog,
-) -> list[CaseAssignment]:
-    return PhenotypeEvaluator(definition, catalog).evaluate(episodes)
+    definition: PhenotypeDefinition,
+    records: Iterable[CanonicalAERecord],
+    catalog: ConceptCatalog | None = None,
+    exposure_totals: dict[str, float] | None = None,
+) -> EvaluationResult:
+    return PhenotypeEvaluator(definition, catalog, exposure_totals).evaluate_all(records)
+
+
+def denominator_table(result: EvaluationResult) -> list[dict[str, Any]]:
+    rows = [d.to_dict() for d in result.denominators()]
+    rows.append({**result.overall().to_dict(), "study_id": "ALL"})
+    return rows
+
+
+def cases_by_subject(result: EvaluationResult) -> dict[str, list[CaseAssignment]]:
+    by_subject: dict[str, list[CaseAssignment]] = defaultdict(list)
+    for assignment in result.cases():
+        by_subject[assignment.subject_id].append(assignment)
+    return dict(by_subject)

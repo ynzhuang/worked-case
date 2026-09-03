@@ -1,0 +1,46 @@
+id: graded_toxicity
+version: 1
+status: frozen
+label: Grade 3 or higher neutropenia after 200 mg cumulative exposure
+description: >
+  A second definition, shipped to prove the contract generalizes beyond the
+  rash example. It uses a different concept set and two criteria the first
+  definition does not have — a grade threshold and a cumulative exposure
+  threshold — and it loads, validates and executes with no code changes.
+supersedes: null
+authors: ["clinical-evidence-prototype"]
+created: 2026-09-03
+
+concept_set:
+  include: [NEUTROPENIA]
+  dictionary_target: "D-21.0"
+
+# No text modifier: grade is a structured field in every profile, which is
+# exactly why this definition needs no extractor.
+modifiers: []
+
+grade:
+  attribute: grade
+  minimum: 3
+  on_unavailable: not_ascertainable
+
+cumulative_exposure:
+  minimum: 200.0
+  unit: mg
+  on_unresolved: not_ascertainable
+
+temporal:
+  anchor: first_exposure
+  window: {min: 0, max: 180, unit: days}
+  on_unresolved: review
+
+evidence_policy:
+  extracted_requires_span: true
+  min_confidence: 0.7
+  below_threshold: review
+
+ascertainability:
+  missing_required_modifier: not_ascertainable
+  uncertain_assertion: review
+
+verdicts: [case, non_case, review, not_ascertainable]

@@ -1,47 +1,44 @@
 # Study profiles.
 #
-# A profile is a *collection decision*, not a property of the patients. The same
-# clinical truth rendered under two profiles produces different records, and
-# which attribute lives where is the whole subject of this prototype.
+# A profile is a collection decision. It is not a property of the patients, and
+# nothing about it may be inferred at read time — a study whose profile is not
+# declared cannot be read at all, because every silence in it would be
+# guesswork.
 #
-# The generator reads these to render a truth; the normalizer reads them to know
-# what a blank means and where to look for each attribute. Both read the same
-# file, so the two cannot disagree about a study's conventions.
+# The generator renders a clinical truth *through* a profile; the normalizer
+# reads a record *through* the same profile. One file, so the two cannot
+# disagree about a study's conventions.
 
 defaults:
-  dictionary: PLACEHOLDER-MedDRA-like
-  dictionary_version: "25.1"
-  # A blank in a variable the profile does not list under `collects` was never
-  # asked for. A blank in one it does list was asked and not answered.
-  blank_means: unknown
+  dictionary: PLACEHOLDER-DICT
+  dictionary_version: "D-21.0"
+  # A variable the profile does not list under `collects` was never asked for.
+  # One it does list, left empty, was asked and not answered.
+  silence_means: not_collected
   gated_variables:
     seriousness_criteria:
       gate: seriousness
-      when_gate_false: not_applicable_gated
+      when_gate_false: not_applicable
   gate_values:
     seriousness:
       from_variable: AESER
       true_when_in: ["Y"]
 
-# Where an attribute can live. `home` names the variable the generator writes it
+# Where a modifier can live. `home` names the variable the generator writes it
 # to and the normalizer reads it from.
-attribute_homes:
-  AELOC:
+modifier_homes:
+  structured_qualifier:
     kind: structured_standard
-    variable: AELOC
-    description: The optional standard location qualifier in the AE domain.
-  AEPATT:
-    kind: structured_standard
-    variable: AEPATT
-    description: A standard pattern qualifier.
+    variable: AEMUCOS
+    description: A standard structured qualifier on the AE record.
+  linked_form:
+    kind: linked_form
+    variable: SC.MUCOSAL
+    description: A linked skin-and-mucosa form pointing at the AE record.
   reported_term:
     kind: reported_term
     variable: AETERM
-    description: The investigator's own words, where the coded term cannot carry the site.
-  sponsor_variable:
-    kind: structured_sponsor
-    variable: SUPPAE
-    description: A sponsor-defined supplemental qualifier, named by the sponsor.
+    description: The investigator's own words, where no structured field exists.
   comment:
     kind: comment
     variable: CO.COVAL
@@ -52,96 +49,106 @@ attribute_homes:
     description: Never collected, and not recoverable from anywhere.
 
 profiles:
-  P1_structured:
-    label: Structured qualifiers throughout
-    study_id: STUDY-P1
+  P_structured:
+    label: Modifier in a structured qualifier
+    study_id: STUDY-A
     reported_term_style: terse
-    location_home: AELOC
-    pattern_home: AEPATT
-    dictionary_version: "25.1"
-    collects: [AETERM, AEDECOD, AELOC, AEPATT, AESEV, AESER, AEREL, AEACN,
+    modifier_homes: {mucosal_involvement: structured_qualifier}
+    dictionary_version: "D-21.0"
+    collects: [AETERM, AEDECOD, AEMUCOS, AESEV, AEGRADE, AESER, AEREL, AEACN,
                AEOUT, AESTDTC, AEENDTC]
     note: >
-      The easy case. Location and pattern arrive by the direct route and no
-      model touches either.
+      Study A in the worked example. The modifier arrives by the direct route
+      and no model touches it.
 
-  P2_text:
-    label: Rich reported terms, no structured qualifiers
-    study_id: STUDY-P2
+  P_text:
+    label: Modifier only in the reported term
+    study_id: STUDY-B
     reported_term_style: rich
-    location_home: reported_term
-    pattern_home: reported_term
-    dictionary_version: "24.0"
-    collects: [AETERM, AEDECOD, AESEV, AESER, AEREL, AEACN, AEOUT, AESTDTC,
-               AEENDTC]
+    modifier_homes: {mucosal_involvement: reported_term}
+    dictionary_version: "D-20.0"
+    prefer_concept: [RASH, RASH_ERYTHEMATOUS]
+    collects: [AETERM, AEDECOD, AESEV, AEGRADE, AESER, AEREL, AEACN, AEOUT,
+               AESTDTC, AEENDTC]
     note: >
-      The MedDRA case. "Skin rash on chest" codes to a rash term that cannot
-      carry the site; nothing is coded incorrectly and the site survives only
-      in the investigator's own words.
+      Study B. The coded term cannot carry the modifier, so it survives only in
+      the investigator's own words — or not at all. Coded under D-20.0, where
+      half its records remap mechanically to the target version.
 
-  P3_prespecified:
-    label: Prespecified term list, nothing else
-    study_id: STUDY-P3
-    reported_term_style: prespecified
-    location_home: none
-    pattern_home: none
-    dictionary_version: "25.1"
-    collects: [AETERM, AEDECOD, AESEV, AESER, AEREL, AEACN, AEOUT, AESTDTC,
-               AEENDTC]
-    note: >
-      The study that must return not_ascertainable. The rash is real and the
-      timing qualifies; the location was never collected and is not recoverable
-      from anywhere. That is not a negative case.
-
-  P4_sponsor:
-    label: Sponsor-defined supplemental qualifier
-    study_id: STUDY-P4
+  P_absent:
+    label: Modifier nowhere
+    study_id: STUDY-C
     reported_term_style: terse
-    location_home: sponsor_variable
-    pattern_home: none
-    sponsor_variable_name: RASHSITE
-    sponsor_codelist: {CHEST: "CH", ABDOMEN: "AB", BACK: "BK", ARM: "AR",
-                       LEG: "LG", FACE: "FC", GENERALISED: "GEN"}
-    dictionary_version: "25.1"
-    collects: [AETERM, AEDECOD, AESEV, AESER, AEREL, AEACN, AEOUT, AESTDTC,
-               AEENDTC, "SUPPAE.RASHSITE"]
+    modifier_homes: {mucosal_involvement: none}
+    dictionary_version: "D-21.0"
+    collects: [AETERM, AEDECOD, AESEV, AEGRADE, AESER, AEREL, AEACN, AEOUT,
+               AESTDTC, AEENDTC]
     note: >
-      The same fact under a name no standard knows, in a codelist the sponsor
-      invented. Resolving it needs a declared mapping, and the method is
-      `normalized` rather than `direct` because a mapping was applied.
+      Study C, and the one to get right. A qualifying event with qualifying
+      timing whose phenotype still cannot be evaluated. That is
+      not_ascertainable, not a non_case.
 
-  P5_comment:
-    label: Location in a linked comment
-    study_id: STUDY-P5
-    reported_term_style: terse
-    location_home: comment
-    pattern_home: none
-    dictionary_version: "26.0"
-    collects: [AETERM, AEDECOD, AESEV, AESER, AEREL, AEACN, AEOUT, AESTDTC,
-               AEENDTC, "CO.COVAL"]
-    note: >
-      The fact is in free text, but not in the AE record at all: a CO record
-      points at it. Extraction has to follow the link to find it.
-
-  P6_both:
-    label: Structured qualifier AND rich reported term
-    study_id: STUDY-P6
-    reported_term_style: rich
-    location_home: [AELOC, reported_term]
-    pattern_home: [AEPATT, reported_term]
-    dictionary_version: "26.0"
-    collects: [AETERM, AEDECOD, AELOC, AEPATT, AESEV, AESER, AEREL, AEACN,
+  P_both:
+    label: Modifier in a structured qualifier AND the reported term
+    study_id: STUDY-D
+    reported_term_style: mixed
+    modifier_homes: {mucosal_involvement: [structured_qualifier, reported_term]}
+    dictionary_version: "D-21.0"
+    collects: [AETERM, AEDECOD, AEMUCOS, AESEV, AEGRADE, AESER, AEREL, AEACN,
                AEOUT, AESTDTC, AEENDTC]
     note: >
-      The evaluation profile. The same attribute is independently present in a
-      structured variable and in the reported term, which is what makes a
-      silver standard possible without anyone hand-annotating anything.
+      The silver-standard evaluation set. Both routes speak independently of
+      each other in the data — though not independently of the investigator,
+      which is the caveat the harness prints.
 
-# Conventions that vary independently of where attributes live.
+  P_negated:
+    label: Reported term states the modifier is absent
+    study_id: STUDY-E
+    reported_term_style: negated
+    modifier_homes: {mucosal_involvement: reported_term}
+    dictionary_version: "D-21.0"
+    collects: [AETERM, AEDECOD, AESEV, AEGRADE, AESER, AEREL, AEACN, AEOUT,
+               AESTDTC, AEENDTC]
+    note: >
+      The profile that proves the system tells a documented negative from
+      silence. "Rash without mucosal involvement" is an observed absence: the
+      subject belongs in the denominator as a non_case.
+
+  P_version:
+    label: Coded under an earlier dictionary version
+    study_id: STUDY-F
+    reported_term_style: rich
+    modifier_homes: {mucosal_involvement: linked_form}
+    dictionary_version: "D-19.0"
+    prefer_concept: [RASH, RASH_ERYTHEMATOUS, RASH_MACULOPAPULAR]
+    collects: [AETERM, AEDECOD, "SC.MUCOSAL", AESEV, AEGRADE, AESER, AEREL,
+               AEACN, AEOUT, AESTDTC, AEENDTC]
+    note: >
+      Codes recorded under D-19.0, spread across three codings so that
+      reconciling to the target version exercises all three outcomes: `Rash` is
+      unchanged, `Rash erythematous` remaps mechanically to `Erythematous
+      rash`, and `Rash maculopapular` has no code under the target and is
+      flagged for review. Nothing is auto-recoded.
+
+  P_concept_variant:
+    label: Coded as a variant concept
+    study_id: STUDY-G
+    reported_term_style: rich
+    modifier_homes: {mucosal_involvement: comment}
+    dictionary_version: "D-21.0"
+    prefer_concept: [RASH_ERYTHEMATOUS]
+    collects: [AETERM, AEDECOD, "CO.COVAL", AESEV, AEGRADE, AESER, AEREL,
+               AEACN, AEOUT, AESTDTC, AEENDTC]
+    note: >
+      Codes the same clinical situation as `Rash erythematous` rather than
+      `Rash`. Both are legitimate; the concept set decides, and neither is
+      rewritten.
+
 conventions:
-  P1_structured: {split_on_severity_change: false, spelling: uk, date_style: iso}
-  P2_text:       {split_on_severity_change: false, spelling: us, date_style: iso}
-  P3_prespecified: {split_on_severity_change: true, spelling: uk, date_style: iso}
-  P4_sponsor:    {split_on_severity_change: false, spelling: us, date_style: dmy}
-  P5_comment:    {split_on_severity_change: false, spelling: uk, date_style: iso}
-  P6_both:       {split_on_severity_change: true, spelling: us, date_style: iso}
+  P_structured:      {date_style: iso,  dose_unit: mg}
+  P_text:            {date_style: iso,  dose_unit: mg}
+  P_absent:          {date_style: iso,  dose_unit: mg}
+  P_both:            {date_style: iso,  dose_unit: mg}
+  P_negated:         {date_style: iso,  dose_unit: mg}
+  P_version:         {date_style: dmy,  dose_unit: mg}
+  P_concept_variant: {date_style: iso,  dose_unit: mg}

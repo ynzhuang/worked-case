@@ -4,15 +4,15 @@ The corpus on disk is:
 
 ``dm.csv`` ``ae.csv`` ``ex.csv``
     the standard domains, one row per record
-``suppae.csv``
-    sponsor-defined supplemental qualifiers, keyed back to an AE record by
-    ``IDVAR``/``IDVARVAL`` — the same fact under a name no standard knows
+``sc.csv``
+    a linked findings form, keyed back to an AE record by ``IDVAR``/``IDVARVAL``
+    — the same clinical fact recorded on a different form
 ``co.csv``
     comment records pointing at an AE record
 ``documents.jsonl``
     the free text of each comment, keyed by ``doc_id``, which is what span
     offsets are measured against
-``truths.jsonl`` ``gold_records.jsonl`` ``gold_episodes.jsonl``
+``truths.jsonl`` ``gold.jsonl``
     the generator's answer key
 
 Gold labels are loaded through separate accessors so no extraction or
@@ -32,11 +32,11 @@ from . import paths
 from .anchors import AnchorResolver, parse_date
 from .hashing import snapshot_id as compute_snapshot_id
 
-TABLES = ("dm", "ae", "ex", "suppae", "co")
+TABLES = ("dm", "ae", "ex", "sc", "co")
 
 #: Columns whose values are numeric when present.  Kept narrow on purpose: SDTM
 #: character columns stay characters.
-_NUMERIC_COLUMNS = {"EXDOSE", "AESEQ", "EXSEQ", "COSEQ", "AGE"}
+_NUMERIC_COLUMNS = {"EXDOSE", "AESEQ", "EXSEQ", "COSEQ", "AGE", "AEGRADE"}
 
 
 class IngestError(RuntimeError):
@@ -125,10 +125,10 @@ class TrialStore:
                            str(r.get("AESPID"))),
         )
 
-    def supplemental_for(self, source_record_id: str) -> list[dict[str, Any]]:
-        """Sponsor-defined qualifiers attached to one AE record."""
+    def linked_form_rows(self, source_record_id: str) -> list[dict[str, Any]]:
+        """Linked-form findings attached to one AE record."""
         return [
-            row for row in self.rows("suppae")
+            row for row in self.rows("sc")
             if str(row.get("IDVARVAL")) == source_record_id
         ]
 
@@ -155,20 +155,16 @@ class TrialStore:
         path = self.root / name
         return [json.loads(line) for line in _iter_lines(path)] if path.exists() else []
 
-    def gold_records(self) -> list[dict[str, Any]]:
-        """True field values and collection states, one entry per source record."""
-        return self._jsonl("gold_records.jsonl")
-
-    def gold_episodes(self) -> list[dict[str, Any]]:
-        """True episode boundaries and phenotype classification."""
-        return self._jsonl("gold_episodes.jsonl")
+    def gold(self) -> list[dict[str, Any]]:
+        """True assertion, availability and verdict, one entry per record."""
+        return self._jsonl("gold.jsonl")
 
     def truths(self) -> list[dict[str, Any]]:
         """The sampled ground truth, before any study wrote it down."""
         return self._jsonl("truths.jsonl")
 
-    def gold_records_by_id(self) -> dict[str, dict[str, Any]]:
-        return {g["source_record_id"]: g for g in self.gold_records()}
+    def gold_by_record(self) -> dict[str, dict[str, Any]]:
+        return {g["source_record_id"]: g for g in self.gold()}
 
     def profile_of(self, study_id: str) -> str | None:
         for profile_id, body in (self.manifest.get("profiles") or {}).items():
@@ -183,7 +179,7 @@ class TrialStore:
             "subjects": len(self.subjects()),
             "ae_records": len(self.rows("ae")),
             "documents": len(self.documents),
-            "supplemental_records": len(self.rows("suppae")),
+            "linked_form_records": len(self.rows("sc")),
             "comment_records": len(self.rows("co")),
             "ex_records": len(self.rows("ex")),
         }

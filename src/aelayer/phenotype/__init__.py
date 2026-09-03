@@ -1,16 +1,17 @@
-"""Phenotype definitions and their evaluation."""
+"""Phenotype definitions: loading them, and running them over records."""
 
-from .evaluator import PhenotypeEvaluator, evaluate_definition
+from .evaluator import (
+    EvaluationResult, PhenotypeEvaluator, cases_by_subject, denominator_table,
+    evaluate_definition,
+)
 from .loader import (
-    DefinitionCatalog,
-    DefinitionError,
-    definition_content_hash,
-    load_definition,
-    validate_definition,
+    DefinitionCatalog, DefinitionError, definition_content_hash,
+    diff_definitions, load_definition, load_definitions, validate_definition,
 )
 
 __all__ = [
-    "DefinitionCatalog", "DefinitionError", "PhenotypeEvaluator",
-    "definition_content_hash", "evaluate_definition", "load_definition",
-    "validate_definition",
+    "DefinitionCatalog", "DefinitionError", "EvaluationResult",
+    "PhenotypeEvaluator", "cases_by_subject", "definition_content_hash",
+    "denominator_table", "diff_definitions", "evaluate_definition",
+    "load_definition", "load_definitions", "validate_definition",
 ]

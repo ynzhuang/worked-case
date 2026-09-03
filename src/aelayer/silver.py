@@ -1,26 +1,37 @@
 """The silver-standard harness.
 
-Some studies collect an attribute **twice**: once in a structured variable and
-once, independently, in the investigator's own words. Where both exist, the
-structured value is a comparator the extractor never sees — so masking it gives
-a genuine evaluation set on data nobody hand-annotated.
+Some studies collect a modifier **twice**: once in a structured variable and
+once, independently of that variable, in the investigator's own words. Where
+both exist, the structured value is a comparator the extractor never sees — so
+masking it gives a real evaluation set on data nobody hand-annotated.
 
 The method, in four steps:
 
 1. mask the structured variable from the extractor
 2. run the model path over the reported term (or comment) alone
-3. normalize both sides to the concept catalogue
-4. compare the extracted value against the masked structured value
+3. normalize both sides to the same value space
+4. compare the extracted **assertion** against the masked structured assertion
 
-It is called a **silver** standard, not ground truth, everywhere it is reported.
-The structured field has its own error rate — a site can mistype a qualifier as
-easily as it can write an ambiguous phrase — and a metric that calls it truth
-would be overstating what it knows.
+Comparing assertions rather than values is the point. An extractor that turns
+every documented "no mucosal involvement" into silence would score perfectly on
+values — it never emits a wrong site — while destroying the denominator.
 
-The output includes an **adjudication queue**: every disagreement, every
-low-confidence prediction, *and a random sample of agreements*. The sample is
-not optional. Without it you only ever inspect failures, and you can never
-estimate the silver standard's own error rate.
+The output has three parts and none of them is optional:
+
+**Agreement**, broken out by profile and by how the site writes.
+
+**Calibration.** Confidence is only useful if it means something: a set of
+predictions made at 0.8 should be right about 80% of the time. Reported as a
+Brier score plus a reliability table, because a single accuracy number cannot
+show a systematically overconfident extractor.
+
+**An adjudication queue**, containing every disagreement, every low-confidence
+prediction, *and a random sample of agreements*. The sample is the one teams
+skip, and skipping it means never learning what the comparator itself gets
+wrong.
+
+Two caveats are printed verbatim wherever this is reported. They are not
+hedging; they bound what the numbers can be used for.
 """
 
 from __future__ import annotations
@@ -36,14 +47,26 @@ from .extract.backends import ExtractionRequest
 from .extract.engine import ExtractionEngine
 from .ingest import TrialStore
 from .models import CanonicalAERecord
+from .normalize.values import TRISTATE
 
-SILVER_CAVEAT = (
-    "This is a silver standard, not ground truth. The comparator is the "
-    "study's own structured qualifier, which has its own error rate: a site can "
-    "mistype a coded qualifier as easily as it can write an ambiguous phrase. "
-    "Disagreement therefore means the two disagree, not that the extractor is "
-    "wrong, and the adjudication queue exists so that the difference can be "
-    "measured rather than assumed."
+#: Printed verbatim in every report that carries a silver number. The first
+#: bounds what agreement *means*; the second bounds who it generalizes to.
+SILVER_CAVEATS: tuple[str, ...] = (
+    "CAVEAT 1 - THE TWO ROUTES ARE NOT INDEPENDENT. The structured qualifier "
+    "and the narrative were produced by the same investigator, at the same "
+    "visit, on the same form, often in the same minute. They share every "
+    "upstream error: a clinician who did not examine the mucosa records "
+    "nothing in the qualifier and writes nothing in the term. Agreement "
+    "between them is therefore an UPPER BOUND on agreement with an independent "
+    "adjudicator, not an estimate of it. This is a silver standard, not ground "
+    "truth, and the comparator has its own error rate.",
+    "CAVEAT 2 - THE EVALUATION SET IS NOT A RANDOM SUBSET. Only studies that "
+    "collect the modifier BOTH structurally and in prose can be scored at all. "
+    "Those studies are, by construction, the ones with the more thorough "
+    "collection conventions and the more detailed narratives. Performance "
+    "measured here does not transfer to a study that keeps the modifier only "
+    "in free text, which is precisely the study the layer is meant to help. "
+    "See the transportability holdout for what that costs.",
 )
 
 
@@ -54,9 +77,11 @@ class Comparison:
     source_record_id: str
     study_id: str
     profile: str
-    attribute: str
+    modifier: str
+    structured_assertion: str | None
     structured_value: str | None
     structured_variable: str | None
+    extracted_assertion: str | None
     extracted_value: str | None
     extracted_confidence: float | None
     text: str
@@ -66,18 +91,37 @@ class Comparison:
     note: str = ""
 
     @property
-    def produced_a_value(self) -> bool:
-        return self.extracted_value is not None
+    def answered(self) -> bool:
+        return self.extracted_assertion is not None
+
+    @property
+    def correct(self) -> bool:
+        return self.agreement == "agree"
+
+
+def _brier(pairs: Sequence[tuple[float, bool]]) -> float | None:
+    """Mean squared error between stated confidence and the outcome.
+
+    0 is perfect, 0.25 is what you get by always saying 0.5, and a confident
+    extractor that is often wrong scores worse than an unconfident one.
+    """
+    if not pairs:
+        return None
+    return round(
+        sum((confidence - (1.0 if hit else 0.0)) ** 2 for confidence, hit in pairs)
+        / len(pairs),
+        4,
+    )
 
 
 @dataclass
 class SilverReport:
-    attribute: str
+    modifier: str
     profiles: list[str]
     comparisons: list[Comparison] = _dc_field(default_factory=list)
-    caveat: str = SILVER_CAVEAT
+    caveats: tuple[str, ...] = SILVER_CAVEATS
 
-    # -- headline numbers ---------------------------------------------------
+    # -- populations --------------------------------------------------------
 
     @property
     def eligible(self) -> int:
@@ -85,7 +129,7 @@ class SilverReport:
 
     @property
     def answered(self) -> list[Comparison]:
-        return [c for c in self.comparisons if c.produced_a_value]
+        return [c for c in self.comparisons if c.answered]
 
     @property
     def agreements(self) -> list[Comparison]:
@@ -99,20 +143,22 @@ class SilverReport:
     def abstentions(self) -> list[Comparison]:
         return [c for c in self.comparisons if c.agreement == "abstained"]
 
-    def metrics(self) -> dict[str, Any]:
-        """Precision, recall, F1, coverage, abstention, normalized agreement.
+    # -- headline numbers ---------------------------------------------------
 
-        Precision is over the values the extractor produced; recall is over the
-        records where the structured comparator had a value. Coverage and
-        abstention are reported alongside because a high precision reached by
-        answering three times out of a hundred is not a useful extractor, and
-        the pair of numbers is what makes that visible.
+    def metrics(self) -> dict[str, Any]:
+        """Precision, recall, F1, coverage, abstention, agreement.
+
+        Precision is over the answers the extractor gave; recall is over the
+        records where the structured comparator said something. Coverage and
+        abstention sit beside them because a precision of 1.0 reached by
+        answering three times in a hundred is not a useful extractor, and the
+        pair of numbers is what makes that visible.
         """
         total = self.eligible
         answered = len(self.answered)
         correct = len(self.agreements)
         with_comparator = sum(
-            1 for c in self.comparisons if c.structured_value is not None
+            1 for c in self.comparisons if c.structured_assertion is not None
         )
         precision = correct / answered if answered else 0.0
         recall = correct / with_comparator if with_comparator else 0.0
@@ -129,10 +175,86 @@ class SilverReport:
             "f1": round(f1, 4),
             "coverage": round(answered / total, 4) if total else 0.0,
             "abstention_rate": round(len(self.abstentions) / total, 4) if total else 0.0,
-            "normalized_agreement": round(correct / answered, 4) if answered else 0.0,
             "agreements": correct,
             "disagreements": len(self.disagreements),
         }
+
+    def by_assertion(self) -> dict[str, dict[str, Any]]:
+        """Agreement per assertion class the comparator recorded.
+
+        Broken out because the classes fail differently, and the one that
+        matters most for the denominator — a documented `absent` — is also the
+        rarest and the easiest to lose in an average.
+        """
+        rows: dict[str, dict[str, Any]] = {}
+        for assertion in ("present", "absent", "uncertain"):
+            subset = [
+                c for c in self.comparisons if c.structured_assertion == assertion
+            ]
+            if not subset:
+                continue
+            answered = [c for c in subset if c.answered]
+            correct = [c for c in subset if c.correct]
+            rows[assertion] = {
+                "n": len(subset),
+                "answered": len(answered),
+                "correct": len(correct),
+                "recall": round(len(correct) / len(subset), 4),
+                "precision": (
+                    round(len(correct) / len(answered), 4) if answered else 0.0
+                ),
+            }
+        return rows
+
+    # -- calibration --------------------------------------------------------
+
+    def calibration(self, bins: int = 5) -> dict[str, Any]:
+        """Does a stated confidence of 0.8 mean right eight times in ten?
+
+        A reliability table plus a Brier score. Reported because an extractor
+        whose confidence carries no information cannot be thresholded, and
+        every phenotype definition in this repository thresholds on it.
+        """
+        pairs = [
+            (c.extracted_confidence or 0.0, c.correct)
+            for c in self.answered
+        ]
+        table: list[dict[str, Any]] = []
+        for index in range(bins):
+            low = index / bins
+            high = (index + 1) / bins
+            in_bin = [
+                (confidence, hit) for confidence, hit in pairs
+                if (low <= confidence < high) or (index == bins - 1 and confidence == 1.0)
+            ]
+            if not in_bin:
+                continue
+            observed = sum(1 for _c, hit in in_bin if hit) / len(in_bin)
+            mean_confidence = sum(c for c, _hit in in_bin) / len(in_bin)
+            table.append({
+                "bin": f"[{low:.1f}, {high:.1f}{']' if index == bins - 1 else ')'}",
+                "n": len(in_bin),
+                "mean_confidence": round(mean_confidence, 4),
+                "observed_accuracy": round(observed, 4),
+                "gap": round(mean_confidence - observed, 4),
+            })
+        gaps = [abs(row["gap"]) * row["n"] for row in table]
+        total = sum(row["n"] for row in table)
+        return {
+            "brier_score": _brier(pairs),
+            "expected_calibration_error": (
+                round(sum(gaps) / total, 4) if total else None
+            ),
+            "reliability": table,
+            "note": (
+                "A positive gap means the extractor was more confident than it "
+                "was right, which is the direction that matters: a phenotype "
+                "definition thresholds on this number, so overconfidence turns "
+                "into cases nobody can defend."
+            ),
+        }
+
+    # -- breakdowns ---------------------------------------------------------
 
     def by(self, key: str) -> dict[str, dict[str, Any]]:
         """The same metrics, broken out by profile or by reported-term style."""
@@ -140,19 +262,21 @@ class SilverReport:
         for comparison in self.comparisons:
             groups.setdefault(getattr(comparison, key), []).append(comparison)
         return {
-            name: SilverReport(self.attribute, [name], rows).metrics()
+            name: SilverReport(self.modifier, [name], rows).metrics()
             for name, rows in sorted(groups.items())
         }
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "attribute": self.attribute,
+            "modifier": self.modifier,
             "profiles": self.profiles,
             "standard": "silver",
-            "caveat": self.caveat,
+            "caveats": list(self.caveats),
             "overall": self.metrics(),
+            "by_assertion": self.by_assertion(),
             "by_profile": self.by("profile"),
             "by_reported_term_style": self.by("reported_term_style"),
+            "calibration": self.calibration(),
         }
 
     # -- adjudication -------------------------------------------------------
@@ -166,7 +290,8 @@ class SilverReport:
         Three populations, deliberately: disagreements, low-confidence
         predictions, and a random sample of agreements. The third is the one
         teams skip, and skipping it means never learning what the comparator
-        itself gets wrong.
+        itself gets wrong — which, given caveat 1, is the number that decides
+        how much any of this is worth.
         """
         rng = random.Random(seed)
         queue: list[dict[str, Any]] = []
@@ -195,9 +320,9 @@ class SilverReport:
         agreements = list(self.agreements)
         rng.shuffle(agreements)
         seen = {q["source_record_id"] for q in queue}
+        sampled = 0
         for comparison in agreements:
-            if len([q for q in queue if q["queue_reason"].startswith("sampled")]) \
-                    >= agreement_sample:
+            if sampled >= agreement_sample:
                 break
             if comparison.source_record_id in seen:
                 continue
@@ -206,6 +331,7 @@ class SilverReport:
                 "sampled agreement: included so the silver standard's own error "
                 "rate can be estimated rather than assumed",
             ))
+            sampled += 1
         return queue
 
     def write_adjudication(
@@ -221,75 +347,86 @@ class SilverReport:
 
 
 class SilverHarness:
-    """Build a silver standard for one attribute over the eligible profiles."""
+    """Build a silver standard for one modifier over the eligible profiles."""
 
     def __init__(self, configs: Configs, store: TrialStore, engine: ExtractionEngine):
         self.configs = configs
         self.store = store
         self.engine = engine
 
-    def eligible_profiles(self, attribute: str) -> list[str]:
-        """Profiles carrying the attribute both structurally and in text."""
-        return self.configs.profiles.evaluation_profiles(attribute)
+    def eligible_profiles(self, modifier: str) -> list[str]:
+        """Profiles carrying the modifier both structurally and in text."""
+        return self.configs.profiles.evaluation_profiles(modifier)
 
     def run(
-        self, records: Sequence[CanonicalAERecord], attribute: str = "location",
+        self, records: Sequence[CanonicalAERecord],
+        modifier: str = "mucosal_involvement",
         profiles: Iterable[str] | None = None,
     ) -> SilverReport:
-        wanted = list(profiles or self.eligible_profiles(attribute))
-        report = SilverReport(attribute=attribute, profiles=wanted)
+        wanted = list(profiles or self.eligible_profiles(modifier))
+        report = SilverReport(modifier=modifier, profiles=wanted)
 
         for record in records:
             if record.profile not in wanted:
                 continue
             profile = self.configs.profiles.profile(record.profile)
-            if not profile.carries_both(attribute):
+            if not profile.carries_both(modifier):
                 continue
-            comparison = self._compare(record, profile, attribute)
+            comparison = self._compare(record, profile, modifier)
             if comparison is not None:
                 report.comparisons.append(comparison)
         return report
 
-    def _compare(self, record, profile, attribute: str) -> Comparison | None:
+    def _compare(self, record, profile, modifier: str) -> Comparison | None:
         """One record: mask the structured value, extract, compare."""
-        structured = self._masked_structured_value(record, profile, attribute)
-        text_home = profile.text_home(attribute)
+        structured_assertion, structured_value = self._masked_comparator(
+            record, profile, modifier
+        )
+        text_home = profile.text_home(modifier)
         if text_home is None:
             return None
 
-        # Step 1 and 2: the extractor sees the text and nothing else. The
+        # Steps 1 and 2: the extractor sees the text and nothing else. The
         # structured value is not in the request, so there is no route by which
         # it could leak into the answer.
         doc_id, text, source_kind, variable = self._text_source(record, text_home)
         if not text:
             return None
         request = ExtractionRequest(
-            doc_id=doc_id, text=text, attributes=(attribute,),
-            concept_id=record.standardized_concept,
-            source_kind=source_kind, source_variable=variable,
+            doc_id=doc_id, text=text, modifiers=(modifier,),
+            concept_id=None, source_kind=source_kind, source_variable=variable,
         )
         result = self.engine.backend.extract(request)
-        extracted = result.values.get(attribute)
+        extracted = result.values.get(modifier)
 
-        # Steps 3 and 4: both sides are already catalogue values, because the
+        # Steps 3 and 4. Both sides are already in the same space, because the
         # normalizer and the backend each normalize before returning.
         if extracted is None:
             agreement = "abstained"
-        elif structured is None:
+        elif structured_assertion is None:
+            agreement = "disagree"
+        elif extracted.assertion != structured_assertion:
+            agreement = "disagree"
+        elif (
+            structured_value is not None
+            and extracted.value is not None
+            and extracted.value != structured_value
+        ):
+            # Same call about whether the modifier was there, different site.
             agreement = "disagree"
         else:
-            agreement = "agree" if extracted.value == structured else "disagree"
+            agreement = "agree"
 
+        home = profile.structured_home(modifier)
         return Comparison(
             source_record_id=record.source_record_id,
             study_id=record.study_id,
             profile=record.profile,
-            attribute=attribute,
-            structured_value=structured,
-            structured_variable=(
-                profile.structured_home(attribute).variable
-                if profile.structured_home(attribute) else None
-            ),
+            modifier=modifier,
+            structured_assertion=structured_assertion,
+            structured_value=structured_value,
+            structured_variable=home.variable if home else None,
+            extracted_assertion=extracted.assertion if extracted else None,
             extracted_value=extracted.value if extracted else None,
             extracted_confidence=extracted.confidence if extracted else None,
             text=text,
@@ -301,32 +438,40 @@ class SilverHarness:
             note=(extracted.note if extracted else "the extractor abstained"),
         )
 
-    def _masked_structured_value(
-        self, record: CanonicalAERecord, profile, attribute: str
-    ) -> str | None:
+    def _masked_comparator(
+        self, record: CanonicalAERecord, profile, modifier: str
+    ) -> tuple[str | None, str | None]:
         """The comparator, read from the source row rather than the record.
 
         Read here and nowhere else, so that the extraction call above cannot
-        see it. On a record where the model path already filled the attribute
+        see it. On a record where the model path already filled the modifier
         from text, the structured value is still what the *study* recorded, and
         that is what a silver standard compares against.
         """
-        home = profile.structured_home(attribute)
+        home = profile.structured_home(modifier)
         if home is None or not home.variable:
+            return None, None
+        raw = self._structured_raw(record, home)
+        if raw in (None, ""):
+            # The comparator itself is silent. Nothing to score against, and
+            # scoring it as a negative would manufacture agreement out of a
+            # blank cell.
+            return None, None
+        return TRISTATE.get(str(raw).strip().lower()), None
+
+    def _structured_raw(self, record: CanonicalAERecord, home) -> Any:
+        if home.kind == "linked_form" and home.variable and "." in home.variable:
+            _domain, testcd = home.variable.split(".", 1)
+            for row in self.store.linked_form_rows(record.source_record_id):
+                if str(row.get("SCTESTCD")) == testcd:
+                    return row.get("SCORRES")
             return None
         row = next(
             (r for r in self.store.rows("ae")
              if str(r.get("AESPID")) == record.source_record_id),
             None,
         )
-        if row is None:
-            return None
-        raw = row.get(home.variable)
-        if raw in (None, ""):
-            return None
-        catalogue = self.configs.catalog.attribute(attribute)
-        text = str(raw).strip()
-        return text if text in catalogue.values else catalogue.normalize(text)
+        return None if row is None else row.get(home.variable)
 
     def _text_source(self, record: CanonicalAERecord, home) -> tuple[str, str, str, str]:
         if home.kind == "comment":
