@@ -318,6 +318,22 @@ not-ascertainable rate       0.2683       0.4766
 
 ---
 
+## Representation invariance, and what it does not prove
+
+The same clinical truth is rendered under all seven profiles, and the harness
+reports how often the verdict agrees **where the evidence supports it** — a
+study that could not record the modifier at all is not expected to reach the
+same verdict, and counting it as a disagreement would punish the system for a
+collection decision.
+
+> **Consistency across representations is not clinical validity.** A pipeline
+> can be perfectly consistent and consistently wrong. This section is a
+> robustness check layered on the phenotype and extraction numbers; it does not
+> replace them, and a high agreement rate here is not evidence that the case
+> definition is clinically correct.
+
+---
+
 ## Phenotype definitions
 
 A definition is a versioned scientific artifact with a content hash. Frozen
