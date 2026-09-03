@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field as _dc_field
 from typing import Any
 
-from ..models import Clarification, Manifest, PhenotypeQuerySpec, Trace
+from ..models import Conflict, Manifest, QuerySpec, Trace
 from ..pipeline import Pipeline
 from ..runs import ManifestStore, execute
 from .compile import CompileResult, compile_question
@@ -23,8 +23,12 @@ from .tools import AgentServices, Permission
 from .trace import trace_number
 
 
-class ClarificationRequired(RuntimeError):
+class ConflictUnresolved(RuntimeError):
     """Raised when execution is attempted on an underdetermined question."""
+
+
+#: Kept so callers written against the earlier name keep working.
+ClarificationRequired = ConflictUnresolved
 
 
 @dataclass
@@ -37,8 +41,9 @@ class EvidencePackage:
     """
 
     question: str
-    spec: PhenotypeQuerySpec
+    spec: QuerySpec
     cohort: dict[str, Any]
+    supportability: dict[str, Any]
     exposure: dict[str, Any]
     covariates: dict[str, Any]
     definition: dict[str, Any]
@@ -55,6 +60,7 @@ class EvidencePackage:
             "question": self.question,
             "spec": self.spec.model_dump(mode="json"),
             "cohort": self.cohort,
+            "supportability": self.supportability,
             "exposure": self.exposure,
             "covariates": self.covariates,
             "definition": self.definition,
@@ -85,12 +91,12 @@ class AgentSession:
         return self.result
 
     @property
-    def spec(self) -> PhenotypeQuerySpec | None:
+    def spec(self) -> QuerySpec | None:
         return self.result.spec if self.result else None
 
     @property
-    def clarification(self) -> Clarification | None:
-        return self.result.clarification if self.result else None
+    def conflict(self) -> Conflict | None:
+        return self.result.conflict if self.result else None
 
     def execute(
         self, *, manifest_store: ManifestStore | None = None, save: bool = True
@@ -98,9 +104,12 @@ class AgentSession:
         if self.result is None:
             self.compile()
         if self.result.spec is None:
-            raise ClarificationRequired(
-                "the question leaves a rule underdetermined, so nothing was "
-                "executed. Answer the clarification and compile again."
+            raise ConflictUnresolved(
+                "the question conflicts with the definition it names, or "
+                "leaves a rule underdetermined, so nothing was executed. The "
+                "agent does not override a bound definition to accommodate a "
+                "question: settle the conflict, or write a new version, and "
+                "compile again."
             )
         spec = self.result.spec
         services = AgentServices(self.pipeline, self.permissions)
@@ -109,6 +118,17 @@ class AgentSession:
             "phenotype.resolve",
             definition_id=spec.definition_id, version=spec.definition_version,
         )
+        # The metadata screen runs *before* any patient-level query. A study
+        # that records the required modifier nowhere cannot answer, and that is
+        # knowable from the collection profile alone.
+        definition = self.pipeline.definition(
+            spec.definition_id, spec.definition_version
+        )
+        supportability = {}
+        for requirement in definition.modifiers:
+            supportability[requirement.name] = services.call(
+                "study.supportability", modifier=requirement.name
+            )
         cohort = services.call(
             "cohort.run", definition_id=spec.definition_id,
             version=spec.definition_version, studies=list(spec.studies),
@@ -116,9 +136,6 @@ class AgentSession:
         exposure = services.call("exposure.build", studies=list(spec.studies))
         covariates = services.call("covariates.build", studies=list(spec.studies))
 
-        definition = self.pipeline.definition(
-            spec.definition_id, spec.definition_version
-        )
         manifest, assignments = execute(
             self.pipeline, definition,
             studies=list(spec.studies) or None,
@@ -139,13 +156,13 @@ class AgentSession:
             label="case count",
             manifest=manifest,
             assignments=assignments,
-            episodes=self.pipeline.episodes(),
             records=self.pipeline.records(),
         )
         return EvidencePackage(
             question=self.question,
             spec=spec,
             cohort=cohort,
+            supportability=supportability,
             exposure=exposure,
             covariates=covariates,
             definition=definition_body,
